@@ -421,10 +421,14 @@ mlx_array* mlx_array_log_softmax(mlx_array* handle, int32_t axis) {
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
-mlx_array* mlx_array_logsumexp(mlx_array* handle, int32_t axis, bool keepdims) {
+mlx_array* mlx_array_logsumexp(mlx_array* handle,
+                               const int32_t* axes,
+                               size_t axes_len,
+                               bool keepdims) {
   auto arr = reinterpret_cast<array*>(handle);
-  std::vector<int> axes{axis};
-  array result = logsumexp(*arr, axes, keepdims);
+  array result = (axes_len == 0)
+                     ? logsumexp(*arr, keepdims)
+                     : logsumexp(*arr, make_axes(axes, axes_len), keepdims);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
@@ -1896,8 +1900,9 @@ mlx_array* mlx_array_var(mlx_array* handle,
                          bool keepdims,
                          int32_t ddof) {
   auto arr = reinterpret_cast<array*>(handle);
-  std::vector<int> target_axes = make_axes(axes, axes_len);
-  array result = mlx::core::var(*arr, target_axes, keepdims, ddof);
+  array result = (axes_len == 0)
+                     ? mlx::core::var(*arr, keepdims, ddof)
+                     : mlx::core::var(*arr, make_axes(axes, axes_len), keepdims, ddof);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
@@ -1907,8 +1912,9 @@ mlx_array* mlx_array_std(mlx_array* handle,
                          bool keepdims,
                          int32_t ddof) {
   auto arr = reinterpret_cast<array*>(handle);
-  std::vector<int> target_axes = make_axes(axes, axes_len);
-  array result = mlx::core::std(*arr, target_axes, keepdims, ddof);
+  array result = (axes_len == 0)
+                     ? mlx::core::std(*arr, keepdims, ddof)
+                     : mlx::core::std(*arr, make_axes(axes, axes_len), keepdims, ddof);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
@@ -1953,24 +1959,6 @@ size_t mlx_array_split_multi(mlx_array* handle,
                              size_t max_outputs) {
   auto arr = reinterpret_cast<array*>(handle);
   auto splits = mlx::core::split(*arr, indices_or_sections, axis);
-  size_t count = std::min(splits.size(), max_outputs);
-  for (size_t i = 0; i < count; ++i) {
-    out_handles[i] =
-        reinterpret_cast<uint64_t>(new array(std::move(splits[i])));
-  }
-  return count;
-}
-
-// Split at specific indices along an axis, returns multiple array handles
-size_t mlx_array_split_at_indices(mlx_array* handle,
-                                  const int32_t* indices,
-                                  size_t indices_len,
-                                  int32_t axis,
-                                  uint64_t* out_handles,
-                                  size_t max_outputs) {
-  auto arr = reinterpret_cast<array*>(handle);
-  mlx::core::Shape idx_vec(indices, indices + indices_len);
-  auto splits = mlx::core::split(*arr, idx_vec, axis);
   size_t count = std::min(splits.size(), max_outputs);
   for (size_t i = 0; i < count; ++i) {
     out_handles[i] =
