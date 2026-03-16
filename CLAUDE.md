@@ -1,640 +1,408 @@
 # MLX-Node: High-Performance ML Framework for Node.js
 
-## 🎯 Project Overview
+## Project Overview
 
-MLX-Node is a high-performance machine learning framework for Node.js that ports Apple's MLX library capabilities to JavaScript/TypeScript. The project implements state-of-the-art GRPO (Group-based Relative Policy Optimization) from HuggingFace's TRL library, with specific support for Qwen3 models. Using Apple's Metal GPU acceleration through a Rust/NAPI bridge, it provides maximum performance while maintaining clean JavaScript APIs.
+MLX-Node is a high-performance machine learning framework for Node.js that brings Apple's MLX library to JavaScript/TypeScript. It supports inference (Qwen3, Qwen3.5, PaddleOCR-VL), training (GRPO, SFT), vision-language models, and document processing pipelines. Uses Metal GPU acceleration through a Rust/NAPI/C++ bridge.
 
 ### Core Technology Stack
 
 - **MLX**: Apple's ML framework with Metal GPU acceleration
-- **Rust**: High-performance implementation layer (~25,000 lines across 3 crates)
-- **NAPI-RS**: Native Node.js bindings
-- **TypeScript**: Type-safe JavaScript APIs with full TypedArray support (3,712 source + 13,702 test lines)
-- **Vitest**: Comprehensive test suite (614 tests: 611 passing, 3 skipped)
-
-## 📊 Current Status Summary
-
-### Implementation Progress (December 2025)
-
-- **Total Code**: ~42,400+ lines (25,000 Rust + 3,712 TS source + 13,702 TS tests)
-- **Functions Implemented**: 245+ public NAPI exports + TypeScript orchestration layer
-- **Test Coverage**: **100% pass rate** (611 tests passing, 3 skipped = 614 total) ✅
-- **Code Quality**: 0 lint errors, 9 minor warnings (unused variables) ✅
-- **Build Time**: ~4.8 seconds (incremental)
-- **Binary Size**: 23 MB (Metal-optimized)
-- **GRPO Infrastructure**: **100% complete** (all production features implemented) ✅
-- **Autograd**: ✅ **Production-ready** (functional forward pass architecture)
-- **Handle Lifetime**: ✅ **Thread-safe with Arc<MxHandle>** 🔒
-- **Tokenizer**: ✅ **Production-ready**
-- **Gradient Infrastructure**: ✅ **Production-ready** (manual + automatic)
-- **Rust Migrations**: ✅ **Complete** (all compute operations in Rust)
-- **Qwen3 Model**: ✅ **Fully migrated to Rust** (2,205 lines total, 5 modules)
-- **Model Persistence**: ✅ **Implemented in Rust** (no JS memory limits)
-- **Feature Parity**: ✅ **90% MLX-LM, 100% TRL GRPO**
-
-### Phase Completion Status
-
-| Phase       | Status      | Completion | Tests            | Description                                    |
-| ----------- | ----------- | ---------- | ---------------- | ---------------------------------------------- |
-| **Phase 1** | ✅ Complete | 100%       | Passing          | Core MLX operations (90 ops)                   |
-| **Phase 2** | ✅ Complete | 100%       | ✅               | Neural network layers & losses (21 components) |
-| **Phase 3** | ✅ Complete | 100%       | ✅               | Manual gradients & optimizers (4 optimizers)   |
-| **Phase 4** | ✅ Complete | 100%       | ✅               | Transformer architecture (8 components)        |
-| **Phase 5** | ✅ Complete | 100%       | 128 TS + 62 Rust | GRPO training (production-ready)               |
-| **Phase 6** | ✅ Complete | 100%       | 3 passing        | **Autograd with functional forward pass**      |
+- **Rust**: ~100,000 lines across 5 crates (mlx-core, mlx-sys, mlx-paged-attn, mlx-tui, mlx-db)
+- **C++**: ~7,700 lines (11 .cpp files + 2 headers) for compiled forward passes and FFI bridge
+- **Metal**: ~2,500 lines of custom shaders (paged attention, gated delta recurrence)
+- **NAPI-RS**: 328 NAPI exports, 221 FFI bindings
+- **TypeScript**: 7,671 source lines across 5 packages + 9,125 test lines
+- **Tests**: 1,315 total (900 Rust + 415 TypeScript)
 
 ---
 
-## 🆕 Recent Major Updates (January 2025)
-
-### Ratatui Training TUI ✅ (Latest)
-
-Terminal User Interface for monitoring and controlling GRPO training runs using Ratatui.
-
-- **Binary**: `target/release/mlx-train` (1.9MB Rust binary)
-- **Files**: `crates/mlx-tui/` (14 Rust source files)
-- **Features**: Real-time metrics with sparklines, progress bars, tabbed panels (Logs/Samples/Config), keyboard controls (pause/resume/save/scroll)
-- **Communication**: Wrapper pattern - TUI spawns Node.js training script, communicates via stdout (JSONL messages) and stdin (line commands)
-- **TypeScript Integration**: `tuiMode` option in TrainingLogger and GRPOTrainer for JSONL output and stdin command handling
-- **Usage**: `./target/release/mlx-train --script train.ts -- --model ./models/qwen3`
-- **Docs**: See plan at `/Users/brooklyn/.claude/plans/elegant-cooking-lampson.md`
-
-### Phase 6: Autograd Integration ✅
-
-Production-ready automatic differentiation using functional forward pass architecture. Computes 311 gradients automatically through full Qwen3 model.
-
-- **Files**: `autograd.rs` (360 lines), `functional.rs` (550 lines), `param_manager.rs` (200 lines)
-- **Tests**: 3 integration tests passing
-- **Docs**: [`AUTOGRAD_INTEGRATION.md`](docs/AUTOGRAD_INTEGRATION.md)
-
-### Causal Masking Fix ✅
-
-Fixed MLX/PyTorch boolean mask semantics mismatch. Achieved perfect 0/151,936 token match between cached and non-cached modes.
-
-- **Files**: `array/mask.rs` (130 lines)
-- **Tests**: 14 mlx-lm reference tests
-- **Docs**: [`causal-mask-bug-fix.md`](docs/causal-mask-bug-fix.md), [`causal-mask-root-cause.md`](docs/causal-mask-root-cause.md)
-
-### Feature Alignment ✅
-
-Implemented repetition penalty, BatchKVCache, entropy filtering, and RotatingKVCache for 90% MLX-LM parity.
-
-- **Added**: 1,308+ lines Rust code, 69+ tests
-- **Impact**: Production-ready GRPO training
-- **Docs**: [`FEATURE_ALIGNMENT_SESSION.md`](docs/FEATURE_ALIGNMENT_SESSION.md)
-
-### Infrastructure Improvements ✅ (November 2025)
-
-Rust-based model persistence, thread-safe handle management, complete Rust migration.
-
-- **Performance**: Test runtime 234s → 34s
-- **Speedup**: Expected 15-25% training improvement
-
-### GRPO Trainer Refactoring ✅ (December 2025)
-
-Unified reward API with pre-parsed tool calls, 62 Rust tests, improved tool-use training.
-
-**Reward API Changes:**
-
-- Old: `RewardFunction = (prompts, completions, answers) => rewards`
-- New: `RewardFunction = (outputs: RewardOutput[]) => rewards`
-- `RewardOutput` includes pre-parsed `toolCalls`, extracted `thinking`, `numTokens`
-
-**Rust Tests Added (62 total):**
-
-- `advantages.rs`: 16 tests for advantage computation
-- `entropy.rs`: 21 tests for entropy filtering
-- `loss.rs`: 25 tests for GRPO/DAPO/Dr.GRPO/BNPO loss variants
-
-**Tool-Use Training:**
-
-- New `ast-grep-dataset.ts` (817 lines) with curriculum learning (50+ patterns)
-- Enhanced system prompt with concrete examples
-- Simplified reward function using pre-parsed tool calls
-
-📚 **Full History**: See [`DEVELOPMENT_HISTORY.md`](docs/DEVELOPMENT_HISTORY.md) for detailed session notes
-
----
-
-## 🏗️ Architecture
-
-**Clean Separation**: Rust for compute, TypeScript for orchestration
+## Architecture
 
 ```
-┌─────────────────────────────────────────┐
-│  TypeScript Layer (3,712 lines)         │  ← Orchestration, I/O, config
-│  - GRPO trainer, logging, config        │
-│  - Model configs & loader               │
-│  - Dataset, rewards, XML parsing        │
-├─────────────────────────────────────────┤
-│  Rust Compute Layer (~25,000 lines)    │  ← 245+ NAPI exports
-│  - Qwen3 model (2,205 lines)            │  ← 5 modules (model, config, generation, persistence)
-│  - Transformers (2,100 lines)           │  ← Attention, KVCache, BatchKVCache, RotatingKVCache
-│  - Array ops (extensive)                │  ← Core ops, padding, masking
-│  - GRPO components (~3,000 lines)       │  ← Loss, advantages, entropy, engine, 62 tests
-│  - Gradients (manual, 3 modules)        │  ← Activation, loss, nn gradients
-│  - Optimizers (4 types, 5 modules)      │  ← Adam, AdamW, SGD, RMSprop
-│  - Sampling (434 lines)                 │  ← All strategies + repetition penalty
-│  - Autograd (360 lines)                 │  ← MLX value_and_grad integration
-│  - Functional (550 lines)               │  ← Stateless forward pass components
-│  - Param Manager (200 lines)            │  ← Parameter flattening/mapping
-│  - Tokenizer (781 lines)                │  ← HuggingFace integration + Jinja2
-│  - Tools (147 lines)                    │  ← Tool call/thinking parsing
-│  - Utilities (batch gen, safetensors)   │  ← Supporting utilities
-├─────────────────────────────────────────┤
-│  NAPI-RS → FFI → C++ Bridge → MLX      │
-│  Metal/Accelerate GPU Backend           │
-└─────────────────────────────────────────┘
-```
-
-### Rust Crate Inventory
-
-| Crate        | Purpose                          | Key Modules                                       |
-| ------------ | -------------------------------- | ------------------------------------------------- |
-| **mlx-sys**  | Low-level MLX bindings           | FFI, C++ bridge                                   |
-| **mlx-core** | All ML operations (NAPI exports) | Arrays, NN, Transformers, Qwen3, GRPO, Optimizers |
-
-#### mlx-core Modules
-
-| Module          | Purpose                                                                      |
-| --------------- | ---------------------------------------------------------------------------- |
-| `array/`        | 90+ core ops, padding, masking, thread-safe handles                          |
-| `nn/`           | Activations (SiLU, GELU, etc.), Linear, RMSNorm, Embedding, Losses           |
-| `transformer/`  | Attention, KVCache, BatchKVCache, RotatingKVCache, MLP, TransformerBlock     |
-| `models/qwen3/` | Complete Qwen3 implementation (model, config, generation, persistence)       |
-| `sampling.rs`   | Temperature, top-k/p, min-p, repetition penalty                              |
-| `tokenizer.rs`  | HuggingFace tokenizers integration                                           |
-| `grpo/`         | GRPO/DAPO/Dr.GRPO/BNPO loss, advantages, entropy, engine, 62 Rust tests      |
-| `optimizers/`   | Adam, AdamW, SGD, RMSprop                                                    |
-| `gradients/`    | Manual backward passes for activations, losses, nn layers                    |
-| `autograd.rs`   | MLX value_and_grad integration                                               |
-| `tools/`        | Tool call parsing (`<tool_call>` tags), thinking extraction (`<think>` tags) |
-| `utils/`        | Batch generation, SafeTensors loading, functional components                 |
-
-**Total**: ~25,000 lines of Rust across 3 crates (mlx-sys, mlx-core, mlx-tui)
-
----
-
-## 📁 Project Structure
-
-The project is organized as a Cargo/npm workspace monorepo with 2 Rust crates and 3 npm packages:
-
-```
-mlx-node/
-├── Cargo.toml                      # Cargo workspace root
-├── package.json                    # npm workspaces root
-├── vitest.config.ts                # Shared test configuration
-├── tsconfig.json                   # TypeScript project references
-├── tsconfig.base.json              # Shared TypeScript settings
-│
-├── crates/                         # Rust workspace members
-│   ├── mlx-sys/                    # Low-level MLX C bindings
-│   │   ├── src/lib.rs              # Rust FFI (110+ functions)
-│   │   ├── src/mlx.cpp             # C++ bridge (1400+ lines)
-│   │   └── mlx/                    # MLX git submodule
-│   │
-│   ├── mlx-tui/                    # Training TUI (Ratatui)
-│   │   ├── src/main.rs             # Entry point, process spawning, event loop
-│   │   ├── src/app.rs              # App state, message handling
-│   │   ├── src/messages.rs         # JSONL message types (Training→TUI)
-│   │   ├── src/commands.rs         # Control commands (TUI→Training)
-│   │   └── src/ui/                 # UI components (header, metrics, logs, etc.)
-│   │
-│   └── mlx-core/                   # @mlx-node/core - All NAPI exports
-│       └── src/
-│           ├── array/              # Array ops, padding, masking
-│           ├── nn/                 # Activations, layers, losses
-│           ├── transformer/        # Attention, KVCache, blocks
-│           ├── models/qwen3/       # Qwen3 model implementation
-│           ├── sampling.rs         # All sampling strategies
-│           ├── tokenizer.rs        # HuggingFace tokenizers + Jinja2 templates
-│           ├── tools/              # Tool call/thinking parsing
-│           ├── grpo/               # GRPO loss, advantages, entropy
-│           ├── optimizers/         # Adam, AdamW, SGD, RMSprop
-│           ├── gradients/          # Manual backward passes
-│           ├── autograd.rs         # Automatic differentiation
-│           └── utils/              # Batch generation, safetensors
-│
-├── packages/                       # npm workspace packages
-│   ├── core/                       # @mlx-node/core (native addon)
-│   │   ├── package.json
-│   │   ├── tsconfig.json           # composite: true
-│   │   ├── src/index.ts            # TypeScript exports + helpers
-│   │   └── index.cjs               # Generated NAPI binding
-│   │
-│   ├── lm/                         # @mlx-node/lm (pure TS, aligned with mlx-lm)
-│   │   ├── package.json            # deps: @mlx-node/core
-│   │   ├── tsconfig.json           # refs: [core]
-│   │   └── src/
-│   │       ├── index.ts            # Model utilities
-│   │       ├── models/             # Model loader, Qwen3 configs
-│   │       └── tools/              # Tool definition types, helpers
-│   │
-│   └── trl/                        # @mlx-node/trl (pure TS, aligned with TRL)
-│       ├── package.json            # deps: @mlx-node/core, @mlx-node/lm
-│       ├── tsconfig.json           # refs: [core, lm]
-│       └── src/
-│           ├── index.ts            # Training exports
-│           ├── trainers/           # GRPO trainer, logger, config
-│           ├── data/               # Dataset handling
-│           ├── rewards.ts          # Reward functions
-│           └── utils/              # XML parser
-│
-├── __test__/                       # Test suite (~600 tests)
-│   ├── core/                       # Core ops, layers, transformers
-│   ├── trainers/                   # GRPO training tests
-│   ├── models/                     # Qwen3 model tests
-│   ├── utils/                      # Utility tests
-│   └── tokenization/               # Tokenizer tests
-│
-├── docs/                           # Technical documentation
-├── assets/tokenizers/              # Qwen3 tokenizer files (15 MB)
-└── src/index.ts                    # Root backward-compat shim
+┌──────────────────────────────────────────────────┐
+│  TypeScript Layer (7,671 lines, 5 packages)      │
+│  @mlx-node/lm   - Inference, streaming, configs  │
+│  @mlx-node/trl  - GRPO/SFT training, datasets    │
+│  @mlx-node/vlm  - VLM, document pipelines        │
+│  @mlx-node/cli  - Model download, conversion      │
+│  @mlx-node/core - Native addon (NAPI bindings)    │
+├──────────────────────────────────────────────────┤
+│  Rust Compute Layer (~100,000 lines, 5 crates)   │
+│  Models: Qwen3, Qwen3.5 Dense/MoE, PaddleOCR-VL │
+│  Document: DocLayout, TextDet, TextRec, Ori, Unwarp│
+│  Training: GRPO engine, SFT engine, autograd      │
+│  Infra: transformers, sampling, tokenizer, KVCache │
+│  Paged attention with Metal kernels               │
+├──────────────────────────────────────────────────┤
+│  C++ Bridge (7,700 lines) → Compiled forward paths│
+│  221 FFI functions, compiled decode (mlx::compile) │
+├──────────────────────────────────────────────────┤
+│  MLX → Metal/Accelerate GPU Backend               │
+└──────────────────────────────────────────────────┘
 ```
 
 ### Package Dependency Chain
 
 ```
-@mlx-node/core (internal) ← @mlx-node/lm (inference) ← @mlx-node/trl (training)
+@mlx-node/core (Rust/NAPI native addon - 328 exports)
+    ├── @mlx-node/lm   (inference: models, streaming, profiling, tools)
+    │     ├── @mlx-node/trl (training: GRPO, SFT, datasets, rewards)
+    │     └── @mlx-node/vlm (vision: VLM, OCR, document pipeline)
+    └── @mlx-node/cli  (CLI: download, convert)
 ```
 
-**Note**: `@mlx-node/core` is internal - import from `@mlx-node/lm` or `@mlx-node/trl` instead.
+### Rust Crate Inventory
 
-### Import Patterns
+| Crate              | Lines                  | Purpose                                         |
+| ------------------ | ---------------------- | ----------------------------------------------- |
+| **mlx-core**       | 82,339                 | All NAPI exports: models, training, ops, vision |
+| **mlx-paged-attn** | 8,473 + 2,043 Metal    | PagedAttention with Metal kernels               |
+| **mlx-tui**        | 5,567                  | Ratatui training TUI (`mlx-train` binary)       |
+| **mlx-db**         | 2,345                  | SQLite training output persistence              |
+| **mlx-sys**        | 1,148 Rust + 7,717 C++ | Low-level MLX FFI bridge                        |
 
-```typescript
-// LM (inference - models, tokenizers, configs)
-import { Qwen3Model, Qwen3Tokenizer, ModelLoader, QWEN3_CONFIGS } from '@mlx-node/lm';
+### mlx-core Key Modules
 
-// TRL (training - trainers, optimizers, gradients, layers)
-import { GRPOTrainer, GRPOConfig, Adam, MxArray, Linear } from '@mlx-node/trl';
-
-// Typical inference script:
-import { Qwen3Model, ModelLoader } from '@mlx-node/lm';
-
-// Typical training script:
-import { ModelLoader, QWEN3_CONFIGS } from '@mlx-node/lm';
-import { GRPOTrainer, GRPOConfig, Adam } from '@mlx-node/trl';
-```
+| Module               | Lines  | Purpose                                                                  |
+| -------------------- | ------ | ------------------------------------------------------------------------ |
+| `models/`            | 36,867 | 9 model implementations (see Models section)                             |
+| `transformer/`       | 9,228  | Attention, KVCache, BatchKVCache, RotatingKVCache, QuantizedKVCache, MLP |
+| `utils/`             | 6,981  | GGUF, foreign weights, SafeTensors, functional, pickle, imatrix          |
+| `grpo/`              | 6,505  | GRPO/DAPO/Dr.GRPO/BNPO loss, advantages, entropy, engine, rewards        |
+| `array/`             | 3,972  | 90+ core ops, padding, masking, thread-safe handles                      |
+| `nn/`                | 4,010  | Activations, Linear, Conv1d, RMSNorm, LayerNorm, Embedding, Losses       |
+| `vision/`            | 2,178  | Conv2d, interpolate, vision encoder, embeddings, projector, 2D RoPE      |
+| `optimizers/`        | 2,203  | Adam, AdamW, SGD, RMSprop                                                |
+| `convert.rs`         | 1,765  | Model conversion (dtype, quantization, FP8, recipes)                     |
+| `sft/`               | 1,192  | SFT training engine with autograd                                        |
+| `output_store/`      | 1,155  | Training output persistence (SQLite)                                     |
+| `tools/`             | 1,004  | Tool call/thinking parsing (`<tool_call>`, `<think>` tags)               |
+| `tokenizer.rs`       | 1,054  | HuggingFace tokenizers + Jinja2 chat templates                           |
+| `sampling.rs`        | 882    | Temperature, top-k/p, min-p, repetition penalty                          |
+| `decode_profiler.rs` | 706    | Per-generation profiling with TTFT, memory snapshots                     |
+| `autograd.rs`        | 503    | MLX value_and_grad integration                                           |
+| `profiling.rs`       | 417    | Global profiling store, NAPI exports                                     |
 
 ---
 
-## 🚀 What's Implemented
+## Models (9 implementations)
 
-### Phase 1: Core Operations (✅ 100%)
+### Language Models
 
-90 array/tensor operations: random generation, arithmetic, linear algebra, reductions (sum, mean, logsumexp), comparison, logical, shape manipulation, math functions, type conversion, indexing, padding
+| Model             | Lines | generate() | chat() | chatStream() | Training | Special                               |
+| ----------------- | ----- | :--------: | :----: | :----------: | :------: | ------------------------------------- |
+| **Qwen3**         | 7,061 |    Yes     |  Yes   |      No      | GRPO/SFT | Speculative decoding, Paged attention |
+| **Qwen3.5 Dense** | 6,768 |    Yes     |  Yes   |     Yes      |    No    | Compiled C++ forward, VLM variant     |
+| **Qwen3.5 MoE**   | 4,267 |    Yes     |  Yes   |     Yes      |    No    | Compiled C++ forward, VLM variant     |
 
-### Phase 2: Neural Networks (✅ 100%)
+### Vision-Language Models
 
-- **Activations (7)**: SiLU, GELU, ReLU, Sigmoid, Softmax, LogSoftmax, SwiGLU
-- **Layers (4)**: Linear, RMSNorm, LayerNorm, Embedding
-- **Losses (3)**: CrossEntropy, KLDivergence, MSE
+| Model            | Lines      | Purpose                                                              |
+| ---------------- | ---------- | -------------------------------------------------------------------- |
+| **PaddleOCR-VL** | 6,770      | OCR + document understanding (ERNIE language model + vision encoder) |
+| **Qwen3.5 VLM**  | integrated | Vision encoder (27 layers) on Qwen3.5 dense/MoE with LRU image cache |
 
-### Phase 3: Gradients & Optimizers (✅ 100%)
+### Document Processing Pipeline
 
-- **Backward Passes (7)**: CrossEntropy, MSE, Linear, RMSNorm, SiLU, ReLU, Sigmoid
-- **Optimizers (4)**: Adam, AdamW, SGD, RMSprop
-- **Utilities**: Gradient clipping (global norm + value), LR schedulers (4 types)
+| Model                 | Lines | Purpose                                                              |
+| --------------------- | ----- | -------------------------------------------------------------------- |
+| **PP-DocLayoutV3**    | 6,680 | Document layout analysis (RT-DETR + HGNetV2 backbone, 25 categories) |
+| **PP-TextDet**        | 2,082 | Text line detection (DBNet with PPHGNetV2 backbone)                  |
+| **PP-TextRec**        | 1,635 | Text recognition (SVTR neck + CTC head, character dictionary)        |
+| **PP-DocOrientation** | 695   | 4-class orientation classifier (0/90/180/270 degrees)                |
+| **PP-DocUnwarp**      | 895   | Document dewarping via 2D displacement field (UVDocNet)              |
 
-### Phase 4: Transformers (✅ 100%)
+### Compiled C++ Forward Paths
 
-- **Components (6)**: KVCache, **BatchKVCache**, **RotatingKVCache**, Attention, FusedAttention, MLP, TransformerBlock
-- **Features**: GQA, QK normalization, RoPE, KV caching, pre-norm architecture, left-padding support
+Qwen3.5 models use `mlx::core::compile` for graph caching — traces forward pass once, reuses via `compile_replace`. Files:
 
-### Phase 5: GRPO Training (✅ 100% PRODUCTION-READY)
-
-**Core Components:**
-
-- ✅ GRPO loss (4 variants: GRPO, DAPO, Dr.GRPO, BNPO)
-- ✅ Importance sampling (token-level & sequence-level)
-- ✅ Advantage computation (group-based normalization)
-- ✅ **Entropy filtering** (selective training on high-uncertainty tokens)
-- ✅ Training loop with checkpointing
-- ✅ Logging & metrics tracking
-- ✅ Dataset handling
-- ✅ Reward functions
-
-**Model & Generation:**
-
-- ✅ Qwen3 model with generation
-- ✅ Logprobs tracking
-- ✅ Tokenizer (HuggingFace, 151K vocab)
-- ✅ **Chat API** (`model.chat()`) with tool calling support
-- ✅ **Tool call parsing** (JSON/XML formats, `<tool_call>` tags)
-- ✅ **Thinking extraction** (`<think>` tags for chain-of-thought)
-- ✅ **Jinja2 templates** (chat formatting with tools)
-
-**Sampling Strategies:**
-
-- ✅ Temperature scaling
-- ✅ Top-k sampling
-- ✅ Top-p (nucleus) sampling
-- ✅ Min-p sampling
-- ✅ **Repetition penalty** (reduce repetitive text)
-
-**Batch Processing:**
-
-- ✅ **BatchKVCache** (variable-length batches with left-padding)
-- ✅ Batch generation utilities (padding, masking)
-- ✅ Efficient memory management
+- `mlx_qwen35.cpp` (285 lines) — dense compiled decode
+- `mlx_qwen35_moe.cpp` (772 lines) — MoE compiled decode with expert routing
+- `mlx_qwen35_vlm.cpp` (199 lines) — VLM compiled prefill
+- `mlx_qwen35_common.h` (712 lines) — shared helpers (linear_proj, attn, GDN, RoPE)
 
 ---
 
-## 💡 API Design
+## Training
 
-**TypedArray-First**: All APIs use TypedArrays (`Float32Array`, `Int32Array`, `BigInt64Array`) for performance
+### GRPO (Group-based Relative Policy Optimization)
 
-```javascript
-// Array creation
-const arr = MxArray.fromFloat32(new Float32Array([1, 2, 3]), BigInt64Array.from([3n]));
-
-// Sampling with all features
-const token = sample(logits, {
-  temperature: 0.8,
-  topK: 50,
-  topP: 0.95,
-  minP: 0.05,
-  repetitionPenalty: 1.2,
-});
-
-// BatchKVCache for variable-length batches
-const cache = new BatchKVCache([1, 2, 0]); // left padding per batch
-const [keys, values] = cache.updateAndFetch(newKeys, newValues);
-cache.filter([0, 2]); // Keep only certain batch elements
-
-// Transformer with rotating cache
-const cache = new RotatingKVCache({ maxSize: 2048, keep: 128 });
-const block = new TransformerBlock(512, 8, 2, 2048, 1e-5);
-const output = block.forward(x, null, cache);
-
-// GRPO training with entropy filtering
-const config = {
-  topEntropyQuantile: 0.8, // Train on top 20% uncertain tokens
-  lossType: 'grpo',
-  importanceSamplingLevel: 'token',
-  clipEpsilon: 0.2,
-};
-```
-
-### Chat API (`model.chat()`)
-
-High-level conversational interface with built-in tool calling and thinking extraction.
+Production-ready with 4 loss variants (GRPO, DAPO, Dr.GRPO, BNPO), entropy filtering, importance sampling, batch generation, reward functions.
 
 ```typescript
-// Simple chat
-const result = await model.chat(messages);
-console.log(result.text);
+import { ModelLoader } from '@mlx-node/lm';
+import { GRPOTrainer, GRPOConfig } from '@mlx-node/trl';
+```
 
-// With tools
-const result = await model.chat(messages, {
-  tools: [weatherTool, searchTool],
-  maxNewTokens: 2048,
-  temperature: 0.7,
-});
+### SFT (Supervised Fine-Tuning)
 
-// Handle tool calls
-for (const call of result.toolCalls) {
-  if (call.status === 'ok') {
-    console.log(call.name, call.arguments); // Arguments is already a JS object!
-  }
-}
+Full SFT training engine with autograd, gradient accumulation, NaN detection, gradient clipping, weight decay, checkpoint resume.
 
-// Access thinking (chain-of-thought reasoning)
-if (result.thinking) {
-  console.log('Model reasoning:', result.thinking);
+```typescript
+import { SFTTrainer, SFTTrainerConfig } from '@mlx-node/trl';
+```
+
+### Autograd
+
+Functional forward pass architecture — stateless transformer components enable MLX to trace the computation graph from parameters to loss. 311 gradients computed automatically for full Qwen3 model.
+
+---
+
+## Key Features
+
+### Streaming API
+
+AsyncGenerator-based `chatStream()` for Qwen3.5 models:
+
+```typescript
+import { Qwen35Model } from '@mlx-node/lm';
+for await (const event of model.chatStream(messages, config)) {
+  if (!event.done) process.stdout.write(event.text);
 }
 ```
 
-**`chat()` vs `generate()`:**
+### CLI Tool (`@mlx-node/cli`)
 
-| Feature          | `chat()`                      | `generate()`                |
-| ---------------- | ----------------------------- | --------------------------- |
-| **Purpose**      | Conversational AI with tools  | Raw text generation         |
-| **Input**        | Chat messages                 | Token IDs (MxArray)         |
-| **Tool Support** | Built-in tool calling         | None                        |
-| **Thinking**     | Extracts `<think>` content    | Raw text only               |
-| **Output**       | Structured `ChatResult`       | Basic `GenerationResult`    |
-| **Use Case**     | Chat apps, agents, assistants | Training, low-level control |
+```bash
+mlx download model --model Qwen/Qwen3-0.6B   # Download from HuggingFace
+mlx download dataset                           # Download + Parquet→JSONL
+mlx convert --model ./model --dtype bf16       # Weight conversion
+mlx convert --model ./model --quantize --q-recipe mixed_4_6  # Quantization
+mlx convert --model ./model.gguf               # GGUF→SafeTensors
+```
 
----
+### Document Processing Pipeline
 
-## 📈 Implementation Roadmap
+```typescript
+import { StructureV3Pipeline } from '@mlx-node/vlm';
+const pipeline = await StructureV3Pipeline.load(modelDir);
+const result = await pipeline.analyze(imageBuffer);
+```
 
-### ✅ Phase 5: GRPO Training (COMPLETE)
+### Profiling
 
-All production features for GRPO training with Qwen3 are now implemented and tested.
+Enable via `enableProfiling()` from `@mlx-node/lm` or `MLX_PROFILE_DECODE=1` env var. Reports per-generation timing, phase breakdown (forward, sample, eval, extract), memory snapshots, and TTFT.
 
-**Feature Parity Achieved:**
-
-- **MLX-LM**: 90% (9/10 features, missing only Qwen3-MoE)
-- **TRL GRPO**: 100% (14/14 features)
-
-**Production Capabilities:**
-
-- Train Qwen3 models with GRPO/DAPO/Dr.GRPO/BNPO
-- Batch generation with variable-length prompts
-- High-quality text generation with repetition control
-- Entropy-based selective training
-- Memory-efficient caching (standard, batch, rotating)
-- Comprehensive test coverage (614 tests, 100% pass rate)
-
-### ✅ Phase 6: Autograd (COMPLETE)
-
-**Goal**: ✅ Automatic differentiation through computation graph
-
-**Implementation**:
-
-- Core autograd infrastructure (360 lines in `autograd.rs`)
-- Functional forward pass architecture (550 lines in `utils/functional.rs`)
-- Parameter management system (200 lines in `param_manager.rs`)
-- GRPO integration (198 lines in `grpo/autograd.rs`)
-
-**Key Achievement**: **Functional Forward Pass Architecture**
-
-- Stateless transformer components that take parameters as arguments
-- Enables MLX to trace computation graph from parameters to loss
-- 311 gradients computed automatically for full Qwen3 model
-- Production-ready for training without manual gradient implementation
-
-**Tests**: 3 comprehensive integration tests passing
-
-- Simple autograd (quadratic functions, basic ops)
-- Full model autograd (Qwen3 forward pass)
-- GRPO training with autograd
-
-**Status**: ✅ Production-ready, fully integrated with GRPO training
-
-### 🔮 Future Enhancements
-
-**Qwen3-MoE** (optional, ~700 lines)
-
-- Mixture-of-Experts model architecture
-- Research complete, ready to implement
-- Requires 1 new MLX operation (`gather_mm`)
-- Estimated: 10-12 hours implementation time
+**Note**: MLX lazy evaluation means `prefillMs` measures only graph construction (~1ms). Use `timeToFirstTokenMs` (TTFT) as the real prefill latency indicator.
 
 ---
 
-## 💻 Development Guide
+## Project Structure
+
+```
+mlx-node/
+├── Cargo.toml                        # Cargo workspace (5 crates)
+├── package.json                      # npm workspaces (5 packages + examples)
+├── vite.config.ts                    # Vitest + Oxlint + Oxfmt config
+├── tsconfig.json                     # TypeScript project references
+│
+├── crates/
+│   ├── mlx-sys/                      # Low-level MLX C/C++ bindings
+│   │   ├── src/lib.rs                # 221 FFI declarations
+│   │   ├── src/mlx_*.cpp             # 11 C++ bridge files (6,702 lines)
+│   │   ├── src/mlx_*.h               # 2 headers (1,015 lines)
+│   │   └── mlx/                      # MLX git submodule
+│   │
+│   ├── mlx-core/                     # @mlx-node/core - All NAPI exports
+│   │   └── src/
+│   │       ├── array/                # Core tensor ops (3,972 lines)
+│   │       ├── nn/                   # Neural network layers (4,010 lines)
+│   │       ├── transformer/          # Attention, caches, blocks (9,228 lines)
+│   │       ├── models/               # 9 model implementations (36,867 lines)
+│   │       │   ├── qwen3/            # Qwen3 (7,061 lines)
+│   │       │   ├── qwen3_5/          # Qwen3.5 Dense + VLM (6,768 lines)
+│   │       │   ├── qwen3_5_moe/      # Qwen3.5 MoE (4,267 lines)
+│   │       │   ├── paddleocr_vl/     # PaddleOCR VLM (6,770 lines)
+│   │       │   ├── pp_doclayout_v3/  # Document layout (6,680 lines)
+│   │       │   ├── pp_text_det/      # Text detection (2,082 lines)
+│   │       │   ├── pp_text_rec/      # Text recognition (1,635 lines)
+│   │       │   ├── pp_doc_ori/       # Orientation (695 lines)
+│   │       │   └── pp_doc_unwarp/    # Dewarping (895 lines)
+│   │       ├── vision/               # Shared vision components (2,178 lines)
+│   │       ├── grpo/                 # GRPO training (6,505 lines)
+│   │       ├── sft/                  # SFT training (1,192 lines)
+│   │       ├── optimizers/           # Adam, AdamW, SGD, RMSprop (2,203 lines)
+│   │       ├── gradients/            # Manual backward passes (974 lines)
+│   │       ├── utils/                # GGUF, foreign weights, functional (6,981 lines)
+│   │       ├── output_store/         # Training persistence (1,155 lines)
+│   │       ├── tools/                # Tool call/thinking parsing (1,004 lines)
+│   │       ├── convert.rs            # Model conversion pipeline (1,765 lines)
+│   │       ├── tokenizer.rs          # HuggingFace + Jinja2 (1,054 lines)
+│   │       ├── sampling.rs           # All sampling strategies (882 lines)
+│   │       ├── decode_profiler.rs    # Generation profiling (706 lines)
+│   │       ├── autograd.rs           # Automatic differentiation (503 lines)
+│   │       └── profiling.rs          # Global profiling store (417 lines)
+│   │
+│   ├── mlx-paged-attn/              # PagedAttention + Metal kernels
+│   │   ├── src/                      # 8,473 Rust lines
+│   │   └── metal/                    # 2,043 lines of Metal shaders
+│   │
+│   ├── mlx-tui/                      # Training TUI (Ratatui, 5,567 lines)
+│   └── mlx-db/                       # SQLite persistence (2,345 lines)
+│
+├── packages/
+│   ├── core/                         # @mlx-node/core (native addon)
+│   ├── lm/                           # @mlx-node/lm (808 lines)
+│   │   └── src/
+│   │       ├── stream.ts             # AsyncGenerator chatStream wrapper
+│   │       ├── profiling.ts          # JS profiling API
+│   │       ├── models/               # ModelLoader, Qwen3/3.5 configs
+│   │       └── tools/                # Tool definition types
+│   ├── trl/                          # @mlx-node/trl (5,298 lines)
+│   │   └── src/
+│   │       ├── trainers/             # GRPO trainer, SFT trainer, logger, configs
+│   │       ├── data/                 # Dataset, SFT dataset
+│   │       └── utils/                # XML parser, path security
+│   ├── vlm/                          # @mlx-node/vlm (633 lines)
+│   │   └── src/
+│   │       ├── models/               # PaddleOCR-VL configs
+│   │       └── pipeline/             # StructureV3Pipeline
+│   └── cli/                          # @mlx-node/cli (932 lines)
+│       └── src/commands/             # download-model, download-dataset, convert
+│
+├── __test__/                         # 415 TypeScript tests (9,125 lines)
+│   ├── core/                         # Autograd, functional, profiling
+│   ├── models/                       # All model tests
+│   ├── trainers/                     # GRPO, SFT tests
+│   ├── tokenization/                 # Tokenizer tests
+│   ├── tools/                        # Chat tests
+│   └── utils/                        # Dataset, XML, path security
+│
+└── examples/                         # Example scripts
+```
+
+---
+
+## Development Guide
 
 ### Building
 
 ```bash
 yarn install                      # Install dependencies
 yarn build                        # Build native + TypeScript
-yarn build:native                 # Build native addon only
-yarn build:ts                     # Build TypeScript packages only
-
-# Build TUI
-cargo build --release -p mlx-tui  # Build mlx-train binary
-
-# Testing
-yarn vite run test                # Run all tests
-yarn vitest __test__/path/to.ts   # Run specific test
+yarn build:native                 # Build native addon only (~70s incremental)
+yarn build:ts                     # Build TypeScript packages only (tsc -b)
+cargo build --release -p mlx-tui  # Build mlx-train TUI binary
 ```
 
-### Running Training with TUI
+### Testing
 
 ```bash
-# Build TUI first
-cargo build --release -p mlx-tui
+yarn vite run test                      # Run all TS tests (415 tests)
+yarn vitest __test__/path/to.test.ts    # Run specific TS test
+cargo test -p mlx-core                  # Run Rust tests (810 tests)
+cargo test -p mlx-paged-attn            # Run paged attention tests (83 tests)
+```
 
-# Run training with TUI visualization
-./target/release/mlx-train --script examples/train.ts -- --model ./models/qwen3
+### Lint & Format
 
-# TUI Keyboard shortcuts:
-# [p] Pause  [r] Resume  [s] Save checkpoint  [Tab] Switch tabs
-# [↑↓] Scroll  [m] Cycle sample mode  [?] Help  [q] Quit
+```bash
+yarn vite fmt                                           # Format TS/JS
+yarn vite lint --type-aware --type-check                # Lint TS/JS
+cargo clippy --all --fix --allow-dirty --allow-staged   # Rust lint
+cargo fmt                                               # Rust format
 ```
 
 ### Build Flow
 
 ```
-yarn build:native → packages/core/index.cjs + *.node
+yarn build:native → packages/core/index.cjs + mlx-core.darwin-arm64.node + mlx.metallib
 yarn build:ts     → packages/*/dist/ (via tsc -b with project references)
 ```
 
 ### Adding New Native Operations
 
 1. Add FFI binding in `crates/mlx-sys/src/lib.rs`
-2. Add C++ bridge in `crates/mlx-sys/src/mlx.cpp` (if needed)
+2. Add C++ bridge in appropriate `crates/mlx-sys/src/mlx_*.cpp` file
 3. Add Rust wrapper in `crates/mlx-core/src/` with `#[napi]` exports
 4. Run `yarn build:native` to generate NAPI binding + TypeScript definitions
 5. Add tests using TypedArray helpers
 
 ### Adding TypeScript Utilities
 
-1. Add to appropriate package (`lm` for inference, `trl` for training)
+1. Add to appropriate package (`lm` for inference, `trl` for training, `vlm` for vision, `cli` for CLI)
 2. Export from `packages/{package}/src/index.ts`
 3. Run `yarn build:ts && yarn typecheck`
 
-See `docs/FEATURE_ALIGNMENT_SESSION.md` for detailed examples
+---
+
+## Import Patterns
+
+```typescript
+// Inference
+import { Qwen3Model, Qwen35Model, ModelLoader, QWEN3_CONFIGS } from '@mlx-node/lm';
+
+// Training
+import { GRPOTrainer, GRPOConfig, SFTTrainer } from '@mlx-node/trl';
+
+// Vision & Document Processing
+import { VLModel, StructureV3Pipeline, DocLayoutModel } from '@mlx-node/vlm';
+
+// Streaming
+import { Qwen35Model } from '@mlx-node/lm';
+for await (const event of model.chatStream(messages)) { ... }
+```
 
 ---
 
-## 📊 Performance
+## Performance
 
 - **Metal GPU acceleration** on Apple Silicon
-- **Zero-copy TypedArray operations**
-- **Lazy evaluation** for operation fusion
-- **Build**: ~4.8s (incremental)
-- **Tests**: ~60s (614 tests, 41 files)
-- **Achieved speedups**: Sampling (3-5x), advantages (2-3x), padding (5-10x)
-- **Memory efficiency**: BatchKVCache, RotatingKVCache for bounded memory usage
+- **Compiled forward passes** via `mlx::core::compile` for graph caching
+- **Qwen3.5 Dense**: ~6.4 tok/s on M3 Max (matches Python mlx-lm)
+- **Qwen3.5 MoE**: ~47-52 tok/s (compiled + MXFP8 quantization)
+- **Paged attention** with Metal kernels for memory-efficient serving
+- **Quantization**: 4-bit affine, MXFP8, FP8 dequant, mixed-precision recipes
+- **Quantized KV cache**: FP8/INT8 for reduced memory during inference
 
-### Profiling API
+### Key Performance Patterns
 
-Enable via `enableProfiling()` / `disableProfiling()` from `@mlx-node/lm`, or set `MLX_PROFILE_DECODE=1` env var (highest priority). Writes a JSON report with per-generation timing, phase breakdown, memory snapshots, and TTFT.
-
-**Key files**: `crates/mlx-core/src/profiling.rs` (global store + NAPI exports), `crates/mlx-core/src/decode_profiler.rs` (per-loop instrumentation), `packages/lm/src/profiling.ts` (JS API + env var auto-mode)
-
-**MLX lazy evaluation and profiling metrics**: MLX uses lazy evaluation — `forward_inner()` only builds the computation graph without executing GPU work. The actual prefill computation is triggered by the first `y.eval()` call in the decode loop. As a result, the profiler's `prefillMs` field measures only graph construction time (~1ms), not the real GPU prefill latency. The true user-perceived prefill cost is captured by `timeToFirstTokenMs` (TTFT), which measures from prefill start to first token extraction and includes the first `eval_token` where the lazy prefill graph is materialized on GPU. When interpreting profiling reports, use TTFT (not `prefillMs`) as the real prefill latency indicator.
-
----
-
-## 📚 References
-
-**External**:
-
-- [MLX Documentation](https://ml-explore.github.io/mlx/)
-- [GRPO Paper](https://arxiv.org/abs/2402.03300)
-- [NAPI-RS](https://napi.rs/)
-- [TRL Library](https://github.com/huggingface/trl)
-
-**Technical Documentation**:
-
-- **Development history**: [`docs/DEVELOPMENT_HISTORY.md`](docs/DEVELOPMENT_HISTORY.md) - Complete development timeline and lessons learned
-- Causal mask fix: [`docs/causal-mask-bug-fix.md`](docs/causal-mask-bug-fix.md)
-- Root cause analysis: [`docs/causal-mask-root-cause.md`](docs/causal-mask-root-cause.md)
-- Autograd integration: [`docs/AUTOGRAD_INTEGRATION.md`](docs/AUTOGRAD_INTEGRATION.md)
-- Feature alignment: [`docs/FEATURE_ALIGNMENT_SESSION.md`](docs/FEATURE_ALIGNMENT_SESSION.md)
-- SafeTensors loader: [`docs/SAFETENSORS_LOADER.md`](docs/SAFETENSORS_LOADER.md)
-
-**Key Implementation Files**:
-
-- Core: `crates/mlx-core/src/array/`, `crates/mlx-core/src/transformer/`
-- Masking: `crates/mlx-core/src/array/mask.rs` (causal mask generation)
-- Models: `crates/mlx-core/src/models/qwen3/`
-- Sampling: `crates/mlx-core/src/sampling.rs` (all strategies)
-- GRPO: `crates/mlx-core/src/grpo/` (loss, advantages, entropy, engine)
-- Tokenizer: `crates/mlx-core/src/tokenizer.rs` (includes security model documentation)
-- Orchestration: `packages/trl/src/trainers/grpo-trainer.ts`
-
-**Security Model**:
-
-Model files (`tokenizer.json`, `tokenizer_config.json`, SafeTensors weights) are assumed to be from **trusted sources**. The tokenizer loads Jinja2 chat templates from `tokenizer_config.json` which are executed with user message content. While minijinja sandboxes execution (no file system access, no code execution), malicious templates could cause DoS. See `crates/mlx-core/src/tokenizer.rs` for full security documentation.
+- `token.eval()` after sampling — prevents unbounded lazy graph
+- `synchronize_and_clear_cache()` every 256 steps — prevents memory accumulation
+- Dtype-aware scalar ops — ANY f32 scalar in binary op with bf16 promotes entire result to f32
+- Token-only eval — caches materialize through dependency graph (no need to eval all caches)
 
 ---
 
-## 🎯 Success Criteria
+## C++ FFI Files (crates/mlx-sys/src/)
 
-| Criteria                         | Status      | Notes                             |
-| -------------------------------- | ----------- | --------------------------------- |
-| Functional parity with MLX-LM    | ✅ 90%      | Missing only Qwen3-MoE (optional) |
-| Functional parity with TRL GRPO  | ✅ 100%     | All features implemented          |
-| Performance within 20% of Python | ✅ Expected | Rust-native implementation        |
-| Intuitive, well-documented API   | ✅ Complete | TypedArray-first design           |
-| Test coverage > 90%              | ✅ 100%     | All implemented features tested   |
-| Production ready                 | ✅ YES      | Ready for GRPO training at scale  |
+| File                   | Lines | Purpose                                                         |
+| ---------------------- | ----- | --------------------------------------------------------------- |
+| `mlx_advanced_ops.cpp` | 1,932 | quantized_matmul, gather_qmm, conv2d, FP8, PaddleOCR forward    |
+| `mlx_nn_ops.cpp`       | 875   | Neural network ops, data extraction, random, math               |
+| `mlx_qwen35_moe.cpp`   | 772   | Compiled MoE forward with expert routing                        |
+| `mlx_fused_ops.cpp`    | 628   | Fused attention, SwiGLU MLP, transformer block                  |
+| `mlx_array_ops.cpp`    | 622   | Array construction, arithmetic, indexing, dtype-safe scalar ops |
+| `mlx_misc_ops.cpp`     | 591   | Synchronization, compiled sampling pipeline                     |
+| `mlx_gated_delta.cpp`  | 388   | Metal GDN kernels, GPU architecture detection                   |
+| `mlx_qwen35.cpp`       | 285   | Compiled Qwen3.5 dense forward                                  |
+| `mlx_autograd.cpp`     | 223   | value_and_grad integration                                      |
+| `mlx_qwen35_vlm.cpp`   | 199   | VLM compiled prefill                                            |
+| `mlx_stream.cpp`       | 187   | Stream/device management, memory limits                         |
+| `mlx_qwen35_common.h`  | 712   | Shared helpers: linear_proj, attn, GDN, RoPE                    |
+| `mlx_common.h`         | 303   | FFI macros, error handling, array conversion                    |
 
 ---
 
-## 📝 Notes for Contributors
+## Security Model
 
-**Best Practices:**
+Model files are assumed from **trusted sources**. Jinja2 chat templates from `tokenizer_config.json` are executed with user message content (minijinja sandbox — no file/code access, but malicious templates could cause DoS).
 
-- Use TypedArrays for all data/shapes (`Float32Array`, `BigInt64Array`, etc.)
-- Test with appropriate floating-point tolerances
-- Consider Rust migration for performance-critical code
-- Follow established re-export pattern for clean APIs
+---
 
-**Known Limitations:**
+## Known Limitations
 
-- macOS only (Metal backend)
+- macOS only (Metal backend, Apple Silicon)
 - No CUDA support
-- Some advanced features from MLX-LM not yet implemented (e.g., Qwen3-MoE)
-
-**Recent Achievements:**
-
-- ✅ 614 tests passing (100% pass rate)
-- ✅ ~25,000 lines of Rust compute code
-- ✅ 13,702 lines of test code
-- ✅ Production-ready GRPO training
-- ✅ Autograd with functional forward pass
-- ✅ 90% feature parity with MLX-LM
-- ✅ 100% feature parity with TRL GRPO
-- ✅ Unified RewardOutput API with pre-parsed tool calls
-- ✅ 62 Rust tests for GRPO components
+- Compiled C++ forward paths use process-wide globals (serialized via Tokio mutex)
 
 ---
 
-_Last updated: December 2025_
-_Status: Production-ready for GRPO training with Qwen3_
-_Test Coverage: 100% (611/614 tests passing, 3 skipped)_
-_Code: ~25,000 Rust lines + 3,712 TypeScript lines + 13,702 test lines_
-_Feature Parity: 90% MLX-LM, 100% TRL GRPO_
-_Phase 6 Autograd: ✅ Complete and production-ready_
+_Last updated: March 2026_
+_Total Code: ~120,000 lines (100K Rust + 7.7K C++ + 2.5K Metal + 7.7K TS source + 9.1K TS tests)_
+_Tests: 1,315 (900 Rust + 415 TypeScript)_
+_Models: 9 (3 language + 2 VLM + 5 document processing)_
+_NAPI Exports: 328 | FFI Functions: 221_
 
 <!--VITE PLUS START-->
 
