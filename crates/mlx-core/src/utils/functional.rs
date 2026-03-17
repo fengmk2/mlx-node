@@ -9,8 +9,12 @@
  * gradients through the entire forward pass from parameters to loss.
  */
 use crate::array::{MxArray, scaled_dot_product_attention};
+use crate::autograd;
 use crate::models::qwen3::Qwen3Config;
+use crate::models::qwen3_5::Qwen3_5Config;
+use crate::models::qwen3_5_moe::Qwen3_5MoeConfig;
 use crate::nn::Activations;
+use crate::training_model::ModelType;
 use napi::bindgen_prelude::*;
 use std::collections::HashMap;
 
@@ -344,6 +348,18 @@ pub fn qwen3_forward_hidden_states(
     params: &HashMap<String, MxArray>,
     input_ids: &MxArray,
 ) -> Result<MxArray> {
+    let mut ckpt = autograd::CheckpointContexts::new();
+    qwen3_forward_hidden_states_impl(config, params, input_ids, false, &mut ckpt)
+}
+
+/// Qwen3 forward with optional gradient checkpointing.
+pub fn qwen3_forward_hidden_states_impl(
+    config: &Qwen3Config,
+    params: &HashMap<String, MxArray>,
+    input_ids: &MxArray,
+    use_checkpointing: bool,
+    ckpt_contexts: &mut autograd::CheckpointContexts,
+) -> Result<MxArray> {
     // 1. Embedding lookup
     let embedding_weight = params
         .get("embedding.weight")
@@ -354,21 +370,66 @@ pub fn qwen3_forward_hidden_states(
     // 2. Transformer layers
     let num_layers = config.num_layers as usize;
     for layer_idx in 0..num_layers {
-        // Get layer parameters
-        let layer_params = get_layer_params(params, layer_idx, config)?;
+        if use_checkpointing {
+            // Checkpointed path: collect layer params, wrap in checkpoint
+            let prefix = format!("layers.{}.", layer_idx);
+            let layer_param_names = collect_layer_param_names(params, &prefix);
 
-        // Forward through transformer block
-        hidden_states = transformer_block_functional(
-            &hidden_states,
-            &layer_params,
-            config.num_heads as u32,
-            config.num_kv_heads as u32,
-            config.head_dim as u32, // Use explicit head_dim from config (critical for Qwen3!)
-            config.rope_theta,
-            config.use_qk_norm,
-            config.rms_norm_eps,
-            0, // offset (no KV caching for training)
-        )?;
+            let mut inputs: Vec<&MxArray> = vec![&hidden_states];
+            for name in &layer_param_names {
+                inputs.push(
+                    params
+                        .get(name)
+                        .ok_or_else(|| Error::from_reason(format!("Missing {}", name)))?,
+                );
+            }
+
+            let names_clone = layer_param_names.clone();
+            let config_clone = config.clone();
+            let layer = layer_idx;
+
+            let outputs = autograd::checkpoint_apply(
+                inputs,
+                move |arrays| {
+                    let h_in = &arrays[0];
+                    let layer_params: HashMap<String, MxArray> = names_clone
+                        .iter()
+                        .enumerate()
+                        .map(|(i, name)| (name.clone(), arrays[i + 1].clone()))
+                        .collect();
+                    let block_params = get_layer_params(&layer_params, layer, &config_clone)?;
+                    let h_out = transformer_block_functional(
+                        h_in,
+                        &block_params,
+                        config_clone.num_heads as u32,
+                        config_clone.num_kv_heads as u32,
+                        config_clone.head_dim as u32,
+                        config_clone.rope_theta,
+                        config_clone.use_qk_norm,
+                        config_clone.rms_norm_eps,
+                        0,
+                    )?;
+                    Ok(vec![h_out])
+                },
+                ckpt_contexts,
+            )?;
+
+            hidden_states = outputs.into_iter().next().unwrap();
+        } else {
+            // Standard path
+            let layer_params = get_layer_params(params, layer_idx, config)?;
+            hidden_states = transformer_block_functional(
+                &hidden_states,
+                &layer_params,
+                config.num_heads as u32,
+                config.num_kv_heads as u32,
+                config.head_dim as u32,
+                config.rope_theta,
+                config.use_qk_norm,
+                config.rms_norm_eps,
+                0,
+            )?;
+        }
     }
 
     // 3. Final layer norm
@@ -758,6 +819,861 @@ fn get_layer_params<'a>(
         input_norm_weight,
         post_attn_norm_weight,
     })
+}
+
+// ============================================
+// Qwen3.5 Dense Model Forward (Functional)
+// ============================================
+
+/// RMS normalization without learnable weight (functional version).
+fn rms_norm_no_weight_functional(x: &MxArray, eps: f64) -> Result<MxArray> {
+    let original_dtype = x.dtype()?;
+    let x_f32 = x.astype(crate::array::DType::Float32)?;
+    let squared = x_f32.square()?;
+    let mean_squared = squared.mean(Some(&[-1]), Some(true))?;
+    let variance_plus_eps = mean_squared.add_scalar(eps)?;
+    let sqrt_var = variance_plus_eps.sqrt()?;
+    let normalized = x_f32.div(&sqrt_var)?;
+    normalized.astype(original_dtype)
+}
+
+/// RMSNormGated functional: swiglu(z, rms_norm(y, weight))
+/// Implements: silu(z) * rms_norm(y) * weight
+fn rms_norm_gated_functional(
+    y: &MxArray,
+    z: &MxArray,
+    weight: &MxArray,
+    eps: f64,
+) -> Result<MxArray> {
+    let y_normed = rms_norm_functional(y, weight, eps)?;
+    let z_activated = Activations::silu_for_autograd(z)?;
+    y_normed.mul(&z_activated)
+}
+
+/// Functional depthwise conv1d using MLX's native conv1d (has VJP support).
+/// weight: [channels, kernel_size, 1] (MLX Conv1d format for depthwise)
+/// input: [B, T, channels]
+/// groups = channels (depthwise convolution)
+fn functional_depthwise_conv1d(
+    input: &MxArray,
+    weight: &MxArray,
+    channels: i64,
+    _kernel_size: i64,
+) -> Result<MxArray> {
+    // Use MLX's native conv1d which has proper VJP for autograd.
+    // Parameters: stride=1, padding=0, dilation=1, groups=channels (depthwise)
+    let handle = unsafe {
+        mlx_sys::mlx_conv1d(
+            input.as_raw_ptr(),
+            weight.as_raw_ptr(),
+            1,               // stride
+            0,               // padding (we prepend zeros manually)
+            1,               // dilation
+            channels as i32, // groups = channels for depthwise
+        )
+    };
+    MxArray::from_handle(handle, "functional_conv1d")
+}
+
+/// GatedDeltaNet functional forward (linear attention layer).
+///
+/// Implements the full GDN pipeline: project -> conv1d -> gated_delta_update -> norm -> out_proj
+/// Uses `use_kernel=false` to ensure full differentiability for training.
+fn gated_delta_net_functional(
+    params: &HashMap<String, MxArray>,
+    x: &MxArray,
+    prefix: &str,
+    config: &Qwen3_5Config,
+) -> Result<MxArray> {
+    let batch = x.shape_at(0)?;
+    let seq_len = x.shape_at(1)?;
+
+    let num_k_heads = config.linear_num_key_heads;
+    let num_v_heads = config.linear_num_value_heads;
+    let key_head_dim = config.linear_key_head_dim;
+    let value_head_dim = config.linear_value_head_dim;
+    let key_dim = num_k_heads * key_head_dim;
+    let value_dim = num_v_heads * value_head_dim;
+    let conv_dim = key_dim * 2 + value_dim;
+    let conv_kernel_dim = config.linear_conv_kernel_dim;
+
+    // Project to qkvz
+    let qkvz_weight = params
+        .get(&format!("{}.in_proj_qkvz.weight", prefix))
+        .ok_or_else(|| Error::from_reason(format!("Missing {}.in_proj_qkvz.weight", prefix)))?;
+    let qkvz = linear_functional(x, qkvz_weight, None)?;
+
+    // Project to ba
+    let ba_weight = params
+        .get(&format!("{}.in_proj_ba.weight", prefix))
+        .ok_or_else(|| Error::from_reason(format!("Missing {}.in_proj_ba.weight", prefix)))?;
+    let ba = linear_functional(x, ba_weight, None)?;
+
+    // Split ba into b and a
+    let b = ba.slice_axis(2, 0, num_v_heads as i64)?;
+    let a = ba.slice_axis(2, num_v_heads as i64, (num_v_heads * 2) as i64)?;
+
+    // Split qkvz: qkv through conv, z bypasses
+    let qkv = qkvz.slice_axis(2, 0, conv_dim as i64)?;
+    let z = qkvz.slice_axis(2, conv_dim as i64, (key_dim * 2 + value_dim * 2) as i64)?;
+
+    // Conv1d: prepend zeros (no cache for training - full sequence)
+    let conv_weight = params
+        .get(&format!("{}.conv1d.weight", prefix))
+        .ok_or_else(|| Error::from_reason(format!("Missing {}.conv1d.weight", prefix)))?;
+    let pad_len = (conv_kernel_dim - 1) as i64;
+    let zeros = MxArray::zeros(&[batch, pad_len, conv_dim as i64], Some(qkv.dtype()?))?;
+    let conv_input = MxArray::concatenate(&zeros, &qkv, 1)?;
+
+    // Depthwise conv1d: use functional matmul-based implementation
+    let conv_out = functional_depthwise_conv1d(
+        &conv_input,
+        conv_weight,
+        conv_dim as i64,
+        conv_kernel_dim as i64,
+    )?;
+
+    // Take last seq_len timesteps
+    let conv_out_len = conv_out.shape_at(1)?;
+    let conv_out = if conv_out_len > seq_len {
+        conv_out.slice_axis(1, conv_out_len - seq_len, conv_out_len)?
+    } else {
+        conv_out
+    };
+
+    // SiLU activation (autograd-safe: tanh-based, avoids NaN gradients)
+    let conv_out = Activations::silu_for_autograd(&conv_out)?;
+
+    // Split into q, k, v
+    let q_flat = conv_out.slice_axis(2, 0, key_dim as i64)?;
+    let k_flat = conv_out.slice_axis(2, key_dim as i64, (key_dim * 2) as i64)?;
+    let v_flat = conv_out.slice_axis(2, (key_dim * 2) as i64, conv_dim as i64)?;
+
+    // Reshape to head format
+    let q = q_flat.reshape(&[batch, seq_len, num_k_heads as i64, key_head_dim as i64])?;
+    let k = k_flat.reshape(&[batch, seq_len, num_k_heads as i64, key_head_dim as i64])?;
+    let v = v_flat.reshape(&[batch, seq_len, num_v_heads as i64, value_head_dim as i64])?;
+
+    // RMS norm scaling (no learnable weight)
+    let inv_scale = (key_head_dim as f64).powf(-0.5);
+    let q_normed = rms_norm_no_weight_functional(&q, 1e-6)?;
+    let k_normed = rms_norm_no_weight_functional(&k, 1e-6)?;
+    let q = q_normed.mul_scalar(inv_scale * inv_scale)?;
+    let k = k_normed.mul_scalar(inv_scale)?;
+
+    // Gated delta update (use_kernel=false for differentiability)
+    let a_log = params
+        .get(&format!("{}.a_log", prefix))
+        .ok_or_else(|| Error::from_reason(format!("Missing {}.a_log", prefix)))?;
+    let dt_bias = params
+        .get(&format!("{}.dt_bias", prefix))
+        .ok_or_else(|| Error::from_reason(format!("Missing {}.dt_bias", prefix)))?;
+
+    use crate::models::qwen3_5::gated_delta::gated_delta_update;
+    let (y, _state) = gated_delta_update(&q, &k, &v, &a, &b, a_log, dt_bias, None, None, false)?;
+
+    // Reshape z to per-head format
+    let z = z.reshape(&[batch, seq_len, num_v_heads as i64, value_head_dim as i64])?;
+
+    // RMSNormGated: applies swiglu(z, rms_norm(y))
+    let norm_weight = params
+        .get(&format!("{}.norm.weight", prefix))
+        .ok_or_else(|| Error::from_reason(format!("Missing {}.norm.weight", prefix)))?;
+    let y_normed = rms_norm_gated_functional(&y, &z, norm_weight, config.rms_norm_eps)?;
+
+    // Flatten heads and output projection
+    let y_flat = y_normed.reshape(&[batch, seq_len, value_dim as i64])?;
+    let out_proj_weight = params
+        .get(&format!("{}.out_proj.weight", prefix))
+        .ok_or_else(|| Error::from_reason(format!("Missing {}.out_proj.weight", prefix)))?;
+    linear_functional(&y_flat, out_proj_weight, None)
+}
+
+/// Qwen3.5 full attention with gating and partial RoPE (functional).
+fn qwen3_5_attention_functional(
+    params: &HashMap<String, MxArray>,
+    x: &MxArray,
+    prefix: &str,
+    config: &Qwen3_5Config,
+) -> Result<MxArray> {
+    let batch = x.shape_at(0)?;
+    let seq_len = x.shape_at(1)?;
+    let num_heads = config.num_heads;
+    let num_kv_heads = config.num_kv_heads;
+    let head_dim = config.head_dim;
+    let scale = (head_dim as f64).powf(-0.5);
+
+    // Q projection (2x width for gating)
+    let q_weight = params
+        .get(&format!("{}.q_proj.weight", prefix))
+        .ok_or_else(|| Error::from_reason(format!("Missing {}.q_proj.weight", prefix)))?;
+    let q_proj_out = linear_functional(x, q_weight, None)?;
+
+    // Split into queries + gate per-head
+    let q_per_head =
+        q_proj_out.reshape(&[batch, seq_len, num_heads as i64, (head_dim * 2) as i64])?;
+    let queries = q_per_head.slice_axis(3, 0, head_dim as i64)?;
+    let gate = q_per_head.slice_axis(3, head_dim as i64, (head_dim * 2) as i64)?;
+    let gate = gate.reshape(&[batch, seq_len, (num_heads * head_dim) as i64])?;
+
+    // K, V projections
+    let k_weight = params
+        .get(&format!("{}.k_proj.weight", prefix))
+        .ok_or_else(|| Error::from_reason(format!("Missing {}.k_proj.weight", prefix)))?;
+    let v_weight = params
+        .get(&format!("{}.v_proj.weight", prefix))
+        .ok_or_else(|| Error::from_reason(format!("Missing {}.v_proj.weight", prefix)))?;
+    let keys = linear_functional(x, k_weight, None)?;
+    let values = linear_functional(x, v_weight, None)?;
+
+    let keys = keys.reshape(&[batch, seq_len, num_kv_heads as i64, head_dim as i64])?;
+    let values = values.reshape(&[batch, seq_len, num_kv_heads as i64, head_dim as i64])?;
+
+    // QK normalization
+    let q_norm_weight = params
+        .get(&format!("{}.q_norm.weight", prefix))
+        .ok_or_else(|| Error::from_reason(format!("Missing {}.q_norm.weight", prefix)))?;
+    let k_norm_weight = params
+        .get(&format!("{}.k_norm.weight", prefix))
+        .ok_or_else(|| Error::from_reason(format!("Missing {}.k_norm.weight", prefix)))?;
+    let queries = rms_norm_functional(&queries, q_norm_weight, config.rms_norm_eps)?;
+    let keys = rms_norm_functional(&keys, k_norm_weight, config.rms_norm_eps)?;
+
+    // Partial RoPE: only rotate rope_dims dimensions
+    let rope_dims = config.rope_dims();
+    let queries = apply_partial_rope(&queries, rope_dims as i64, config.rope_theta, 0)?;
+    let keys = apply_partial_rope(&keys, rope_dims as i64, config.rope_theta, 0)?;
+
+    // Transpose to [B, H, T, D] for SDPA
+    let queries = queries.transpose(Some(&[0, 2, 1, 3]))?;
+    let keys = keys.transpose(Some(&[0, 2, 1, 3]))?;
+    let values = values.transpose(Some(&[0, 2, 1, 3]))?;
+
+    // SDPA with causal mask (training: full sequence, no cache)
+    let output = if seq_len > 1 {
+        use crate::array::attention::scaled_dot_product_attention_causal;
+        scaled_dot_product_attention_causal(&queries, &keys, &values, scale)?
+    } else {
+        scaled_dot_product_attention(&queries, &keys, &values, scale, None)?
+    };
+
+    // Back to [B, T, H*D]
+    let output = output.transpose(Some(&[0, 2, 1, 3]))?;
+    let output = output.reshape(&[batch, seq_len, (num_heads * head_dim) as i64])?;
+
+    // Gate: output * sigmoid(gate)
+    let gate_sigmoid = Activations::sigmoid(&gate)?;
+    let gated_output = output.mul(&gate_sigmoid)?;
+
+    // Output projection
+    let o_weight = params
+        .get(&format!("{}.o_proj.weight", prefix))
+        .ok_or_else(|| Error::from_reason(format!("Missing {}.o_proj.weight", prefix)))?;
+    linear_functional(&gated_output, o_weight, None)
+}
+
+/// Apply partial RoPE: only rotate the first `rope_dims` dimensions.
+/// Input shape: [B, T, H, D] (pre-transpose, heads in dim 2)
+fn apply_partial_rope(x: &MxArray, rope_dims: i64, theta: f64, offset: i32) -> Result<MxArray> {
+    let head_dim = x.shape_at(3)?;
+    if rope_dims >= head_dim {
+        // Full RoPE — transpose to [B, H, T, D], apply, transpose back
+        let x_t = x.transpose(Some(&[0, 2, 1, 3]))?;
+        let x_t = apply_rope(&x_t, head_dim as u32, theta, offset)?;
+        return x_t.transpose(Some(&[0, 2, 1, 3]));
+    }
+
+    // Split: rotated part + pass-through part
+    let x_rot = x.slice_axis(3, 0, rope_dims)?;
+    let x_pass = x.slice_axis(3, rope_dims, head_dim)?;
+
+    // Apply RoPE to rotated part only (transpose to [B, H, T, D] for apply_rope)
+    let x_rot = x_rot.transpose(Some(&[0, 2, 1, 3]))?;
+    let x_rot = apply_rope(&x_rot, rope_dims as u32, theta, offset)?;
+    let x_rot = x_rot.transpose(Some(&[0, 2, 1, 3]))?;
+
+    // Concatenate back along head_dim axis
+    MxArray::concatenate(&x_rot, &x_pass, 3)
+}
+
+/// Qwen3.5 dense decoder block (functional).
+fn qwen3_5_block_functional(
+    params: &HashMap<String, MxArray>,
+    x: &MxArray,
+    config: &Qwen3_5Config,
+    layer_idx: usize,
+) -> Result<MxArray> {
+    let prefix = format!("layers.{}", layer_idx);
+
+    // Pre-norm + attention
+    let input_norm_weight = params
+        .get(&format!("{}.input_layernorm.weight", prefix))
+        .ok_or_else(|| Error::from_reason(format!("Missing {}.input_layernorm.weight", prefix)))?;
+    let normed = rms_norm_functional(x, input_norm_weight, config.rms_norm_eps)?;
+
+    let attn_out = if config.is_linear_layer(layer_idx) {
+        let attn_prefix = format!("{}.linear_attn", prefix);
+        gated_delta_net_functional(params, &normed, &attn_prefix, config)?
+    } else {
+        let attn_prefix = format!("{}.self_attn", prefix);
+        qwen3_5_attention_functional(params, &normed, &attn_prefix, config)?
+    };
+
+    // Residual
+    let h = x.add(&attn_out)?;
+
+    // Pre-norm + MLP
+    let post_norm_weight = params
+        .get(&format!("{}.post_attention_layernorm.weight", prefix))
+        .ok_or_else(|| {
+            Error::from_reason(format!(
+                "Missing {}.post_attention_layernorm.weight",
+                prefix
+            ))
+        })?;
+    let normed = rms_norm_functional(&h, post_norm_weight, config.rms_norm_eps)?;
+    let mlp_out = mlp_functional(
+        &normed,
+        params
+            .get(&format!("{}.mlp.gate_proj.weight", prefix))
+            .ok_or_else(|| {
+                Error::from_reason(format!("Missing {}.mlp.gate_proj.weight", prefix))
+            })?,
+        params
+            .get(&format!("{}.mlp.up_proj.weight", prefix))
+            .ok_or_else(|| Error::from_reason(format!("Missing {}.mlp.up_proj.weight", prefix)))?,
+        params
+            .get(&format!("{}.mlp.down_proj.weight", prefix))
+            .ok_or_else(|| {
+                Error::from_reason(format!("Missing {}.mlp.down_proj.weight", prefix))
+            })?,
+    )?;
+
+    h.add(&mlp_out)
+}
+
+/// Apply LM head to hidden states: linear projection + logit clamping.
+/// Shared by all model variants (Qwen3.5 Dense and MoE).
+fn lm_head_functional(
+    hidden_states: &MxArray,
+    params: &HashMap<String, MxArray>,
+    tie_word_embeddings: bool,
+) -> Result<MxArray> {
+    let logits = if tie_word_embeddings {
+        let embed_weight = params
+            .get("embedding.weight")
+            .ok_or_else(|| Error::from_reason("Missing embedding.weight"))?;
+        linear_functional(hidden_states, embed_weight, None)?
+    } else {
+        let lm_head_weight = params
+            .get("lm_head.weight")
+            .ok_or_else(|| Error::from_reason("Missing lm_head.weight"))?;
+        linear_functional(hidden_states, lm_head_weight, None)?
+    };
+    logits.clip(Some(-100.0), Some(100.0))
+}
+
+/// Full Qwen3.5 Dense forward pass returning logits (functional).
+pub fn qwen3_5_forward_functional(
+    config: &Qwen3_5Config,
+    params: &HashMap<String, MxArray>,
+    input_ids: &MxArray,
+) -> Result<MxArray> {
+    let hidden_states = qwen3_5_forward_hidden_states(config, params, input_ids)?;
+    lm_head_functional(&hidden_states, params, config.tie_word_embeddings)
+}
+
+/// Collect sorted parameter names that match a prefix (e.g., "layers.0.")
+fn collect_layer_param_names(params: &HashMap<String, MxArray>, prefix: &str) -> Vec<String> {
+    let mut names: Vec<String> = params
+        .keys()
+        .filter(|k| k.starts_with(prefix))
+        .cloned()
+        .collect();
+    names.sort();
+    names
+}
+
+/// Run a Qwen3.5 Dense block through gradient checkpointing.
+///
+/// Flattens [hidden_states, layer_param1, layer_param2, ...] into a single
+/// array vec for checkpoint, then reconstructs params inside the callback.
+fn qwen3_5_block_checkpointed(
+    params: &HashMap<String, MxArray>,
+    h: &MxArray,
+    config: &Qwen3_5Config,
+    layer_idx: usize,
+    ckpt_contexts: &mut autograd::CheckpointContexts,
+) -> Result<MxArray> {
+    let prefix = format!("layers.{}.", layer_idx);
+    let layer_param_names = collect_layer_param_names(params, &prefix);
+
+    // Build inputs: [hidden_states, param1, param2, ...]
+    let mut inputs: Vec<&MxArray> = vec![h];
+    for name in &layer_param_names {
+        inputs.push(
+            params
+                .get(name)
+                .ok_or_else(|| Error::from_reason(format!("Missing {}", name)))?,
+        );
+    }
+
+    let names_clone = layer_param_names.clone();
+    let config_clone = config.clone();
+    let layer = layer_idx;
+
+    let outputs = autograd::checkpoint_apply(
+        inputs,
+        move |arrays| {
+            // arrays[0] = hidden_states, arrays[1..] = layer params
+            let h_in = &arrays[0];
+            let layer_params: HashMap<String, MxArray> = names_clone
+                .iter()
+                .enumerate()
+                .map(|(i, name)| (name.clone(), arrays[i + 1].clone()))
+                .collect();
+            let h_out = qwen3_5_block_functional(&layer_params, h_in, &config_clone, layer)?;
+            Ok(vec![h_out])
+        },
+        ckpt_contexts,
+    )?;
+
+    Ok(outputs.into_iter().next().unwrap())
+}
+
+/// Qwen3.5 Dense forward returning hidden states before LM head.
+pub fn qwen3_5_forward_hidden_states(
+    config: &Qwen3_5Config,
+    params: &HashMap<String, MxArray>,
+    input_ids: &MxArray,
+) -> Result<MxArray> {
+    let mut ckpt = autograd::CheckpointContexts::new();
+    qwen3_5_forward_hidden_states_impl(config, params, input_ids, false, &mut ckpt)
+}
+
+/// Qwen3.5 Dense forward with optional gradient checkpointing.
+pub fn qwen3_5_forward_hidden_states_impl(
+    config: &Qwen3_5Config,
+    params: &HashMap<String, MxArray>,
+    input_ids: &MxArray,
+    use_checkpointing: bool,
+    ckpt_contexts: &mut autograd::CheckpointContexts,
+) -> Result<MxArray> {
+    // Embedding
+    let embed_weight = params
+        .get("embedding.weight")
+        .ok_or_else(|| Error::from_reason("Missing embedding.weight"))?;
+    let mut h = embedding_functional(embed_weight, input_ids)?;
+
+    // Transformer blocks — NO eval() between layers!
+    // During value_and_grad tracing, eval() would materialize data without calling
+    // detach() (because is_tracer() is true), preventing checkpoint from freeing
+    // intermediates. The lazy graph is built here; the final eval() (outside tracing)
+    // processes it with proper detach, freeing each layer's intermediates in turn.
+    for layer_idx in 0..config.num_layers as usize {
+        if use_checkpointing {
+            h = qwen3_5_block_checkpointed(params, &h, config, layer_idx, ckpt_contexts)?;
+        } else {
+            h = qwen3_5_block_functional(params, &h, config, layer_idx)?;
+        }
+    }
+
+    // Final norm
+    let final_norm_weight = params
+        .get("final_norm.weight")
+        .ok_or_else(|| Error::from_reason("Missing final_norm.weight"))?;
+    let result = rms_norm_functional(&h, final_norm_weight, config.rms_norm_eps)?;
+    Ok(result)
+}
+
+// ============================================
+// Qwen3.5 MoE Model Forward (Functional)
+// ============================================
+
+/// Helper to get a parameter by prefix.suffix from the params map.
+fn get_param<'a>(
+    params: &'a HashMap<String, MxArray>,
+    prefix: &str,
+    suffix: &str,
+) -> Result<&'a MxArray> {
+    let key = format!("{}.{}", prefix, suffix);
+    params
+        .get(&key)
+        .ok_or_else(|| Error::from_reason(format!("Missing {}", key)))
+}
+
+struct GatherSortResult {
+    x_sorted: MxArray,
+    idx_sorted: MxArray,
+    inv_order: MxArray,
+}
+
+/// Sort tokens by expert assignment for efficient gather_mm.
+/// Replicates Python `_gather_sort` from mlx-lm switch_layers.py.
+fn functional_gather_sort(x: &MxArray, indices: &MxArray) -> Result<GatherSortResult> {
+    let idx_shape = indices.shape()?;
+    let m = *idx_shape
+        .last()
+        .ok_or_else(|| Error::from_reason("empty indices"))?;
+
+    let flat_indices = indices.reshape(&[-1])?;
+    let order = flat_indices.argsort(Some(-1))?;
+    let inv_order = order.argsort(Some(-1))?;
+    let idx_sorted = flat_indices.take(&order, 0)?;
+
+    let x_shape = x.shape()?;
+    let d = *x_shape
+        .last()
+        .ok_or_else(|| Error::from_reason("gather_sort: x has empty shape"))?;
+    let x_flat = x.reshape(&[-1, 1, d])?;
+    let m_scalar = MxArray::scalar_int(m as i32)?;
+    let token_indices = order.floor_divide(&m_scalar)?;
+    let x_sorted = x_flat.take(&token_indices, 0)?;
+
+    Ok(GatherSortResult {
+        x_sorted,
+        idx_sorted,
+        inv_order,
+    })
+}
+
+/// Unsort gather_mm output back to original token order.
+fn functional_scatter_unsort(
+    x: &MxArray,
+    inv_order: &MxArray,
+    orig_shape: &[i64],
+) -> Result<MxArray> {
+    let unsorted = x.take(inv_order, 0)?;
+    let x_shape = unsorted.shape()?;
+    let mut new_shape = orig_shape.to_vec();
+    for &dim in &x_shape[1..] {
+        new_shape.push(dim);
+    }
+    unsorted.reshape(&new_shape)
+}
+
+/// Sparse MoE routing and expert computation (functional).
+///
+/// Uses `gather_mm` for efficient expert-indexed matmuls instead of looping
+/// over all experts. Only computes matmuls for the top-k routed experts per
+/// token (~16x speedup for 128 experts, top-8).
+///
+/// `gather_mm` has full VJP support in MLX, so this is fully differentiable.
+fn sparse_moe_functional(
+    params: &HashMap<String, MxArray>,
+    x: &MxArray,
+    prefix: &str,
+    config: &Qwen3_5MoeConfig,
+) -> Result<MxArray> {
+    let batch = x.shape_at(0)?;
+    let seq_len = x.shape_at(1)?;
+    let hidden_size = config.hidden_size as i64;
+    let num_experts = config.num_experts;
+    let num_experts_per_tok = config.num_experts_per_tok;
+    let ne = batch * seq_len;
+    let k = num_experts_per_tok;
+    let num_exp = num_experts as i64;
+
+    let x_flat = x.reshape(&[ne, hidden_size])?;
+
+    // Router: softmax(gate(x)) -> top-k
+    let gate_weight = get_param(params, prefix, "gate.weight")?;
+    let router_logits = linear_functional(&x_flat, gate_weight, None)?;
+    let router_weights = Activations::softmax(&router_logits, Some(-1))?;
+
+    // Top-k selection via argpartition
+    let top_indices_full = router_weights.argpartition(-k, Some(-1))?;
+    let top_indices = top_indices_full.slice_axis(1, num_exp - k as i64, num_exp)?;
+    let scores = router_weights.take_along_axis(&top_indices, -1)?;
+
+    // Normalize top-k weights
+    let scores = if config.norm_topk_prob {
+        let sum = scores.sum(Some(&[-1]), Some(true))?;
+        scores.div(&sum)?
+    } else {
+        scores
+    };
+
+    // Expert computation using gather_mm
+    let gate_proj_w = get_param(params, prefix, "switch_mlp.gate_proj.weight")?;
+    let up_proj_w = get_param(params, prefix, "switch_mlp.up_proj.weight")?;
+    let down_proj_w = get_param(params, prefix, "switch_mlp.down_proj.weight")?;
+
+    // Transpose weights: [E, out, in] -> [E, in, out] (gather_mm convention)
+    let gate_proj_t = gate_proj_w.transpose(Some(&[0, 2, 1]))?;
+    let up_proj_t = up_proj_w.transpose(Some(&[0, 2, 1]))?;
+    let down_proj_t = down_proj_w.transpose(Some(&[0, 2, 1]))?;
+
+    // Expand x for gather_mm: [ne, D] -> [ne, 1, 1, D]
+    let x_expanded = x_flat.reshape(&[ne, 1, 1, hidden_size])?;
+
+    // stop_gradient on indices (training: don't differentiate through discrete index selection)
+    let top_indices = top_indices.stop_gradient()?;
+
+    // Sort optimization (same threshold as stateful SwitchGLU in switch_glu.rs)
+    let do_sort = top_indices.size()? >= 64;
+
+    let y = if do_sort {
+        let sorted = functional_gather_sort(&x_expanded, &top_indices)?;
+        let idx = &sorted.idx_sorted;
+        let gate_out = sorted.x_sorted.gather_mm(&gate_proj_t, idx, true)?;
+        let up_out = sorted.x_sorted.gather_mm(&up_proj_t, idx, true)?;
+        let gate_act = Activations::silu_for_autograd(&gate_out)?;
+        let activated = gate_act.mul(&up_out)?;
+        let expert_out = activated.gather_mm(&down_proj_t, idx, true)?;
+        functional_scatter_unsort(&expert_out, &sorted.inv_order, &[ne, k as i64])?
+    } else {
+        let gate_out = x_expanded.gather_mm(&gate_proj_t, &top_indices, false)?;
+        let up_out = x_expanded.gather_mm(&up_proj_t, &top_indices, false)?;
+        let gate_act = Activations::silu_for_autograd(&gate_out)?;
+        let activated = gate_act.mul(&up_out)?;
+        activated.gather_mm(&down_proj_t, &top_indices, false)?
+    };
+
+    // Squeeze penultimate dim, weight by routing scores, sum over top-k
+    let y = y.squeeze(Some(&[-2]))?; // [ne, k, D]
+    let scores_expanded = scores.reshape(&[ne, k as i64, 1])?;
+    let expert_output = y.mul(&scores_expanded)?.sum(Some(&[1]), Some(false))?; // [ne, D]
+
+    // Shared expert (unchanged — dense MLP, always-on)
+    let shared_gate = get_param(params, prefix, "shared_expert.gate_proj.weight")?;
+    let shared_up = get_param(params, prefix, "shared_expert.up_proj.weight")?;
+    let shared_down = get_param(params, prefix, "shared_expert.down_proj.weight")?;
+    let shared_out = mlp_functional(&x_flat, shared_gate, shared_up, shared_down)?;
+
+    // Shared expert gate
+    let shared_expert_gate_weight = get_param(params, prefix, "shared_expert_gate.weight")?;
+    let gate_out = linear_functional(&x_flat, shared_expert_gate_weight, None)?;
+    let gate_sigmoid = Activations::sigmoid(&gate_out)?;
+    let shared_gated = shared_out.mul(&gate_sigmoid)?;
+
+    // Combine expert + shared
+    let combined = expert_output.add(&shared_gated)?;
+    combined.reshape(&[batch, seq_len, hidden_size])
+}
+
+/// Qwen3.5 MoE decoder block (functional).
+fn qwen3_5_moe_block_functional(
+    params: &HashMap<String, MxArray>,
+    x: &MxArray,
+    config: &Qwen3_5MoeConfig,
+    dense_config: &Qwen3_5Config,
+    layer_idx: usize,
+) -> Result<MxArray> {
+    let prefix = format!("layers.{}", layer_idx);
+
+    // Pre-norm + attention (same as dense)
+    let input_norm_weight = params
+        .get(&format!("{}.input_layernorm.weight", prefix))
+        .ok_or_else(|| Error::from_reason(format!("Missing {}.input_layernorm.weight", prefix)))?;
+    let normed = rms_norm_functional(x, input_norm_weight, config.rms_norm_eps)?;
+
+    let attn_out = if config.is_linear_layer(layer_idx) {
+        let attn_prefix = format!("{}.linear_attn", prefix);
+        gated_delta_net_functional(params, &normed, &attn_prefix, dense_config)?
+    } else {
+        let attn_prefix = format!("{}.self_attn", prefix);
+        qwen3_5_attention_functional(params, &normed, &attn_prefix, dense_config)?
+    };
+
+    let h = x.add(&attn_out)?;
+
+    // Pre-norm + MLP (MoE or dense depending on layer)
+    let post_norm_weight = params
+        .get(&format!("{}.post_attention_layernorm.weight", prefix))
+        .ok_or_else(|| {
+            Error::from_reason(format!(
+                "Missing {}.post_attention_layernorm.weight",
+                prefix
+            ))
+        })?;
+    let normed = rms_norm_functional(&h, post_norm_weight, config.rms_norm_eps)?;
+
+    let mlp_out = if config.is_moe_layer(layer_idx) {
+        let mlp_prefix = format!("{}.mlp", prefix);
+        sparse_moe_functional(params, &normed, &mlp_prefix, config)?
+    } else {
+        mlp_functional(
+            &normed,
+            params
+                .get(&format!("{}.mlp.gate_proj.weight", prefix))
+                .ok_or_else(|| {
+                    Error::from_reason(format!("Missing {}.mlp.gate_proj.weight", prefix))
+                })?,
+            params
+                .get(&format!("{}.mlp.up_proj.weight", prefix))
+                .ok_or_else(|| {
+                    Error::from_reason(format!("Missing {}.mlp.up_proj.weight", prefix))
+                })?,
+            params
+                .get(&format!("{}.mlp.down_proj.weight", prefix))
+                .ok_or_else(|| {
+                    Error::from_reason(format!("Missing {}.mlp.down_proj.weight", prefix))
+                })?,
+        )?
+    };
+
+    h.add(&mlp_out)
+}
+
+/// Full Qwen3.5 MoE forward pass returning logits (functional).
+pub fn qwen3_5_moe_forward_functional(
+    config: &Qwen3_5MoeConfig,
+    params: &HashMap<String, MxArray>,
+    input_ids: &MxArray,
+) -> Result<MxArray> {
+    let hidden_states = qwen3_5_moe_forward_hidden_states(config, params, input_ids)?;
+    lm_head_functional(&hidden_states, params, config.tie_word_embeddings)
+}
+
+/// Run a Qwen3.5 MoE block through gradient checkpointing.
+fn qwen3_5_moe_block_checkpointed(
+    params: &HashMap<String, MxArray>,
+    h: &MxArray,
+    config: &Qwen3_5MoeConfig,
+    dense_config: &Qwen3_5Config,
+    layer_idx: usize,
+    ckpt_contexts: &mut autograd::CheckpointContexts,
+) -> Result<MxArray> {
+    let prefix = format!("layers.{}.", layer_idx);
+    let layer_param_names = collect_layer_param_names(params, &prefix);
+
+    let mut inputs: Vec<&MxArray> = vec![h];
+    for name in &layer_param_names {
+        inputs.push(
+            params
+                .get(name)
+                .ok_or_else(|| Error::from_reason(format!("Missing {}", name)))?,
+        );
+    }
+
+    let names_clone = layer_param_names.clone();
+    let config_clone = config.clone();
+    let dense_clone = dense_config.clone();
+    let layer = layer_idx;
+
+    let outputs = autograd::checkpoint_apply(
+        inputs,
+        move |arrays| {
+            let h_in = &arrays[0];
+            let layer_params: HashMap<String, MxArray> = names_clone
+                .iter()
+                .enumerate()
+                .map(|(i, name)| (name.clone(), arrays[i + 1].clone()))
+                .collect();
+            let h_out = qwen3_5_moe_block_functional(
+                &layer_params,
+                h_in,
+                &config_clone,
+                &dense_clone,
+                layer,
+            )?;
+            Ok(vec![h_out])
+        },
+        ckpt_contexts,
+    )?;
+
+    Ok(outputs.into_iter().next().unwrap())
+}
+
+/// Qwen3.5 MoE forward returning hidden states.
+pub fn qwen3_5_moe_forward_hidden_states(
+    config: &Qwen3_5MoeConfig,
+    params: &HashMap<String, MxArray>,
+    input_ids: &MxArray,
+) -> Result<MxArray> {
+    let mut ckpt = autograd::CheckpointContexts::new();
+    qwen3_5_moe_forward_hidden_states_impl(config, params, input_ids, false, &mut ckpt)
+}
+
+/// Qwen3.5 MoE forward with optional gradient checkpointing.
+pub fn qwen3_5_moe_forward_hidden_states_impl(
+    config: &Qwen3_5MoeConfig,
+    params: &HashMap<String, MxArray>,
+    input_ids: &MxArray,
+    use_checkpointing: bool,
+    ckpt_contexts: &mut autograd::CheckpointContexts,
+) -> Result<MxArray> {
+    let embed_weight = params
+        .get("embedding.weight")
+        .ok_or_else(|| Error::from_reason("Missing embedding.weight"))?;
+    let mut h = embedding_functional(embed_weight, input_ids)?;
+
+    let dense_config = config.to_dense_config();
+    for layer_idx in 0..config.num_layers as usize {
+        if use_checkpointing {
+            h = qwen3_5_moe_block_checkpointed(
+                params,
+                &h,
+                config,
+                &dense_config,
+                layer_idx,
+                ckpt_contexts,
+            )?;
+        } else {
+            h = qwen3_5_moe_block_functional(params, &h, config, &dense_config, layer_idx)?;
+        }
+    }
+
+    let final_norm_weight = params
+        .get("final_norm.weight")
+        .ok_or_else(|| Error::from_reason("Missing final_norm.weight"))?;
+    rms_norm_functional(&h, final_norm_weight, config.rms_norm_eps)
+}
+
+// ============================================
+// Unified Model Dispatch (for autograd)
+// ============================================
+
+/// Dispatch functional forward pass based on model type.
+pub(crate) fn forward_functional_dispatch(
+    model_type: &ModelType,
+    params: &HashMap<String, MxArray>,
+    input_ids: &MxArray,
+    use_checkpointing: bool,
+    ckpt_contexts: &mut autograd::CheckpointContexts,
+) -> Result<MxArray> {
+    let hidden_states = forward_hidden_states_dispatch(
+        model_type,
+        params,
+        input_ids,
+        use_checkpointing,
+        ckpt_contexts,
+    )?;
+    lm_head_functional(&hidden_states, params, model_type.tie_word_embeddings())
+}
+
+/// Dispatch forward pass returning hidden states with optional checkpointing.
+pub(crate) fn forward_hidden_states_dispatch(
+    model_type: &ModelType,
+    params: &HashMap<String, MxArray>,
+    input_ids: &MxArray,
+    use_checkpointing: bool,
+    ckpt_contexts: &mut autograd::CheckpointContexts,
+) -> Result<MxArray> {
+    match model_type {
+        ModelType::Qwen3(config) => qwen3_forward_hidden_states_impl(
+            config,
+            params,
+            input_ids,
+            use_checkpointing,
+            ckpt_contexts,
+        ),
+        ModelType::Qwen35Dense(config) => qwen3_5_forward_hidden_states_impl(
+            config,
+            params,
+            input_ids,
+            use_checkpointing,
+            ckpt_contexts,
+        ),
+        ModelType::Qwen35Moe(config) => qwen3_5_moe_forward_hidden_states_impl(
+            config,
+            params,
+            input_ids,
+            use_checkpointing,
+            ckpt_contexts,
+        ),
+    }
 }
 
 #[cfg(test)]

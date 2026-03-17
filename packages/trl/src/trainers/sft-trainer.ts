@@ -30,12 +30,17 @@ import * as readline from 'node:readline';
 import {
   SftTrainingEngine,
   Qwen3Model,
+  Qwen35Model,
+  Qwen35MoeModel,
   Qwen3Tokenizer,
   MxArray,
   type SftEngineConfig,
   type SftStepMetrics,
   type SftEpochMetrics,
 } from '@mlx-node/core';
+import { detectModelType } from '@mlx-node/lm';
+
+type TrainableModel = Qwen3Model | Qwen35Model | Qwen35MoeModel;
 
 import type { SFTTrainerConfig } from './sft-config';
 import { getDefaultSFTConfig, mergeSFTConfig } from './sft-config';
@@ -73,7 +78,7 @@ export interface SFTTrainStepResult {
  */
 export class SFTTrainer {
   private engine: SftTrainingEngine;
-  private model: Qwen3Model;
+  private model: TrainableModel;
   private tokenizer: Qwen3Tokenizer;
   private config: SFTTrainerConfig;
   private currentEpoch: number = 0;
@@ -97,7 +102,7 @@ export class SFTTrainer {
    * @param logger - Optional custom logger
    */
   constructor(
-    model: Qwen3Model,
+    model: TrainableModel,
     tokenizer: Qwen3Tokenizer,
     config: Partial<SFTTrainerConfig> = {},
     logger?: TrainingLogger,
@@ -130,9 +135,18 @@ export class SFTTrainer {
       gradientClipNorm: this.config.max_grad_norm,
       weightDecay: this.config.weight_decay,
       labelSmoothing: this.config.label_smoothing,
+      gradientCheckpointing: this.config.gradient_checkpointing,
     };
 
-    this.engine = new SftTrainingEngine(model, engineConfig);
+    if (model instanceof Qwen35Model) {
+      this.engine = SftTrainingEngine.fromQwen35(model, engineConfig);
+    } else if (model instanceof Qwen35MoeModel) {
+      this.engine = SftTrainingEngine.fromQwen35Moe(model, engineConfig);
+    } else if (model instanceof Qwen3Model) {
+      this.engine = new SftTrainingEngine(model, engineConfig);
+    } else {
+      throw new Error(`Unsupported model type: ${(model as object).constructor?.name ?? typeof model}`);
+    }
 
     // Setup stdin handler if TUI mode
     if (this.config.tui_mode) {
@@ -253,11 +267,22 @@ export class SFTTrainer {
     const modelName = parse(modelPath).base || 'Unknown';
     logger.status('loading', `Loading ${modelName}...`);
 
-    // Load model and tokenizer
-    const model = await Qwen3Model.loadPretrained(modelPath);
+    // Detect model type and load appropriate model class
+    const modelType = await detectModelType(modelPath);
+    let model: TrainableModel;
+    if (modelType === 'qwen3_5_moe') {
+      model = await Qwen35MoeModel.loadPretrained(modelPath);
+    } else if (modelType === 'qwen3_5') {
+      model = await Qwen35Model.loadPretrained(modelPath);
+    } else if (modelType === 'qwen3') {
+      model = await Qwen3Model.loadPretrained(modelPath);
+    } else {
+      throw new Error(`Unsupported model_type "${modelType}" in ${modelPath}/config.json`);
+    }
+
     const tokenizer = await Qwen3Tokenizer.fromPretrained(join(modelPath, 'tokenizer.json'));
 
-    logger.status('loading', `${modelName} loaded`);
+    logger.status('loading', `${modelName} loaded (${modelType})`);
 
     // Create trainer
     const trainer = new SFTTrainer(model, tokenizer, config, logger);
@@ -528,9 +553,8 @@ export class SFTTrainer {
     const statePath = join(checkpointPath, 'training_state.json');
     writeFileSync(statePath, JSON.stringify(state, null, 2));
 
-    // Save model weights (use trained model from engine, not original)
-    const trainedModel = this.engine.getModel();
-    await trainedModel.saveModel(checkpointPath);
+    // Save model weights
+    await this.model.saveModel(checkpointPath);
 
     // Copy tokenizer files
     const tokenizerSource = this.originalModelPath ?? this.config.model_name;
@@ -609,8 +633,13 @@ export class SFTTrainer {
   /**
    * Get the underlying model for inference
    */
-  getModel(): Qwen3Model {
-    return this.engine.getModel();
+  getModel(): TrainableModel {
+    if (this.model instanceof Qwen3Model) {
+      return this.engine.getModel();
+    }
+    // For Qwen3.5 models, return the original model reference
+    // (engine.getModel() only supports Qwen3)
+    return this.model;
   }
 
   /**

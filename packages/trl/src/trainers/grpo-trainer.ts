@@ -59,6 +59,8 @@ import {
   GrpoTrainingEngine,
   NativeRewardRegistry,
   Qwen3Model,
+  Qwen35Model,
+  Qwen35MoeModel,
   OutputStore,
   buildRewardOutputs,
   type GrpoEngineConfig,
@@ -69,6 +71,9 @@ import {
   type RewardOutput,
   type ToolDefinition,
 } from '@mlx-node/core';
+import { detectModelType } from '@mlx-node/lm';
+
+type TrainableModel = Qwen3Model | Qwen35Model | Qwen35MoeModel;
 
 import type { ChatMessage, DatasetExample, RewardFunction } from '../types';
 import { createTrainingLogger, type TrainingLogger } from './training-logger';
@@ -220,6 +225,24 @@ export interface GRPOTrainerConfig<T = unknown> {
   useParallelBatchGeneration?: boolean;
 
   /**
+   * Enable gradient checkpointing (default: true).
+   * Discards intermediate activations during forward pass and recomputes during backward,
+   * reducing peak memory from O(num_layers) to O(1) for intermediate states.
+   * For Qwen3.5 0.8B, this reduces autograd peak from ~105GB to ~11GB.
+   * Trade-off: ~30% more compute (one extra forward pass per layer during backward).
+   */
+  gradientCheckpointing?: boolean;
+
+  /** Optimizer type: 'sgd' or 'adamw' (default: 'adamw') */
+  optimizerType?: 'sgd' | 'adamw';
+  /** AdamW beta1 (default: 0.9) */
+  adamwBeta1?: number;
+  /** AdamW beta2 (default: 0.999) */
+  adamwBeta2?: number;
+  /** AdamW epsilon (default: 1e-8) */
+  adamwEps?: number;
+
+  /**
    * Chunk size for vocabulary dimension in cross-entropy computation.
    * When computing logsumexp over large vocabularies (e.g., Qwen3's 151,936 tokens),
    * the computation is split into chunks of this size to reduce peak memory usage.
@@ -277,6 +300,8 @@ export interface TrainingState {
   timestamp: string;
   /** Dataset information for resume validation */
   dataset?: DatasetMetadata;
+  /** Whether optimizer state was saved alongside this checkpoint */
+  hasOptimizerState?: boolean;
 }
 
 /**
@@ -318,6 +343,7 @@ export const DEFAULT_GRPO_CONFIG: GRPOTrainerConfig = {
   logConsole: true,
   logJsonl: true,
   maxCheckpoints: 3,
+  lmHeadChunkSize: 2,
 };
 
 /**
@@ -425,7 +451,7 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, errorMessage: st
  */
 export class GRPOTrainer<T = unknown> {
   private engine: GrpoTrainingEngine;
-  private model: Qwen3Model;
+  private model: TrainableModel;
   private config: GRPOTrainerConfig<T>;
   private rewardFn?: RewardFunction<T>;
   private currentEpoch: number = 0;
@@ -464,7 +490,7 @@ export class GRPOTrainer<T = unknown> {
    * @param model - Pre-loaded Qwen3 model
    * @param config - Training configuration
    */
-  constructor(model: Qwen3Model, config: Partial<GRPOTrainerConfig<T>> = {}, logger?: TrainingLogger) {
+  constructor(model: TrainableModel, config: Partial<GRPOTrainerConfig<T>> = {}, logger?: TrainingLogger) {
     // Auto-detect TUI mode from environment variable (set by mlx-train TUI)
     const tuiModeFromEnv = process.env.MLX_TUI_MODE === '1';
     if (tuiModeFromEnv && config.tuiMode === undefined) {
@@ -518,9 +544,25 @@ export class GRPOTrainer<T = unknown> {
       vocabChunkSize: this.config.vocabChunkSize,
       // Parallel batch generation
       useParallelBatchGeneration: this.config.useParallelBatchGeneration,
+      // Gradient checkpointing
+      gradientCheckpointing: this.config.gradientCheckpointing,
+      // Optimizer
+      optimizerType: this.config.optimizerType,
+      adamwBeta1: this.config.adamwBeta1,
+      adamwBeta2: this.config.adamwBeta2,
+      adamwEps: this.config.adamwEps,
+      weightDecay: this.config.weightDecay,
     };
 
-    this.engine = new GrpoTrainingEngine(model, engineConfig);
+    if (model instanceof Qwen35Model) {
+      this.engine = GrpoTrainingEngine.fromQwen35(model, engineConfig);
+    } else if (model instanceof Qwen35MoeModel) {
+      this.engine = GrpoTrainingEngine.fromQwen35Moe(model, engineConfig);
+    } else if (model instanceof Qwen3Model) {
+      this.engine = new GrpoTrainingEngine(model, engineConfig);
+    } else {
+      throw new Error(`Unsupported model type: ${(model as object).constructor?.name ?? typeof model}`);
+    }
 
     // Setup stdin handler if TUI mode
     if (this.config.tuiMode) {
@@ -900,11 +942,6 @@ export class GRPOTrainer<T = unknown> {
     if (config.advantageNormalization === false) {
       throw new Error('advantageNormalization=false is not yet supported. Remove this option or set to true.');
     }
-    if (config.weightDecay !== undefined && config.weightDecay !== 0.01) {
-      throw new Error(
-        'Custom weightDecay is not yet implemented. Optimizer uses simple SGD. Remove weightDecay from config or use default (0.01).',
-      );
-    }
     if (config.rewardType === 'model') {
       throw new Error(
         'rewardType="model" is not implemented. Use rewardType="function" with a custom reward function.',
@@ -977,10 +1014,20 @@ export class GRPOTrainer<T = unknown> {
     const modelName = modelPath.split('/').pop() ?? 'Unknown';
     logger.status('loading', `Loading ${modelName}...`);
 
-    // Load model from disk (checkpoint or original)
-    const model = await Qwen3Model.loadPretrained(modelPath);
+    // Detect model type and load appropriate model class
+    const modelType = await detectModelType(modelPath);
+    let model: TrainableModel;
+    if (modelType === 'qwen3_5_moe') {
+      model = await Qwen35MoeModel.loadPretrained(modelPath);
+    } else if (modelType === 'qwen3_5') {
+      model = await Qwen35Model.loadPretrained(modelPath);
+    } else if (modelType === 'qwen3') {
+      model = await Qwen3Model.loadPretrained(modelPath);
+    } else {
+      throw new Error(`Unsupported model_type "${modelType}" in ${modelPath}/config.json`);
+    }
 
-    logger.status('loading', `${modelName} loaded`);
+    logger.status('loading', `${modelName} loaded (${modelType})`);
 
     // Create trainer with the pre-created logger
     const trainer = new GRPOTrainer(model, config, logger);
@@ -1010,6 +1057,17 @@ export class GRPOTrainer<T = unknown> {
           `Restored dataset metadata: size=${resumedState.dataset.size}, hash=${resumedState.dataset.contentHash}, ` +
             `${trainer.processedBatchIndices.size} processed batches`,
         );
+      }
+
+      // Restore optimizer state if available
+      if (resumedState.hasOptimizerState) {
+        const optimizerStatePath = join(modelPath, 'optimizer_state.safetensors');
+        try {
+          trainer.engine.loadOptimizerState(optimizerStatePath);
+          logger.info(`Restored optimizer state from checkpoint`);
+        } catch (e) {
+          logger.warn(`Failed to restore optimizer state: ${String(e)}`);
+        }
       }
 
       // If resuming from a regular checkpoint (not emergency), track it as last known good
@@ -1857,6 +1915,17 @@ export class GRPOTrainer<T = unknown> {
           copyFileSync(srcPath, destPath);
         }
       }
+    }
+
+    // Save optimizer state (AdamW moments + step counter)
+    try {
+      this.engine.saveOptimizerState(join(checkpointPath, 'optimizer_state.safetensors'));
+      state.hasOptimizerState = true;
+      // Re-write training_state.json with updated hasOptimizerState flag
+      writeFileSync(statePath, JSON.stringify(state, null, 2));
+    } catch (e) {
+      // Non-fatal: training can continue without optimizer state on resume
+      this.logger.warn(`Failed to save optimizer state: ${String(e)}`);
     }
 
     this.logger.info(`Checkpoint saved: ${checkpointPath}`);

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+use futures::TryFutureExt;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
@@ -20,10 +21,11 @@ use crate::models::qwen3_5::vision::Qwen3_5VisionEncoder;
 use super::quantized_linear::LinearProj;
 use crate::array::MxArray;
 use crate::array::mask::create_causal_mask;
+use crate::models::qwen3::{BatchGenerationResult, GenerationConfig, GenerationResult};
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, apply_repetition_penalty, check_repetition_cutoff, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};
-use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
+use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 use crate::tools;
 
 use super::config::Qwen3_5MoeConfig;
@@ -1718,6 +1720,133 @@ impl Qwen3_5MoeModel {
         total += h;
         total
     }
+
+    /// Save the model weights and configuration to a directory.
+    ///
+    /// This saves:
+    /// - config.json: Model configuration (with model_type for detectModelType)
+    /// - weights.safetensors: Full model weights in SafeTensors format
+    /// - weights.mlx: Parameter metadata (for reference)
+    ///
+    /// # Arguments
+    /// * `save_path` - Directory to save the model
+    #[napi]
+    pub fn save_model<'env>(
+        &self,
+        env: &'env Env,
+        save_path: String,
+    ) -> Result<PromiseRaw<'env, ()>> {
+        let mut params = self.get_parameters_for_training()?;
+
+        // Include vision encoder weights when present (VLM models)
+        if let Some(ref vision_enc) = self.vision_encoder {
+            let vision_params = vision_enc.get_parameters();
+            params.extend(vision_params);
+        }
+
+        // Validate all parameters for NaN/Inf before saving
+        for (name, param) in params.iter() {
+            let data = param.to_float32()?;
+            let invalid_count = data
+                .iter()
+                .filter(|v| v.is_nan() || v.is_infinite())
+                .count();
+            if invalid_count > 0 {
+                return Err(napi::Error::new(
+                    Status::GenericFailure,
+                    format!(
+                        "Cannot save model: parameter '{}' contains {} NaN/Inf values. \
+                        Model weights are corrupted, likely due to training instability. \
+                        Consider reducing learning rate or using an earlier checkpoint.",
+                        name, invalid_count
+                    ),
+                ));
+            }
+        }
+
+        let params_clone: HashMap<String, MxArray> =
+            params.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+
+        // Create weights metadata (for reference)
+        let mut weights_metadata = serde_json::Map::new();
+        for (key, array) in params.iter() {
+            let shape_data = array.shape()?;
+            let shape: Vec<i64> = shape_data.as_ref().to_vec();
+            let dtype = array.dtype()?;
+
+            let mut param_info = serde_json::Map::new();
+            param_info.insert("shape".to_string(), serde_json::json!(shape));
+            param_info.insert("dtype".to_string(), serde_json::json!(dtype as i32));
+
+            weights_metadata.insert(key.clone(), serde_json::Value::Object(param_info));
+        }
+
+        // Serialize config and inject model_type for detectModelType
+        let config = self.get_config();
+        let mut config_value = serde_json::to_value(&config).map_err(|e| {
+            napi::Error::new(
+                Status::GenericFailure,
+                format!("Failed to serialize config: {e}"),
+            )
+        })?;
+        if let serde_json::Value::Object(ref mut map) = config_value {
+            map.insert("model_type".to_string(), serde_json::json!("qwen3_5_moe"));
+        }
+
+        let weights_json = serde_json::json!({
+            "version": "1.0",
+            "config": config_value,
+            "weights": weights_metadata,
+            "note": "Full weights are in weights.safetensors"
+        });
+
+        let promise = env.spawn_future(async move {
+            tokio::task::spawn_blocking(move || {
+                let path = std::path::Path::new(&save_path);
+                std::fs::create_dir_all(path)?;
+
+                info!("Saving model to {}", save_path);
+
+                // 1. Save configuration as JSON
+                let config_path = path.join("config.json");
+                let config_json = serde_json::to_string_pretty(&config_value)?;
+                std::fs::write(&config_path, config_json)?;
+                info!("Saved config.json");
+
+                // 2. Save full weights in SafeTensors format
+                let safetensors_path = path.join("weights.safetensors");
+                let metadata = Some(serde_json::json!({
+                    "format": "mlx-node",
+                    "version": "1.0"
+                }));
+                crate::utils::safetensors::save_safetensors(
+                    &safetensors_path,
+                    &params_clone,
+                    metadata,
+                )?;
+                info!("Saved weights.safetensors");
+
+                // 3. Save weights metadata (for reference)
+                let weights_str = serde_json::to_string_pretty(&weights_json)?;
+                let weights_path = path.join("weights.mlx");
+                std::fs::write(&weights_path, weights_str)?;
+                info!("Saved weights.mlx metadata");
+
+                Ok::<_, Error>(())
+            })
+            .map_err(|err| {
+                napi::Error::new(
+                    Status::GenericFailure,
+                    format!("Failed to save model: {}", err),
+                )
+            })
+            .await
+            .flatten()?;
+            Ok(())
+        })?;
+
+        Ok(promise)
+    }
 }
 
 /// Forward pass using already-acquired lock guards (no lock overhead).
@@ -1759,7 +1888,7 @@ fn forward_inner(
             fa_mask.as_ref()
         };
         let cache = caches.as_mut().map(|c| &mut c[i]);
-        h = layers[i].forward(&h, mask, cache, None)?;
+        h = layers[i].forward(&h, mask, cache, None, true)?;
     }
 
     let h = final_norm.forward(&h)?;
@@ -1949,7 +2078,7 @@ fn vlm_prefill_moe(
             } else {
                 Some(&position_ids)
             };
-            h = layers_guard[i].forward(&h, mask, cache, layer_pos)?;
+            h = layers_guard[i].forward(&h, mask, cache, layer_pos, true)?;
         }
 
         let h = final_norm_guard.forward(&h)?;
@@ -2047,7 +2176,7 @@ impl Qwen3_5MoeModel {
             } else {
                 position_ids
             };
-            h = layers_guard[i].forward(&h, mask, cache, layer_pos)?;
+            h = layers_guard[i].forward(&h, mask, cache, layer_pos, true)?;
         }
 
         drop(layers_guard);
@@ -2112,5 +2241,598 @@ impl Qwen3_5MoeModel {
     /// Set the spatial merge size.
     pub(crate) fn set_spatial_merge_size(&mut self, size: i32) {
         self.spatial_merge_size = Some(size);
+    }
+}
+
+// ========== Training Support Methods ==========
+// These methods are Rust-internal only (not exposed via NAPI).
+// They implement the TrainableModel trait interface for MoE.
+
+impl Qwen3_5MoeModel {
+    /// Get model configuration.
+    pub(crate) fn get_config(&self) -> Qwen3_5MoeConfig {
+        self.config.clone()
+    }
+
+    /// Create a cheap clone for training sessions.
+    /// Arc-clones all shared components, no deep copy. No VLM components.
+    pub(crate) fn clone_for_training(&self) -> Result<Self> {
+        Ok(Self {
+            config: self.config.clone(),
+            embedding: Embedding::from_weight(&self.embedding.get_weight())?,
+            layers: Arc::clone(&self.layers),
+            final_norm: Arc::clone(&self.final_norm),
+            lm_head: Arc::clone(&self.lm_head),
+            caches: Arc::new(RwLock::new(None)), // Fresh empty caches
+            tokenizer: self.tokenizer.clone(),
+            fa_idx: self.fa_idx,
+            vision_encoder: None, // Not needed for training
+            image_processor: None,
+            spatial_merge_size: None,
+            vision_cache: Arc::new(Mutex::new(VisionCacheInner {
+                entries: HashMap::new(),
+                generation: 0,
+            })),
+        })
+    }
+
+    /// Extract all trainable parameters as a name->array map.
+    ///
+    /// Parameter naming convention matches HuggingFace format:
+    /// - `embedding.weight`
+    /// - Linear attention layers: `layers.{i}.linear_attn.{in_proj_qkvz,in_proj_ba,conv1d,norm,out_proj}.weight`
+    /// - Linear attention learnable: `layers.{i}.linear_attn.{a_log,dt_bias}`
+    /// - Full attention layers: `layers.{i}.self_attn.{q_proj,k_proj,v_proj,o_proj}.weight`
+    /// - Full attention norms: `layers.{i}.self_attn.{q_norm,k_norm}.weight`
+    /// - Dense MLP layers: `layers.{i}.mlp.{gate_proj,up_proj,down_proj}.weight`
+    /// - MoE layers:
+    ///   - `layers.{i}.mlp.gate.weight` (router)
+    ///   - `layers.{i}.mlp.switch_mlp.{gate_proj,up_proj,down_proj}.weight` (expert weights 3D)
+    ///   - `layers.{i}.mlp.shared_expert.{gate_proj,up_proj,down_proj}.weight`
+    ///   - `layers.{i}.mlp.shared_expert_gate.weight`
+    /// - All layers: `layers.{i}.{input_layernorm,post_attention_layernorm}.weight`
+    /// - `final_norm.weight`
+    /// - `lm_head.weight` (if not tied)
+    pub(crate) fn get_parameters_for_training(&self) -> Result<HashMap<String, MxArray>> {
+        use super::decoder_layer::{AttentionType, MLPType};
+
+        let mut params = HashMap::new();
+
+        let layers_guard = self
+            .layers
+            .read()
+            .map_err(|_| Error::from_reason("Failed to acquire layers read lock"))?;
+        let final_norm_guard = self
+            .final_norm
+            .read()
+            .map_err(|_| Error::from_reason("Failed to acquire final_norm read lock"))?;
+        let lm_head_guard = self
+            .lm_head
+            .read()
+            .map_err(|_| Error::from_reason("Failed to acquire lm_head read lock"))?;
+
+        // Embedding
+        params.insert("embedding.weight".to_string(), self.embedding.get_weight());
+
+        // Transformer layers
+        for (i, layer) in layers_guard.iter().enumerate() {
+            let prefix = format!("layers.{}", i);
+
+            // Attention weights
+            match &layer.attn {
+                AttentionType::Linear(gdn) => {
+                    params.insert(
+                        format!("{}.linear_attn.in_proj_qkvz.weight", prefix),
+                        gdn.get_in_proj_qkvz_weight(),
+                    );
+                    params.insert(
+                        format!("{}.linear_attn.in_proj_ba.weight", prefix),
+                        gdn.get_in_proj_ba_weight(),
+                    );
+                    params.insert(
+                        format!("{}.linear_attn.conv1d.weight", prefix),
+                        gdn.get_conv1d_weight(),
+                    );
+                    params.insert(
+                        format!("{}.linear_attn.norm.weight", prefix),
+                        gdn.get_norm_weight(),
+                    );
+                    params.insert(
+                        format!("{}.linear_attn.out_proj.weight", prefix),
+                        gdn.get_out_proj_weight(),
+                    );
+                    params.insert(format!("{}.linear_attn.dt_bias", prefix), gdn.get_dt_bias());
+                    params.insert(format!("{}.linear_attn.a_log", prefix), gdn.get_a_log());
+                }
+                AttentionType::Full(attn) => {
+                    params.insert(
+                        format!("{}.self_attn.q_proj.weight", prefix),
+                        attn.get_q_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.self_attn.k_proj.weight", prefix),
+                        attn.get_k_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.self_attn.v_proj.weight", prefix),
+                        attn.get_v_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.self_attn.o_proj.weight", prefix),
+                        attn.get_o_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.self_attn.q_norm.weight", prefix),
+                        attn.get_q_norm_weight(),
+                    );
+                    params.insert(
+                        format!("{}.self_attn.k_norm.weight", prefix),
+                        attn.get_k_norm_weight(),
+                    );
+                }
+            }
+
+            // MLP weights — different for Dense vs MoE layers
+            match &layer.mlp {
+                MLPType::Dense(mlp) => {
+                    params.insert(
+                        format!("{}.mlp.gate_proj.weight", prefix),
+                        mlp.get_gate_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.mlp.up_proj.weight", prefix),
+                        mlp.get_up_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.mlp.down_proj.weight", prefix),
+                        mlp.get_down_proj_weight(),
+                    );
+                }
+                MLPType::MoE(moe) => {
+                    // Router gate
+                    params.insert(format!("{}.mlp.gate.weight", prefix), moe.get_gate_weight());
+                    // Expert weights (3D: [num_experts, out, in])
+                    let switch_mlp = moe.get_switch_mlp();
+                    params.insert(
+                        format!("{}.mlp.switch_mlp.gate_proj.weight", prefix),
+                        switch_mlp.get_gate_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.mlp.switch_mlp.up_proj.weight", prefix),
+                        switch_mlp.get_up_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.mlp.switch_mlp.down_proj.weight", prefix),
+                        switch_mlp.get_down_proj_weight(),
+                    );
+                    // Shared expert
+                    params.insert(
+                        format!("{}.mlp.shared_expert.gate_proj.weight", prefix),
+                        moe.get_shared_expert_gate_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.mlp.shared_expert.up_proj.weight", prefix),
+                        moe.get_shared_expert_up_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.mlp.shared_expert.down_proj.weight", prefix),
+                        moe.get_shared_expert_down_proj_weight(),
+                    );
+                    // Shared expert gate
+                    params.insert(
+                        format!("{}.mlp.shared_expert_gate.weight", prefix),
+                        moe.get_shared_expert_gate_weight(),
+                    );
+                }
+            }
+
+            // Layer norms
+            params.insert(
+                format!("{}.input_layernorm.weight", prefix),
+                layer.get_input_layernorm_weight(),
+            );
+            params.insert(
+                format!("{}.post_attention_layernorm.weight", prefix),
+                layer.get_post_attention_layernorm_weight(),
+            );
+        }
+
+        // Final norm
+        params.insert(
+            "final_norm.weight".to_string(),
+            final_norm_guard.get_weight(),
+        );
+
+        // LM head (only if not tied)
+        if !self.config.tie_word_embeddings
+            && let Some(ref lm_head) = *lm_head_guard
+        {
+            params.insert("lm_head.weight".to_string(), lm_head.get_weight());
+        }
+
+        Ok(params)
+    }
+
+    /// Apply gradients to model parameters using pre-fetched params.
+    /// SGD update: param = param - lr * grad.
+    pub(crate) fn apply_gradients_with_params(
+        &mut self,
+        gradients: HashMap<String, &MxArray>,
+        learning_rate: f64,
+        current_params: &HashMap<String, MxArray>,
+    ) -> Result<()> {
+        use crate::training_model::compute_sgd_updates;
+
+        // Compute updated parameters using shared SGD helper
+        let updated_params = compute_sgd_updates(&gradients, learning_rate, current_params)?;
+
+        // Acquire write locks
+        let mut layers = self.layers.write().map_err(|_| {
+            Error::new(
+                Status::GenericFailure,
+                "Failed to acquire layers write lock",
+            )
+        })?;
+        let mut final_norm = self.final_norm.write().map_err(|_| {
+            Error::new(
+                Status::GenericFailure,
+                "Failed to acquire final_norm write lock",
+            )
+        })?;
+        let mut lm_head = self.lm_head.write().map_err(|_| {
+            Error::new(
+                Status::GenericFailure,
+                "Failed to acquire lm_head write lock",
+            )
+        })?;
+
+        // Apply updates
+        for (name, updated_param) in updated_params.iter() {
+            if name == "lm_head.weight" {
+                if let Some(ref mut lm) = *lm_head {
+                    lm.set_weight(updated_param, "lm_head")?;
+                }
+            } else if name == "final_norm.weight" {
+                final_norm.set_weight(updated_param)?;
+            } else if name == "embedding.weight" {
+                self.embedding.set_weight(updated_param)?;
+            } else if name.starts_with("layers.") {
+                let parts: Vec<&str> = name.split('.').collect();
+                if parts.len() >= 3
+                    && let Ok(layer_idx) = parts[1].parse::<usize>()
+                    && layer_idx < layers.len()
+                {
+                    let layer = &mut layers[layer_idx];
+                    self.apply_layer_gradient(layer, name, updated_param)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn apply_layer_gradient(
+        &self,
+        layer: &mut super::decoder_layer::DecoderLayer,
+        name: &str,
+        updated_param: &MxArray,
+    ) -> Result<()> {
+        use super::decoder_layer::{AttentionType, MLPType};
+
+        if name.contains(".linear_attn.") {
+            if let AttentionType::Linear(ref mut gdn) = layer.attn {
+                if name.ends_with(".in_proj_qkvz.weight") {
+                    gdn.set_in_proj_qkvz_weight(updated_param)?;
+                } else if name.ends_with(".in_proj_ba.weight") {
+                    gdn.set_in_proj_ba_weight(updated_param)?;
+                } else if name.ends_with(".conv1d.weight") {
+                    gdn.set_conv1d_weight(updated_param)?;
+                } else if name.ends_with(".norm.weight") {
+                    gdn.set_norm_weight(updated_param)?;
+                } else if name.ends_with(".out_proj.weight") {
+                    gdn.set_out_proj_weight(updated_param)?;
+                } else if name.ends_with(".dt_bias") {
+                    gdn.set_dt_bias(updated_param);
+                } else if name.ends_with(".a_log") {
+                    gdn.set_a_log(updated_param)?;
+                }
+            }
+        } else if name.contains(".self_attn.") {
+            if let AttentionType::Full(ref mut attn) = layer.attn {
+                if name.ends_with(".q_proj.weight") {
+                    attn.set_q_proj_weight(updated_param)?;
+                } else if name.ends_with(".k_proj.weight") {
+                    attn.set_k_proj_weight(updated_param)?;
+                } else if name.ends_with(".v_proj.weight") {
+                    attn.set_v_proj_weight(updated_param)?;
+                } else if name.ends_with(".o_proj.weight") {
+                    attn.set_o_proj_weight(updated_param)?;
+                } else if name.ends_with(".q_norm.weight") {
+                    attn.set_q_norm_weight(updated_param)?;
+                } else if name.ends_with(".k_norm.weight") {
+                    attn.set_k_norm_weight(updated_param)?;
+                }
+            }
+        } else if name.contains(".mlp.") {
+            match &mut layer.mlp {
+                MLPType::Dense(mlp) => {
+                    if name.ends_with(".gate_proj.weight") {
+                        mlp.set_gate_proj_weight(updated_param)?;
+                    } else if name.ends_with(".up_proj.weight") {
+                        mlp.set_up_proj_weight(updated_param)?;
+                    } else if name.ends_with(".down_proj.weight") {
+                        mlp.set_down_proj_weight(updated_param)?;
+                    }
+                }
+                MLPType::MoE(moe) => {
+                    if name.ends_with(".mlp.gate.weight") {
+                        moe.set_gate_weight(updated_param)?;
+                    } else if name.contains(".mlp.switch_mlp.") {
+                        if name.ends_with(".gate_proj.weight") {
+                            moe.set_switch_mlp_gate_proj_weight(updated_param);
+                        } else if name.ends_with(".up_proj.weight") {
+                            moe.set_switch_mlp_up_proj_weight(updated_param);
+                        } else if name.ends_with(".down_proj.weight") {
+                            moe.set_switch_mlp_down_proj_weight(updated_param);
+                        }
+                    } else if name.contains(".mlp.shared_expert_gate.") {
+                        moe.set_shared_expert_gate_weight(updated_param)?;
+                    } else if name.contains(".mlp.shared_expert.") {
+                        if name.ends_with(".gate_proj.weight") {
+                            moe.set_shared_expert_gate_proj_weight(updated_param)?;
+                        } else if name.ends_with(".up_proj.weight") {
+                            moe.set_shared_expert_up_proj_weight(updated_param)?;
+                        } else if name.ends_with(".down_proj.weight") {
+                            moe.set_shared_expert_down_proj_weight(updated_param)?;
+                        }
+                    }
+                }
+            }
+        } else if name.ends_with(".input_layernorm.weight") {
+            layer.set_input_layernorm_weight(updated_param)?;
+        } else if name.ends_with(".post_attention_layernorm.weight") {
+            layer.set_post_attention_layernorm_weight(updated_param)?;
+        } else {
+            tracing::warn!(
+                "Unrecognized parameter name in apply_layer_gradient: {}",
+                name
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Tokenize messages using the model's chat template.
+    pub(crate) fn apply_chat_template_sync(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: Option<bool>,
+        tools: Option<&[ToolDefinition]>,
+        enable_thinking: Option<bool>,
+    ) -> Result<Vec<u32>> {
+        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
+            Error::from_reason("Tokenizer not loaded - call load_pretrained first")
+        })?;
+        tokenizer.apply_chat_template_sync(messages, add_generation_prompt, tools, enable_thinking)
+    }
+
+    /// Generate a single completion with logprob tracking (for GRPO training).
+    ///
+    /// Uses the C++ MoE forward path when available (~10x faster than Rust).
+    /// Generation does NOT need differentiability — gradients are computed separately
+    /// via the functional forward path in autograd Phase 2.
+    pub(crate) fn generate_for_training_sync(
+        &self,
+        input_ids: &MxArray,
+        config: Option<GenerationConfig>,
+    ) -> Result<GenerationResult> {
+        let config = config.unwrap_or_default();
+        let eos_token_id = config.eos_token_id.or(Some(self.config.eos_token_id));
+
+        // Check if C++ MoE path is available (weights loaded from safetensors)
+        let use_cpp = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
+
+        // Try to acquire MoE compiled mutex (non-blocking, safe from sync context).
+        // If locked (concurrent generate() call), fall back to Rust path.
+        let compiled_lock = if use_cpp {
+            MOE_COMPILED_MUTEX.try_lock().ok()
+        } else {
+            None
+        };
+        let use_cpp = compiled_lock.is_some();
+
+        // Ensure caches exist
+        self.init_caches()?;
+
+        // Acquire locks
+        let embedding_weight = self.embedding.get_weight();
+        let mut layers_guard = self
+            .layers
+            .write()
+            .map_err(|_| Error::from_reason("Failed to acquire layers write lock"))?;
+        let final_norm_guard = self
+            .final_norm
+            .read()
+            .map_err(|_| Error::from_reason("Failed to acquire final_norm read lock"))?;
+        let lm_head_guard = self
+            .lm_head
+            .read()
+            .map_err(|_| Error::from_reason("Failed to acquire lm_head read lock"))?;
+        let mut caches_guard = self
+            .caches
+            .write()
+            .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
+
+        let fa_idx = self.fa_idx;
+
+        // === Prefill (always uses Rust forward — runs once) ===
+        let logits = forward_inner(
+            input_ids,
+            &embedding_weight,
+            &mut layers_guard,
+            &mut caches_guard,
+            &final_norm_guard,
+            &lm_head_guard,
+            fa_idx,
+            None,
+        )?;
+        let seq_len = logits.shape_at(1)?;
+        let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
+        let last_logits = last_logits.squeeze(Some(&[1]))?;
+        let input_tokens = input_ids.to_uint32()?;
+
+        let result = if use_cpp {
+            // === C++ MoE decode path ===
+            let _moe_guard = MoeResetGuard;
+            let max_new_tokens = config.max_new_tokens.unwrap_or(100);
+            let prefill_len = seq_len as i32;
+            let max_kv_len = ((prefill_len + max_new_tokens + 255) / 256) * 256;
+            let num_layers = self.config.num_layers as usize;
+            let mut cache_ptrs: Vec<*mut mlx_sys::mlx_array> =
+                vec![std::ptr::null_mut(); num_layers * 2];
+            if let Some(ref caches) = *caches_guard {
+                for (i, cache) in caches.iter().enumerate() {
+                    let (p0, p1) = cache.export_ptrs();
+                    cache_ptrs[i * 2] = p0;
+                    cache_ptrs[i * 2 + 1] = p1;
+                }
+            }
+            let mlp_only: Vec<i32> = self
+                .config
+                .mlp_only_layers
+                .as_deref()
+                .unwrap_or(&[])
+                .to_vec();
+            // Drop locks not needed during C++ MoE decode
+            drop(layers_guard);
+            drop(final_norm_guard);
+            drop(lm_head_guard);
+            // Keep caches_guard alive through init_from_prefill so cache_ptrs remain valid
+            unsafe {
+                mlx_sys::mlx_qwen35_moe_init_from_prefill(
+                    self.config.num_layers,
+                    self.config.hidden_size,
+                    self.config.num_heads,
+                    self.config.num_kv_heads,
+                    self.config.head_dim,
+                    self.config.rope_theta as f32,
+                    self.config.rope_dims(),
+                    self.config.rms_norm_eps as f32,
+                    self.config.full_attention_interval,
+                    self.config.linear_num_key_heads,
+                    self.config.linear_num_value_heads,
+                    self.config.linear_key_head_dim,
+                    self.config.linear_value_head_dim,
+                    self.config.linear_conv_kernel_dim,
+                    if self.config.tie_word_embeddings {
+                        1
+                    } else {
+                        0
+                    },
+                    max_kv_len,
+                    1, // batch_size
+                    self.config.num_experts,
+                    self.config.num_experts_per_tok,
+                    if self.config.norm_topk_prob { 1 } else { 0 },
+                    self.config.decoder_sparse_step,
+                    if mlp_only.is_empty() {
+                        std::ptr::null()
+                    } else {
+                        mlp_only.as_ptr()
+                    },
+                    mlp_only.len() as i32,
+                    cache_ptrs.as_mut_ptr(),
+                    prefill_len,
+                );
+            }
+            // C++ has copied arrays into its own globals — safe to release
+            drop(caches_guard);
+
+            // Decode using C++ MoE forward with synchronous cache eval.
+            // Caches are eval'd BEFORE each forward call to ensure the previous step's
+            // caches are materialized, preventing O(N²) graph growth.
+            let mut forward_fn = |ids: &MxArray| -> Result<MxArray> {
+                unsafe { mlx_sys::mlx_qwen35_moe_sync_eval_caches() };
+                let logits = forward_moe_cpp(ids, &embedding_weight)?;
+                // forward_moe_cpp returns [1, vocab] but training loop expects [1, 1, vocab]
+                let logits = logits.reshape(&[1, 1, -1])?;
+                Ok(logits)
+            };
+
+            crate::models::training_generate::generate_decode_loop_for_training(
+                &last_logits,
+                &input_tokens,
+                &config,
+                eos_token_id,
+                &mut forward_fn,
+            )?
+            // _moe_guard dropped here → mlx_qwen35_moe_reset()
+        } else {
+            // === Rust fallback decode path ===
+            let mut forward_fn = |ids: &MxArray| -> Result<MxArray> {
+                forward_inner(
+                    ids,
+                    &embedding_weight,
+                    &mut layers_guard,
+                    &mut caches_guard,
+                    &final_norm_guard,
+                    &lm_head_guard,
+                    fa_idx,
+                    None,
+                )
+            };
+
+            let result = crate::models::training_generate::generate_decode_loop_for_training(
+                &last_logits,
+                &input_tokens,
+                &config,
+                eos_token_id,
+                &mut forward_fn,
+            )?;
+
+            drop(layers_guard);
+            drop(final_norm_guard);
+            drop(lm_head_guard);
+            drop(caches_guard);
+
+            result
+        };
+
+        // Drop compiled lock before reset_caches
+        drop(compiled_lock);
+        self.reset_caches()?;
+
+        Ok(result)
+    }
+
+    /// Generate a batch of completions for GRPO training.
+    pub(crate) fn generate_batch_for_training_sync(
+        &self,
+        prompt_arrays: &[MxArray],
+        group_size: usize,
+        config: Option<GenerationConfig>,
+    ) -> Result<BatchGenerationResult> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
+
+        crate::models::training_generate::generate_batch_for_training_loop(
+            prompt_arrays,
+            group_size,
+            config,
+            tokenizer,
+            |prompt, cfg| self.generate_for_training_sync(prompt, cfg),
+        )
+    }
+
+    /// Decode token IDs to text.
+    pub(crate) fn decode_tokens_sync(&self, tokens: &MxArray) -> Result<String> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
+        let token_ids = tokens.to_uint32()?;
+        tokenizer.decode_sync(&token_ids, true)
     }
 }

@@ -51,10 +51,13 @@ use crate::grpo::rewards::{
     BuiltinRewardConfig, JsonSchemaReward, LengthReward, RewardRegistry, ToolUseReward,
     XMLFormatReward,
 };
-use crate::models::qwen3::{GenerationConfig, Qwen3Config, Qwen3Model};
+use crate::models::qwen3::{GenerationConfig, Qwen3Model};
+use crate::models::qwen3_5::model::Qwen3_5Model;
+use crate::models::qwen3_5_moe::model::Qwen3_5MoeModel;
 use crate::optimizers::GradientUtils;
 use crate::tokenizer::{ChatMessage, ToolDefinition};
 use crate::tools::build_reward_outputs;
+use crate::training_model::{ModelType, TrainableModel, TrainableModelEnum};
 
 /// Configuration for the GRPO training engine
 #[napi(object)]
@@ -152,6 +155,24 @@ pub struct GRPOEngineConfig {
     /// When false, uses the sequential generation (process one prompt at a time,
     /// then expand KV cache for G completions).
     pub use_parallel_batch_generation: Option<bool>,
+
+    /// Enable gradient checkpointing (default: true).
+    /// When true, each transformer layer's activations are discarded during the forward
+    /// pass and recomputed during backward, reducing peak memory from O(num_layers) to O(1)
+    /// for intermediate states. For Qwen3.5 0.8B, this reduces autograd peak from ~105GB to ~11GB.
+    /// The trade-off is ~30% more compute (one extra forward pass per layer during backward).
+    pub gradient_checkpointing: Option<bool>,
+
+    /// Optimizer type: "sgd" or "adamw" (default: "adamw")
+    pub optimizer_type: Option<String>,
+    /// AdamW beta1 (default: 0.9)
+    pub adamw_beta1: Option<f64>,
+    /// AdamW beta2 (default: 0.999)
+    pub adamw_beta2: Option<f64>,
+    /// AdamW epsilon (default: 1e-8)
+    pub adamw_eps: Option<f64>,
+    /// Weight decay for AdamW (default: 0.01)
+    pub weight_decay: Option<f64>,
 }
 
 impl Default for GRPOEngineConfig {
@@ -175,10 +196,16 @@ impl Default for GRPOEngineConfig {
             verbose_nan_detection: Some(false),
             enable_thinking: Some(true),
             tools: None,
-            lm_head_chunk_size: None,      // Default: no chunking
-            forward_chunk_size: None,      // Default: no chunking
+            lm_head_chunk_size: Some(2), // Default: 2 (chunked for memory efficiency)
+            forward_chunk_size: None,    // Default: no chunking
             vocab_chunk_size: Some(65536), // Default: 2^16 chunks for large vocabularies
             use_parallel_batch_generation: Some(false), // Default: use sequential for stability
+            gradient_checkpointing: Some(true), // Default: enable for memory efficiency
+            optimizer_type: Some("adamw".to_string()),
+            adamw_beta1: Some(0.9),
+            adamw_beta2: Some(0.999),
+            adamw_eps: Some(1e-8),
+            weight_decay: Some(0.01),
         }
     }
 }
@@ -343,42 +370,202 @@ impl Default for EngineState {
 #[napi]
 pub struct GRPOTrainingEngine {
     /// The model being trained
-    model: Arc<RwLock<Qwen3Model>>,
-    /// Model configuration (for functional forward pass)
-    model_config: Qwen3Config,
+    model: Arc<RwLock<TrainableModelEnum>>,
+    /// Model type (carries config for functional forward pass in autograd)
+    model_type: ModelType,
     /// Engine configuration
     config: GRPOEngineConfig,
     /// Reward registry (built-in rewards)
     reward_registry: RewardRegistry,
     /// Training state
     state: Arc<RwLock<EngineState>>,
+    /// AdamW optimizer (used when optimizer_type is "adamw")
+    optimizer: Option<Arc<std::sync::Mutex<crate::optimizers::AdamW>>>,
+}
+
+/// Apply gradients to model using either AdamW or SGD.
+fn apply_optimizer_step(
+    model: &mut TrainableModelEnum,
+    grads: &HashMap<String, MxArray>,
+    params: &HashMap<String, MxArray>,
+    lr: f64,
+    optimizer: &Option<Arc<std::sync::Mutex<crate::optimizers::AdamW>>>,
+    grad_acc_steps: i32,
+) -> Result<()> {
+    if let Some(opt_arc) = optimizer {
+        // AdamW path
+        let mut opt = opt_arc
+            .lock()
+            .map_err(|_| Error::new(Status::GenericFailure, "Failed to acquire optimizer lock"))?;
+
+        let mut param_names_vec: Vec<String> = Vec::new();
+        let mut param_refs: Vec<&MxArray> = Vec::new();
+        let mut grad_refs: Vec<&MxArray> = Vec::new();
+
+        // When using gradient accumulation, gradients are summed (not averaged).
+        // SGD compensates by dividing lr, but AdamW ignores lr (uses delta trick with 1.0).
+        // So we must average the gradients explicitly before passing to AdamW.
+        let scaled_grads: HashMap<String, MxArray>;
+        let grads_to_use = if grad_acc_steps > 1 {
+            let scale = 1.0 / grad_acc_steps as f32;
+            let scale_arr = MxArray::from_float32(&[scale], &[]).unwrap();
+            scaled_grads = grads
+                .iter()
+                .map(|(name, grad)| (name.clone(), grad.mul(&scale_arr).unwrap()))
+                .collect();
+            &scaled_grads
+        } else {
+            grads
+        };
+
+        for (name, grad) in grads_to_use {
+            if let Some(param) = params.get(name) {
+                param_names_vec.push(name.clone());
+                param_refs.push(param);
+                grad_refs.push(grad);
+            }
+        }
+
+        let updated = opt.update_batch(param_names_vec.clone(), param_refs.clone(), grad_refs)?;
+
+        // Create deltas: delta = param - updated (so param - 1.0 * delta = updated)
+        let deltas: HashMap<String, MxArray> = param_names_vec
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let delta = param_refs[i].sub(&updated[i]).unwrap();
+                (name.clone(), delta)
+            })
+            .collect();
+
+        let delta_refs: HashMap<String, &MxArray> =
+            deltas.iter().map(|(k, v)| (k.clone(), v)).collect();
+        model.apply_gradients_with_params(delta_refs, 1.0, params)?;
+
+        debug!("Applied AdamW update (step={})", opt.get_step());
+    } else {
+        // SGD path
+        let grads_refs: HashMap<String, &MxArray> =
+            grads.iter().map(|(k, v)| (k.clone(), v)).collect();
+        model.apply_gradients_with_params(grads_refs, lr, params)?;
+
+        debug!("Applied SGD gradients with lr: {}", lr);
+    }
+
+    Ok(())
+}
+
+/// Create an AdamW optimizer from engine config, or None for SGD.
+fn create_optimizer(
+    config: &GRPOEngineConfig,
+) -> Option<Arc<std::sync::Mutex<crate::optimizers::AdamW>>> {
+    let opt_type = config.optimizer_type.as_deref().unwrap_or("adamw");
+    if opt_type == "adamw" {
+        let optimizer = crate::optimizers::AdamW::new(
+            config.learning_rate,
+            config.adamw_beta1,
+            config.adamw_beta2,
+            config.adamw_eps,
+            config.weight_decay,
+            Some(true), // bias correction
+        );
+        info!(
+            "Using AdamW optimizer (lr={}, beta1={}, beta2={}, wd={})",
+            config.learning_rate.unwrap_or(1e-6),
+            config.adamw_beta1.unwrap_or(0.9),
+            config.adamw_beta2.unwrap_or(0.999),
+            config.weight_decay.unwrap_or(0.01),
+        );
+        Some(Arc::new(std::sync::Mutex::new(optimizer)))
+    } else {
+        info!(
+            "Using SGD optimizer (lr={})",
+            config.learning_rate.unwrap_or(1e-6)
+        );
+        None
+    }
 }
 
 #[napi]
 impl GRPOTrainingEngine {
-    /// Create a new training engine from an existing model
+    /// Create a new training engine from a Qwen3 model
     ///
     /// # Arguments
     /// * `model` - The Qwen3 model to train (will be cloned internally)
     /// * `config` - Engine configuration
     #[napi(constructor)]
     pub fn new(model: &Qwen3Model, config: GRPOEngineConfig) -> Result<Self> {
-        let model_config = model.get_config();
+        let model_type = ModelType::Qwen3(model.get_config());
 
         info!(
             "Creating training engine: {} layers, {} hidden, eos_token_id={}, pad_token_id={}",
-            model_config.num_layers,
-            model_config.hidden_size,
-            model_config.eos_token_id,
-            model_config.pad_token_id
+            model_type.num_layers(),
+            model_type.hidden_size(),
+            model_type.eos_token_id(),
+            model_type.pad_token_id()
         );
 
+        let optimizer = create_optimizer(&config);
+
         Ok(Self {
-            model: Arc::new(RwLock::new(model.clone_for_session()?)),
-            model_config,
+            model: Arc::new(RwLock::new(TrainableModelEnum::Qwen3(
+                model.clone_for_session()?,
+            ))),
+            model_type,
             config,
             reward_registry: RewardRegistry::new(),
             state: Arc::new(RwLock::new(EngineState::default())),
+            optimizer,
+        })
+    }
+
+    /// Create a new training engine from a Qwen3.5 dense model
+    #[napi(factory)]
+    pub fn from_qwen35(model: &Qwen3_5Model, config: GRPOEngineConfig) -> Result<Self> {
+        let model_type = ModelType::Qwen35Dense(model.get_config());
+
+        info!(
+            "Creating training engine (Qwen3.5 Dense): {} layers, {} hidden",
+            model_type.num_layers(),
+            model_type.hidden_size()
+        );
+
+        let optimizer = create_optimizer(&config);
+
+        Ok(Self {
+            model: Arc::new(RwLock::new(TrainableModelEnum::Qwen35Dense(
+                model.clone_for_training()?,
+            ))),
+            model_type,
+            config,
+            reward_registry: RewardRegistry::new(),
+            state: Arc::new(RwLock::new(EngineState::default())),
+            optimizer,
+        })
+    }
+
+    /// Create a new training engine from a Qwen3.5 MoE model
+    #[napi(factory)]
+    pub fn from_qwen35_moe(model: &Qwen3_5MoeModel, config: GRPOEngineConfig) -> Result<Self> {
+        let model_type = ModelType::Qwen35Moe(model.get_config());
+
+        info!(
+            "Creating training engine (Qwen3.5 MoE): {} layers, {} hidden",
+            model_type.num_layers(),
+            model_type.hidden_size()
+        );
+
+        let optimizer = create_optimizer(&config);
+
+        Ok(Self {
+            model: Arc::new(RwLock::new(TrainableModelEnum::Qwen35Moe(
+                model.clone_for_training()?,
+            ))),
+            model_type,
+            config,
+            reward_registry: RewardRegistry::new(),
+            state: Arc::new(RwLock::new(EngineState::default())),
+            optimizer,
         })
     }
 
@@ -493,7 +680,8 @@ impl GRPOTrainingEngine {
         // Clone Arcs for the blocking task
         let model_arc = Arc::clone(&self.model);
         let state_arc = Arc::clone(&self.state);
-        let model_config = self.model_config.clone();
+        let optimizer_arc = self.optimizer.clone();
+        let model_type = self.model_type.clone();
         let config = self.config.clone();
         let enable_thinking = config.enable_thinking;
         let tools = config.tools.clone();
@@ -510,7 +698,7 @@ impl GRPOTrainingEngine {
             max_consecutive_tokens: Some(16),
             max_ngram_repeats: Some(8),
             ngram_size: Some(3),
-            eos_token_id: Some(model_config.eos_token_id),
+            eos_token_id: Some(model_type.eos_token_id()),
             return_logprobs: Some(true),
             prefill_step_size: None, // Use default (2048)
             kv_cache_bits: None,     // Default: no quantization
@@ -602,7 +790,7 @@ impl GRPOTrainingEngine {
                 let model = model_arc.read().map_err(|_| {
                     Error::new(Status::GenericFailure, "Failed to acquire model read lock")
                 })?;
-                model.get_parameters()
+                model.get_parameters()?
             };
 
             let prompt_refs: Vec<&MxArray> = prompt_tokens_all.iter().collect();
@@ -610,7 +798,7 @@ impl GRPOTrainingEngine {
             let logprob_refs: Vec<&MxArray> = completion_logprobs_all.iter().collect();
 
             let (loss_value, gradients) = compute_loss_and_gradients_autograd(
-                &model_config,
+                &model_type,
                 &params,
                 &prompt_refs,
                 &completion_refs,
@@ -618,6 +806,7 @@ impl GRPOTrainingEngine {
                 &rewards,
                 config.group_size.unwrap_or(4),
                 loss_config,
+                config.gradient_checkpointing.unwrap_or(true),
             )?;
 
             // Check for NaN
@@ -814,11 +1003,7 @@ impl GRPOTrainingEngine {
                     Error::new(Status::GenericFailure, "Failed to acquire model write lock")
                 })?;
 
-                let grads_refs: HashMap<String, &MxArray> =
-                    grads.iter().map(|(k, v)| (k.clone(), v)).collect();
-                model_mut.apply_gradients(grads_refs, lr)?;
-
-                debug!("Applied gradients with lr: {}", lr);
+                apply_optimizer_step(&mut model_mut, &grads, &params, lr, &optimizer_arc, grad_acc_steps)?;
 
                 // Re-acquire state lock
                 let mut state = state_arc.write().map_err(|_| {
@@ -937,7 +1122,7 @@ impl GRPOTrainingEngine {
 
         let model_arc = Arc::clone(&self.model);
         let config = self.config.clone();
-        let model_config = self.model_config.clone();
+        let model_type = self.model_type.clone();
         let enable_thinking = config.enable_thinking;
         let tools = config.tools.clone();
 
@@ -953,7 +1138,7 @@ impl GRPOTrainingEngine {
             max_consecutive_tokens: Some(16),
             max_ngram_repeats: Some(8),
             ngram_size: Some(3),
-            eos_token_id: Some(model_config.eos_token_id),
+            eos_token_id: Some(model_type.eos_token_id()),
             return_logprobs: Some(true),
             prefill_step_size: None, // Use default (2048)
             kv_cache_bits: None,     // Default: no quantization
@@ -994,7 +1179,16 @@ impl GRPOTrainingEngine {
                     Error::new(Status::GenericFailure, "Failed to acquire model read lock")
                 })?;
                 if use_parallel {
-                    model.generate_batch_parallel_sync(&prompt_arrays, group_size, Some(gen_config.clone()))?
+                    // Parallel batch generation is only available for Qwen3 models
+                    match &*model {
+                        TrainableModelEnum::Qwen3(m) => {
+                            m.generate_batch_parallel_sync(&prompt_arrays, group_size, Some(gen_config.clone()))?
+                        }
+                        _ => {
+                            // Fall back to sequential for non-Qwen3 models
+                            model.generate_batch_for_training_sync(&prompt_arrays, group_size, Some(gen_config.clone()))?
+                        }
+                    }
                 } else {
                     model.generate_batch_for_training_sync(&prompt_arrays, group_size, Some(gen_config.clone()))?
                 }
@@ -1035,7 +1229,7 @@ impl GRPOTrainingEngine {
                 // Bounds check with helpful error message
                 let reason = batch_result.finish_reasons
                     .get(prompt_idx)
-                    .and_then(|reasons| reasons.get(group_idx))
+                    .and_then(|reasons: &Vec<String>| reasons.get(group_idx))
                     .cloned()
                     .unwrap_or_else(|| {
                         eprintln!(
@@ -1125,7 +1319,8 @@ impl GRPOTrainingEngine {
         // Clone Arcs for the blocking task
         let model_arc = Arc::clone(&self.model);
         let state_arc = Arc::clone(&self.state);
-        let model_config = self.model_config.clone();
+        let optimizer_arc = self.optimizer.clone();
+        let model_type = self.model_type.clone();
         let config = self.config.clone();
         let enable_thinking = config.enable_thinking;
         let tools = config.tools.clone();
@@ -1204,7 +1399,7 @@ impl GRPOTrainingEngine {
                 let model = model_arc.read().map_err(|_| {
                     Error::new(Status::GenericFailure, "Failed to acquire model read lock")
                 })?;
-                model.get_parameters()
+                model.get_parameters()?
             };
 
             let prompt_refs: Vec<&MxArray> = prompt_tokens_all.iter().collect();
@@ -1212,7 +1407,7 @@ impl GRPOTrainingEngine {
             let logprob_refs: Vec<&MxArray> = completion_logprobs_all.iter().collect();
 
             let (loss_value, gradients) = compute_loss_and_gradients_autograd(
-                &model_config,
+                &model_type,
                 &params,
                 &prompt_refs,
                 &completion_refs,
@@ -1220,6 +1415,7 @@ impl GRPOTrainingEngine {
                 &rewards,
                 config.group_size.unwrap_or(4),
                 loss_config,
+                config.gradient_checkpointing.unwrap_or(true),
             )?;
 
             // Check for NaN
@@ -1410,11 +1606,7 @@ impl GRPOTrainingEngine {
                     Error::new(Status::GenericFailure, "Failed to acquire model write lock")
                 })?;
 
-                let grads_refs: HashMap<String, &MxArray> =
-                    grads.iter().map(|(k, v)| (k.clone(), v)).collect();
-                model_mut.apply_gradients(grads_refs, lr)?;
-
-                debug!("Applied gradients with lr: {}", lr);
+                apply_optimizer_step(&mut model_mut, &grads, &params, lr, &optimizer_arc, grad_acc_steps)?;
 
                 // Re-acquire state lock
                 let mut state = state_arc.write().map_err(|_| {
@@ -1538,7 +1730,7 @@ impl GRPOTrainingEngine {
 
         // Clone Arcs for the blocking task
         let model_arc = Arc::clone(&self.model);
-        let model_config = self.model_config.clone();
+        let model_type = self.model_type.clone();
         let config = self.config.clone();
         let enable_thinking = config.enable_thinking;
         let tools = config.tools.clone();
@@ -1555,7 +1747,7 @@ impl GRPOTrainingEngine {
             max_consecutive_tokens: Some(16),
             max_ngram_repeats: Some(8),
             ngram_size: Some(3),
-            eos_token_id: Some(model_config.eos_token_id),
+            eos_token_id: Some(model_type.eos_token_id()),
             return_logprobs: Some(true),
             prefill_step_size: None, // Use default (2048)
             kv_cache_bits: None,     // Default: no quantization
@@ -1859,7 +2051,8 @@ impl GRPOTrainingEngine {
 
         let model_arc = Arc::clone(&self.model);
         let state_arc = Arc::clone(&self.state);
-        let model_config = self.model_config.clone();
+        let optimizer_arc = self.optimizer.clone();
+        let model_type = self.model_type.clone();
         let config = self.config.clone();
         let rewards_clone = filtered_rewards.clone();
         let group_size_for_training = effective_group_size as i32;
@@ -1886,7 +2079,7 @@ impl GRPOTrainingEngine {
                 let model = model_arc.read().map_err(|_| {
                     Error::new(Status::GenericFailure, "Failed to acquire model read lock")
                 })?;
-                model.get_parameters()
+                model.get_parameters()?
             };
 
             let prompt_refs: Vec<&MxArray> = prompt_tokens.iter().collect();
@@ -1901,7 +2094,7 @@ impl GRPOTrainingEngine {
             let grad_start = std::time::Instant::now();
 
             let (loss_value, gradients) = compute_loss_and_gradients_autograd(
-                &model_config,
+                &model_type,
                 &params,
                 &prompt_refs,
                 &completion_refs,
@@ -1909,6 +2102,7 @@ impl GRPOTrainingEngine {
                 &rewards_clone,
                 group_size_for_training,
                 loss_config,
+                config.gradient_checkpointing.unwrap_or(true),
             )?;
 
             info!(
@@ -2071,9 +2265,14 @@ impl GRPOTrainingEngine {
                     Error::new(Status::GenericFailure, "Failed to acquire model write lock")
                 })?;
 
-                let grads_refs: HashMap<String, &MxArray> =
-                    grads.iter().map(|(k, v)| (k.clone(), v)).collect();
-                model_mut.apply_gradients(grads_refs, lr)?;
+                apply_optimizer_step(
+                    &mut model_mut,
+                    &grads,
+                    &params,
+                    lr,
+                    &optimizer_arc,
+                    grad_acc_steps,
+                )?;
                 drop(model_mut);
                 drop(grads);
 
@@ -2269,6 +2468,14 @@ impl GRPOTrainingEngine {
             .map_err(|_| Error::new(Status::GenericFailure, "Failed to acquire state lock"))?;
 
         *state = EngineState::default();
+
+        // Reset optimizer state if present
+        if let Some(ref optimizer) = self.optimizer
+            && let Ok(mut opt) = optimizer.lock()
+        {
+            opt.reset();
+        }
+
         synchronize_and_clear_cache();
 
         info!("Training engine reset");
@@ -2326,6 +2533,93 @@ impl GRPOTrainingEngine {
             .write()
             .map_err(|_| Error::new(Status::GenericFailure, "Failed to acquire state lock"))?;
         state.needs_emergency_save = false;
+        Ok(())
+    }
+
+    /// Save optimizer state (moment tensors + step) to a SafeTensors file.
+    ///
+    /// The step counter is stored in the `__metadata__` field.
+    /// Each parameter's first moment (m) and second moment (v) are stored as
+    /// `{param_name}.m` and `{param_name}.v` tensors.
+    ///
+    /// No-op if the engine uses SGD (no optimizer state to save).
+    #[napi]
+    pub fn save_optimizer_state(&self, path: String) -> Result<()> {
+        let opt_arc = match &self.optimizer {
+            Some(opt) => opt,
+            None => return Ok(()), // SGD — no state to save
+        };
+
+        let opt = opt_arc
+            .lock()
+            .map_err(|_| Error::new(Status::GenericFailure, "Failed to acquire optimizer lock"))?;
+
+        let step = opt.get_step();
+        let keys = opt.get_state_keys();
+
+        if keys.is_empty() {
+            return Ok(()); // No state accumulated yet
+        }
+
+        let mut tensors: HashMap<String, MxArray> = HashMap::new();
+
+        for key in &keys {
+            if let Some(m) = opt.get_first_moment(key.clone()) {
+                tensors.insert(format!("{}.m", key), m);
+            }
+            if let Some(v) = opt.get_second_moment(key.clone()) {
+                tensors.insert(format!("{}.v", key), v);
+            }
+        }
+
+        let metadata = serde_json::json!({
+            "step": step.to_string(),
+            "format": "adamw_optimizer_state",
+        });
+
+        crate::utils::safetensors::save_safetensors(&path, &tensors, Some(metadata))
+    }
+
+    /// Load optimizer state (moment tensors + step) from a SafeTensors file.
+    ///
+    /// Restores the step counter from metadata and sets first/second moment
+    /// tensors for each parameter found in the file.
+    ///
+    /// No-op if the engine uses SGD (no optimizer to restore).
+    #[napi]
+    pub fn load_optimizer_state(&self, path: String) -> Result<()> {
+        let opt_arc = match &self.optimizer {
+            Some(opt) => opt,
+            None => return Ok(()), // SGD — nothing to restore
+        };
+
+        let mut opt = opt_arc
+            .lock()
+            .map_err(|_| Error::new(Status::GenericFailure, "Failed to acquire optimizer lock"))?;
+
+        // Load SafeTensors file
+        let st_file = crate::utils::safetensors::SafeTensorsFile::load(&path)?;
+
+        // Restore step from metadata
+        if let Some(metadata) = &st_file.metadata
+            && let Some(step_str) = metadata.get("step").and_then(|v| v.as_str())
+            && let Ok(step) = step_str.parse::<i64>()
+        {
+            opt.set_step(step);
+        }
+
+        // Load all tensors
+        let tensors = st_file.load_tensors(&path)?;
+
+        // Restore moment tensors: keys are "{param_name}.m" and "{param_name}.v"
+        for (tensor_key, array) in &tensors {
+            if let Some(param_name) = tensor_key.strip_suffix(".m") {
+                opt.set_first_moment(param_name.to_string(), array)?;
+            } else if let Some(param_name) = tensor_key.strip_suffix(".v") {
+                opt.set_second_moment(param_name.to_string(), array)?;
+            }
+        }
+
         Ok(())
     }
 }

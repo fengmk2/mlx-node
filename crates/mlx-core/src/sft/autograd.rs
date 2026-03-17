@@ -20,9 +20,9 @@ use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
 use crate::autograd;
-use crate::models::qwen3::Qwen3Config;
 use crate::nn::Losses;
 use crate::param_manager;
+use crate::training_model::ModelType;
 use crate::utils::functional;
 
 use super::SftLossConfig;
@@ -43,12 +43,13 @@ use super::SftLossConfig;
 ///
 /// # Returns
 /// * `(loss_value, gradients)` - Scalar loss and gradients for each parameter
-pub fn compute_sft_loss_and_gradients(
-    model_config: &Qwen3Config,
+pub(crate) fn compute_sft_loss_and_gradients(
+    model_type: &ModelType,
     model_params: &HashMap<String, MxArray>,
     input_ids: &MxArray,
     labels: &MxArray,
     loss_config: SftLossConfig,
+    use_checkpointing: bool,
 ) -> Result<(f64, HashMap<String, MxArray>)> {
     // 1. Flatten parameters into ordered list (keep native dtype - bfloat16)
     let mut param_names: Vec<String> = model_params.keys().cloned().collect();
@@ -69,17 +70,25 @@ pub fn compute_sft_loss_and_gradients(
         let param_names_clone = param_names.clone();
         let input_ids_clone = input_ids.clone();
         let labels_clone = labels.clone();
-        let config_clone = model_config.clone();
+        let config_clone = model_type.clone();
         let loss_config_clone = loss_config.clone();
 
         // Define loss function for autograd
+        let ckpt_contexts =
+            std::rc::Rc::new(std::cell::RefCell::new(autograd::CheckpointContexts::new()));
+        let ckpt_ctx = ckpt_contexts.clone();
         let loss_fn = move |params: &[MxArray]| -> Result<MxArray> {
             // Map params to structured dictionary
             let param_dict = param_manager::map_params_to_dict(params, &param_names_clone)?;
 
             // Forward pass using functional implementation
-            let logits =
-                functional::qwen3_forward_functional(&config_clone, &param_dict, &input_ids_clone)?;
+            let logits = functional::forward_functional_dispatch(
+                &config_clone,
+                &param_dict,
+                &input_ids_clone,
+                use_checkpointing,
+                &mut ckpt_ctx.borrow_mut(),
+            )?;
 
             // Get shapes
             let batch_size = logits.shape_at(0)?;
@@ -126,6 +135,9 @@ pub fn compute_sft_loss_and_gradients(
             grad.eval();
         }
 
+        // Reclaim checkpoint contexts now that the graph is eval'd
+        ckpt_contexts.borrow_mut().reclaim();
+
         // Extract values before scope ends
         let loss_val = loss_array.item_at_float32(0)? as f64;
         let grads: HashMap<String, MxArray> = param_names
@@ -156,14 +168,21 @@ pub fn compute_sft_loss_and_gradients(
 ///
 /// # Returns
 /// * Accuracy value between 0.0 and 1.0
-pub fn compute_token_accuracy(
-    model_config: &Qwen3Config,
+pub(crate) fn compute_token_accuracy(
+    model_type: &ModelType,
     model_params: &HashMap<String, MxArray>,
     input_ids: &MxArray,
     labels: &MxArray,
 ) -> Result<f64> {
-    // Forward pass
-    let logits = functional::qwen3_forward_functional(model_config, model_params, input_ids)?;
+    // Forward pass (no checkpointing needed for validation — no backward pass)
+    let mut ckpt = autograd::CheckpointContexts::new();
+    let logits = functional::forward_functional_dispatch(
+        model_type,
+        model_params,
+        input_ids,
+        false,
+        &mut ckpt,
+    )?;
 
     // Get shapes
     let batch_size = logits.shape_at(0)?;
@@ -202,53 +221,6 @@ pub fn compute_token_accuracy(
     } else {
         Ok(correct_val / valid_val)
     }
-}
-
-/// Compute SFT loss only (no gradients)
-///
-/// Useful for evaluation/validation without the overhead of gradient computation.
-pub fn compute_sft_loss_only(
-    model_config: &Qwen3Config,
-    model_params: &HashMap<String, MxArray>,
-    input_ids: &MxArray,
-    labels: &MxArray,
-    loss_config: SftLossConfig,
-) -> Result<f64> {
-    // Build param dict
-    let param_dict: HashMap<String, MxArray> = model_params.clone();
-
-    // Forward pass
-    let logits = functional::qwen3_forward_functional(model_config, &param_dict, input_ids)?;
-
-    // Get shapes
-    let batch_size = logits.shape_at(0)?;
-    let seq_len = logits.shape_at(1)?;
-    let vocab_size = logits.shape_at(2)?;
-
-    // Shift for next-token prediction
-    let shift_logits = logits.slice(&[0, 0, 0], &[batch_size, seq_len - 1, vocab_size])?;
-    let shift_labels = labels.slice(&[0, 1], &[batch_size, seq_len])?;
-
-    // Reshape
-    let logits_flat = shift_logits.reshape(&[(batch_size) * (seq_len - 1), vocab_size])?;
-    let labels_flat = shift_labels.reshape(&[(batch_size) * (seq_len - 1)])?;
-
-    // Compute loss
-    let ignore_idx = loss_config.ignore_index.unwrap_or(-100);
-    let label_smoothing = loss_config.label_smoothing.unwrap_or(0.0);
-
-    let loss = Losses::cross_entropy(
-        &logits_flat,
-        &labels_flat,
-        None,
-        Some(ignore_idx),
-        Some(label_smoothing),
-    )?;
-
-    loss.eval();
-    let loss_value = loss.item_at_float32(0)? as f64;
-
-    Ok(loss_value)
 }
 
 #[cfg(test)]
