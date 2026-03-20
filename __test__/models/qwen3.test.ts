@@ -138,7 +138,7 @@ describe.sequential('Qwen3 Model', () => {
       expect(result.tokens).toBeDefined();
       expect(result.logprobs).toBeDefined();
       expect(result.finishReason).toBeDefined();
-      expect(['eos', 'length']).toContain(result.finishReason);
+      expect(['stop', 'length']).toContain(result.finishReason);
       expect(result.numTokens).toBeGreaterThanOrEqual(0);
       expect(result.numTokens).toBeLessThanOrEqual(20);
     });

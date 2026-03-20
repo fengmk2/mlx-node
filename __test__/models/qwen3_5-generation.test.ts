@@ -45,7 +45,7 @@ describe.sequential('Qwen3.5 Generation', () => {
     expect(result.tokens.length).toBeGreaterThan(0);
     expect(result.tokens.length).toBeLessThanOrEqual(5);
     expect(result.numTokens).toBe(result.tokens.length);
-    expect(['eos', 'length']).toContain(result.finishReason);
+    expect(['stop', 'length']).toContain(result.finishReason);
   });
 
   it('should respect maxNewTokens limit', async () => {
