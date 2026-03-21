@@ -176,6 +176,9 @@ jobs:
       - name: Install dependencies
         run: yarn install --immutable
 
+      - name: Build TypeScript
+        run: yarn build:ts
+
       - uses: actions/download-artifact@v7
         with:
           name: mlx-node
