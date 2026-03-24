@@ -174,6 +174,14 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
                 valid.join(", ")
             )));
         }
+        // Unsloth recipe requires imatrix for near-lossless attention/SSM quantization
+        if recipe == "unsloth" && imatrix_path.is_none() {
+            return Err(Error::from_reason(
+                "unsloth recipe requires --imatrix-path: imatrix calibration data is needed \
+                 for near-lossless quantization of attention/SSM layers"
+                    .to_string(),
+            ));
+        }
     }
 
     // Validate input directory
@@ -810,13 +818,20 @@ pub(crate) fn build_qwen35_recipe(
 ///
 /// Key findings from Unsloth's per-tensor 99.9% KLD analysis (sorted worst→best):
 ///
-/// **Most sensitive (skip quantization — keep bf16):**
-/// - `ssm_out` (`linear_attn.out_proj`): KLD ~6.0 at q2_k — by far the worst
-/// - `attn_qkv` (`self_attn.*`): KLD ~2.9 — "especially sensitive for hybrid architectures"
-/// - `attn_v/output/q/gate`: KLD ~1.5-2.1 — all attn_* tensors are high sensitivity
-/// - `attn_gate` (`linear_attn.in_proj_z`): "performs poorly with MXFP4"
+/// **Most sensitive — AWQ-correctable (quantize at 5-bit with imatrix):**
+/// - `attn_qkv` (`self_attn.q/k/v_proj`): KLD ~1.5-2.9 — AWQ via input_layernorm
+/// - `attn_gate` (`linear_attn.in_proj_z`): "performs poorly with MXFP4" — AWQ via input_layernorm
+/// - `linear_attn.in_proj_qkv`: KLD ~2.9 — AWQ via input_layernorm
+///
+/// **Most sensitive — NOT AWQ-correctable (keep bf16):**
+/// - `ssm_out` (`linear_attn.out_proj`): KLD ~6.0 at q2_k — no preceding norm
+/// - `self_attn.o_proj`: KLD ~1.5 — no preceding norm
+///
 /// - `ssm_beta`, `ssm_alpha` (`in_proj_a/b`): degrade significantly with low bits
 ///   (already excluded by `should_quantize()` since they lack `.weight` suffix)
+///
+/// NOTE: imatrix is **required** for this recipe — without AWQ pre-scaling,
+/// affine quantization of attention/SSM at 5-bit would have noticeable quality loss.
 ///
 /// **Moderate sensitivity (default_bits + 1):**
 /// - `ffn_down` (`down_proj`): "slightly more sensitive" than other FFN weights
@@ -832,8 +847,9 @@ pub(crate) fn build_qwen35_recipe(
 /// **Always 8-bit:**
 /// - Router gates: standard for MoE routing accuracy
 ///
-/// This recipe matches Unsloth Dynamic 2.0's approach of "upcasting important
-/// layers to 8 or 16-bit" while aggressively quantizing FFN weights to 3-bit.
+/// This recipe matches Unsloth Dynamic 2.0's approach of quantizing important
+/// layers at higher bits (5-bit with imatrix) while aggressively quantizing
+/// FFN weights to 3-bit. Requires imatrix for near-lossless quality.
 /// Embeddings and lm_head are quantized at higher precision (5-6 bit) following
 /// llama.cpp's standard practice — they're dequantized at load time since the
 /// model accesses them every token (savings come from smaller file on disk).
@@ -856,6 +872,7 @@ pub(crate) fn build_unsloth_recipe(
     let down_proj_bits = snap_bits(default_bits + 1);
     let embed_bits = snap_bits(default_bits + 2);
     let lm_head_bits = snap_bits(default_bits + 3);
+    let attn_ssm_bits = snap_bits(default_bits + 2); // 5-bit for attention/SSM (Q5_K equivalent)
     let gs = default_group_size;
 
     Box::new(move |key: &str| -> QuantDecision {
@@ -890,18 +907,32 @@ pub(crate) fn build_unsloth_recipe(
             };
         }
 
-        // ssm_out (linear_attn.out_proj): skip entirely — keep bf16
-        if key.contains("linear_attn.out_proj") {
-            return QuantDecision::Skip;
-        }
-
-        // All attention and SSM-sensitive projections: skip entirely — keep bf16
-        // This matches Unsloth Dynamic 2.0's "upcasted to 16-bit" approach
-        let is_attn_sensitive = key.contains("self_attn.")
+        // Attention/SSM projections WITH AWQ pre-scaling (Groups C & D):
+        // input_layernorm absorbs inverse scales for these.
+        let is_awq_corrected_attn = key.contains("self_attn.q_proj")
+            || key.contains("self_attn.k_proj")
+            || key.contains("self_attn.v_proj")
             || key.contains("linear_attn.in_proj_qkv")
             || key.contains("linear_attn.in_proj_z");
 
-        if is_attn_sensitive {
+        if is_awq_corrected_attn {
+            return QuantDecision::Custom {
+                bits: attn_ssm_bits,
+                group_size: gs,
+                mode: "affine".to_string(),
+            };
+        }
+
+        // Attention/SSM projections WITHOUT AWQ pre-scaling:
+        // o_proj input comes from attention computation (not a norm layer),
+        // out_proj input comes from GDN computation.
+        // These cannot be AWQ-corrected — keep at bf16 for quality.
+        // linear_attn.out_proj: KLD ~6.0 — worst tensor by far.
+        // self_attn.o_proj: KLD ~1.5 — sensitive but not catastrophic.
+        let is_non_awq_attn =
+            key.contains("self_attn.o_proj") || key.contains("linear_attn.out_proj");
+
+        if is_non_awq_attn {
             return QuantDecision::Skip;
         }
 
@@ -1675,13 +1706,19 @@ fn sanitize_qwen35_moe(
 
 /// Apply AWQ-style pre-scaling using imatrix importance scores.
 ///
-/// For each FFN scale group, amplifies important weight columns and fuses
+/// For each scale group, amplifies important weight columns and fuses
 /// the inverse into the preceding layer. This improves quantization quality
 /// without changing model size or inference speed.
 ///
 /// Scale groups per layer:
 ///   A: post_attention_layernorm → gate_proj, up_proj (input columns)
 ///   B: up_proj (output rows) → down_proj (input columns)
+///   C: input_layernorm → self_attn.q_proj, k_proj, v_proj (full-attention layers)
+///   D: input_layernorm → linear_attn.in_proj_qkv, in_proj_z (GatedDeltaNet layers)
+///
+/// Note: self_attn.o_proj and linear_attn.out_proj are NOT covered — their inputs
+/// come from attention/GDN computation, not from a norm layer. These tensors should
+/// be kept at bf16 or quantized without AWQ correction.
 pub(crate) fn apply_awq_prescaling(
     weights: &mut HashMap<String, MxArray>,
     imatrix: &crate::utils::imatrix::ImatrixData,
@@ -1756,6 +1793,73 @@ pub(crate) fn apply_awq_prescaling(
                 modified += 1;
             }
         }
+
+        // ── Group C: input_layernorm → self_attn.q_proj + k_proj + v_proj ──
+        // (Only present in full-attention layers, every full_attention_interval-th layer)
+        let q_key = format!("{prefix}.self_attn.q_proj.weight");
+        let k_key = format!("{prefix}.self_attn.k_proj.weight");
+        let v_key = format!("{prefix}.self_attn.v_proj.weight");
+        let input_norm_key = format!("{prefix}.input_layernorm.weight");
+
+        // Only apply if this layer has self_attn weights (full attention layer)
+        if weights.contains_key(&q_key)
+            && let Some(scales) =
+                compute_multi_key_scales(imatrix, &[&q_key, &k_key, &v_key], ratio)?
+        {
+            for proj_key in [&q_key, &k_key, &v_key] {
+                if let Some(proj) = weights.remove(proj_key) {
+                    let scaled = scale_columns(&proj, &scales)?;
+                    weights.insert(proj_key.to_string(), scaled);
+                    modified += 1;
+                }
+            }
+            // input_layernorm.weight /= scales
+            if let Some(norm) = weights.remove(&input_norm_key) {
+                let inv = invert_scales(&scales)?.astype(norm.dtype()?)?;
+                let scaled = norm.mul(&inv)?;
+                weights.insert(input_norm_key.clone(), scaled);
+                modified += 1;
+            } else {
+                warn!(
+                    "AWQ Group C: input_layernorm.weight missing for layer {} — \
+                         projection weights were scaled but inverse not fused into norm",
+                    i
+                );
+            }
+        }
+
+        // ── Group D: input_layernorm → linear_attn.in_proj_qkv + in_proj_z ──
+        // (Only present in GatedDeltaNet layers)
+        let qkv_key = format!("{prefix}.linear_attn.in_proj_qkv.weight");
+        let z_key = format!("{prefix}.linear_attn.in_proj_z.weight");
+
+        // Only apply if this layer has linear_attn weights (GDN layer)
+        if weights.contains_key(&qkv_key)
+            && let Some(scales) = compute_multi_key_scales(imatrix, &[&qkv_key, &z_key], ratio)?
+        {
+            for proj_key in [&qkv_key, &z_key] {
+                if let Some(proj) = weights.remove(proj_key) {
+                    let scaled = scale_columns(&proj, &scales)?;
+                    weights.insert(proj_key.to_string(), scaled);
+                    modified += 1;
+                }
+            }
+            // input_layernorm.weight /= scales
+            // Groups C and D are mutually exclusive — a layer is either
+            // full-attention or GDN, never both — so this norm is only modified once.
+            if let Some(norm) = weights.remove(&input_norm_key) {
+                let inv = invert_scales(&scales)?.astype(norm.dtype()?)?;
+                let scaled = norm.mul(&inv)?;
+                weights.insert(input_norm_key, scaled);
+                modified += 1;
+            } else {
+                warn!(
+                    "AWQ Group D: input_layernorm.weight missing for layer {} — \
+                         projection weights were scaled but inverse not fused into norm",
+                    i
+                );
+            }
+        }
     }
 
     // Eval all modified weights to materialize
@@ -1794,6 +1898,66 @@ fn compute_group_a_scales(
         }
         (None, None) => Ok(None),
     }
+}
+
+/// Compute AWQ scales from multiple weight keys (element-wise max of all importances).
+fn compute_multi_key_scales(
+    imatrix: &crate::utils::imatrix::ImatrixData,
+    keys: &[&str],
+    ratio: f32,
+) -> Result<Option<MxArray>> {
+    let importances: Vec<&Vec<f32>> = keys
+        .iter()
+        .filter_map(|k| imatrix.importance.get(*k))
+        .collect();
+
+    if importances.is_empty() {
+        return Ok(None);
+    }
+
+    // Require ALL keys present — partial AWQ correction is worse than none
+    if importances.len() < keys.len() {
+        let missing: Vec<&str> = keys
+            .iter()
+            .filter(|k| !imatrix.importance.contains_key(**k))
+            .copied()
+            .collect();
+        warn!(
+            "AWQ: skipping group — imatrix missing {}/{} keys: {}",
+            missing.len(),
+            keys.len(),
+            missing.join(", ")
+        );
+        return Ok(None);
+    }
+
+    // Validate all importance vectors have the same length
+    if importances.len() > 1 {
+        let expected_len = importances[0].len();
+        for (i, imp) in importances.iter().enumerate().skip(1) {
+            if imp.len() != expected_len {
+                return Err(Error::from_reason(format!(
+                    "AWQ imatrix dimension mismatch: key[0] has {} entries but key[{}] has {}",
+                    expected_len,
+                    i,
+                    imp.len()
+                )));
+            }
+        }
+    }
+
+    let len = importances[0].len();
+    let mut combined = vec![0.0f32; len];
+    for imp in &importances {
+        for (j, &val) in imp.iter().enumerate() {
+            if j < len {
+                combined[j] = combined[j].max(val);
+            }
+        }
+    }
+
+    let scales = compute_normalized_scales(&combined, ratio)?;
+    Ok(Some(scales))
 }
 
 /// Compute AWQ scales for a single weight key.

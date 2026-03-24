@@ -434,23 +434,55 @@ pub fn has_tool_calls(text: &str) -> bool {
 /// - `thinking_content` is the extracted content from within the tags (None if no tags found)
 ///
 /// If multiple `<think>` blocks exist, they are concatenated with newlines.
+///
+/// Also handles the case where the chat template already added `<think>\n` as part
+/// of the assistant generation prompt — the generated text then starts with thinking
+/// content followed by `</think>` but without the opening `<think>` tag. To avoid
+/// misinterpreting literal `</think>` in non-thinking output (e.g., the model
+/// explaining XML tags), the fallback only applies when `</think>` is followed by
+/// a newline or end-of-text — not when it's embedded mid-sentence.
 pub fn parse_thinking(text: &str) -> (String, Option<String>) {
     let blocks = extract_tag_blocks(text, "<think>", "</think>");
 
-    let thinking_parts: Vec<&str> = blocks
-        .iter()
-        .map(|(_, _, inner)| inner.trim())
-        .filter(|s| !s.is_empty())
-        .collect();
+    if !blocks.is_empty() {
+        let thinking_parts: Vec<&str> = blocks
+            .iter()
+            .map(|(_, _, inner)| inner.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
 
-    let thinking = if thinking_parts.is_empty() {
-        None
-    } else {
-        Some(thinking_parts.join("\n\n"))
-    };
+        let thinking = if thinking_parts.is_empty() {
+            None
+        } else {
+            Some(thinking_parts.join("\n\n"))
+        };
 
-    let cleaned_text = strip_tag_blocks(text, "<think>", "</think>");
-    (cleaned_text, thinking)
+        let cleaned_text = strip_tag_blocks(text, "<think>", "</think>");
+        return (cleaned_text, thinking);
+    }
+
+    // Handle missing opening <think> tag (template already added it as prefix).
+    // The template adds `<think>\n` as the assistant generation prompt, so the
+    // model's output starts with thinking content + `</think>`.
+    //
+    // To distinguish from literal `</think>` in content (e.g., "Use </think> to
+    // close the tag"), only apply when `</think>` is followed by a newline or
+    // end-of-text — the model always generates `</think>\n\n` before the response.
+    if let Some(close_pos) = text.find("</think>") {
+        let after_tag = &text[close_pos + "</think>".len()..];
+        if after_tag.is_empty() || after_tag.starts_with('\n') {
+            let thinking_content = text[..close_pos].trim();
+            let after = after_tag.trim();
+            let thinking = if thinking_content.is_empty() {
+                None
+            } else {
+                Some(thinking_content.to_string())
+            };
+            return (after.to_string(), thinking);
+        }
+    }
+
+    (text.to_string(), None)
 }
 
 /// Check if text contains any thinking tags
@@ -516,6 +548,48 @@ pub fn parse_generation_output(text: &str) -> (String, Vec<ToolCallResult>, Opti
     let (text_without_tools, tool_calls) = parse_tool_calls(text);
     let (cleaned_text, thinking) = parse_thinking(&text_without_tools);
     (cleaned_text, tool_calls, thinking)
+}
+
+/// Check if the `</think>` token exists in generated tokens.
+pub fn has_think_end_token(generated_tokens: &[u32], think_end_id: Option<u32>) -> bool {
+    think_end_id.is_some_and(|id| generated_tokens.contains(&id))
+}
+
+/// Split generated output using token-level thinking detection.
+///
+/// When the think-end token was found in generated tokens (`think_end_tag` is Some),
+/// splits at the corresponding text boundary. Supports both `</think>` and
+/// `</longcat_think>` variants. Falls back to `parse_generation_output` when
+/// no think-end token was detected.
+pub fn split_at_think_end(
+    raw_text: &str,
+    think_end_tag: Option<&str>,
+) -> (String, Vec<ToolCallResult>, Option<String>) {
+    // If the text contains paired <think>...</think> blocks, use the standard
+    // tag-pair parser (handles models that emit the full opening tag).
+    if raw_text.contains("<think>") || raw_text.contains("<longcat_think>") {
+        return parse_generation_output(raw_text);
+    }
+    // Token-level split: the template injected <think>\n as a prefix, so the
+    // generated text starts with thinking content followed by </think>.
+    if let Some(tag) = think_end_tag
+        && let Some(close_pos) = raw_text.find(tag)
+    {
+        let after_tag = &raw_text[close_pos + tag.len()..];
+        if !after_tag.is_empty() && !after_tag.starts_with('\n') {
+            return parse_generation_output(raw_text);
+        }
+        let thinking_text = raw_text[..close_pos].trim();
+        let response_text = after_tag.trim();
+        let thinking = if thinking_text.is_empty() {
+            None
+        } else {
+            Some(thinking_text.to_string())
+        };
+        let (clean_text, tool_calls) = parse_tool_calls(response_text);
+        return (clean_text.trim().to_string(), tool_calls, thinking);
+    }
+    parse_generation_output(raw_text)
 }
 
 /// Build RewardOutput array from generation results.
@@ -894,6 +968,56 @@ Here's the result."#;
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].name, "get_current_time");
         assert_eq!(thinking, Some("I need to check the time.".to_string()));
+    }
+
+    // ---- Thinking: missing opening tag (template prefix) ----
+
+    #[test]
+    fn test_parse_thinking_no_opening_tag() {
+        // When enable_thinking=true, the chat template adds <think>\n as the
+        // assistant prefix. The model's generated text starts after that, so
+        // it contains thinking content + </think> but no opening <think>.
+        let input = "Let me analyze this problem.\n</think>\n\nThe answer is 42.";
+
+        let (text, thinking) = parse_thinking(input);
+
+        assert_eq!(text, "The answer is 42.");
+        assert_eq!(thinking, Some("Let me analyze this problem.".to_string()));
+    }
+
+    #[test]
+    fn test_parse_thinking_literal_close_tag_mid_sentence() {
+        // Bare </think> in the middle of a sentence should NOT be treated
+        // as a thinking delimiter — it's literal content.
+        let input = "Use </think> to close the tag.";
+
+        let (text, thinking) = parse_thinking(input);
+
+        assert_eq!(text, "Use </think> to close the tag.");
+        assert!(thinking.is_none());
+    }
+
+    #[test]
+    fn test_parse_thinking_no_opening_tag_empty_thinking() {
+        // Model immediately closes thinking with no content
+        let input = "\n</think>\n\nThe response.";
+
+        let (text, thinking) = parse_thinking(input);
+
+        assert_eq!(text, "The response.");
+        assert!(thinking.is_none());
+    }
+
+    #[test]
+    fn test_parse_generation_output_no_opening_think_with_tools() {
+        let input = "I need to check.\n</think>\n\n<tool_call>\n<function=get_time>\n</function>\n</tool_call>";
+
+        let (text, tool_calls, thinking) = parse_generation_output(input);
+
+        assert_eq!(text, "");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].name, "get_time");
+        assert_eq!(thinking, Some("I need to check.".to_string()));
     }
 
     // ---- JSON sanitizer ----

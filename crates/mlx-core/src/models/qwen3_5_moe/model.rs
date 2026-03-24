@@ -105,6 +105,13 @@ pub struct Qwen3_5MoeModel {
     /// LRU cache for vision encoder embeddings, avoids re-encoding the same
     /// image in multi-turn VLM conversations.
     pub(crate) vision_cache: VisionCache,
+    /// Token history for KV cache reuse across chat() calls.
+    /// Stores the full token sequence (template + generated) from the last call.
+    cached_token_history: Arc<RwLock<Vec<u32>>>,
+    /// Image cache key for VLM cache reuse (None for text-only conversations).
+    cached_image_key: Arc<RwLock<Option<u64>>>,
+    /// Rope deltas from VLM prefill, for cache reuse M-RoPE correction
+    cached_rope_deltas: Arc<RwLock<Option<i32>>>,
 }
 
 #[napi]
@@ -154,7 +161,81 @@ impl Qwen3_5MoeModel {
                 entries: HashMap::new(),
                 generation: 0,
             })),
+            cached_token_history: Arc::new(RwLock::new(Vec::new())),
+            cached_image_key: Arc::new(RwLock::new(None)),
+            cached_rope_deltas: Arc::new(RwLock::new(None)),
         })
+    }
+
+    /// Take the KV cache from the model, returning a `PromptCache` handle.
+    ///
+    /// The cache is moved out of the model — calling `takeCache()` twice
+    /// returns `null` the second time. Pass the cache back via `setCache()`
+    /// before the next `chat()` call for incremental prefill.
+    #[napi]
+    pub fn take_cache(&self) -> Option<crate::models::qwen3_5::prompt_cache::PromptCache> {
+        let mut caches_guard = self.caches.write().ok()?;
+        let token_history_guard = self.cached_token_history.read().ok()?;
+        let caches = caches_guard.take()?;
+        if token_history_guard.is_empty() {
+            // No generation has happened yet — put caches back
+            *caches_guard = Some(caches);
+            return None;
+        }
+        let image_key = self.cached_image_key.read().ok().and_then(|g| *g);
+        let rope_deltas = self.cached_rope_deltas.read().ok().and_then(|g| *g);
+        Some(crate::models::qwen3_5::prompt_cache::PromptCache::new(
+            caches,
+            token_history_guard.clone(),
+            "qwen3_5_moe",
+            self.config.num_layers as usize,
+            image_key,
+            rope_deltas,
+        ))
+    }
+
+    /// Restore a previously taken `PromptCache` into the model.
+    ///
+    /// On the next `chat()` call with `reuseCache: true`, the model will
+    /// prefix-match the new tokens against the cache and only prefill the delta.
+    #[napi]
+    pub fn set_cache(
+        &self,
+        cache: &mut crate::models::qwen3_5::prompt_cache::PromptCache,
+    ) -> Result<()> {
+        if cache.model_type() != "qwen3_5_moe" {
+            return Err(Error::from_reason(format!(
+                "Cache type '{}' doesn't match model type 'qwen3_5_moe'",
+                cache.model_type()
+            )));
+        }
+        if cache.num_layers() != self.config.num_layers as usize {
+            return Err(Error::from_reason(format!(
+                "Cache has {} layers but model has {} layers",
+                cache.num_layers(),
+                self.config.num_layers
+            )));
+        }
+        let restored_caches = cache.take_caches().ok_or_else(|| {
+            Error::from_reason("PromptCache is empty (already consumed or disposed)")
+        })?;
+        let mut caches_guard = self
+            .caches
+            .write()
+            .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
+        let mut token_history_guard = self
+            .cached_token_history
+            .write()
+            .map_err(|_| Error::from_reason("Failed to acquire token history write lock"))?;
+        *caches_guard = Some(restored_caches);
+        *token_history_guard = cache.token_history().to_vec();
+        if let Ok(mut ik) = self.cached_image_key.write() {
+            *ik = cache.image_cache_key();
+        }
+        if let Ok(mut rd) = self.cached_rope_deltas.write() {
+            *rd = cache.rope_deltas();
+        }
+        Ok(())
     }
 
     #[napi]
@@ -188,6 +269,13 @@ impl Qwen3_5MoeModel {
             }
         }
         *caches_guard = None;
+        // Also clear token history so next chat() does a full prefill
+        if let Ok(mut th) = self.cached_token_history.write() {
+            th.clear();
+        }
+        if let Ok(mut rd) = self.cached_rope_deltas.write() {
+            *rd = None;
+        }
         Ok(())
     }
 
@@ -580,8 +668,10 @@ impl Qwen3_5MoeModel {
             tools: None,
             enable_thinking: None,
             report_performance: None,
+            reuse_cache: None,
         });
 
+        let reuse_cache = config.reuse_cache.unwrap_or(true);
         let tokenizer = self
             .tokenizer
             .clone()
@@ -597,8 +687,13 @@ impl Qwen3_5MoeModel {
         let final_norm_arc = self.final_norm.clone();
         let lm_head_arc = self.lm_head.clone();
         let caches_arc = self.caches.clone();
+        let cached_token_history_arc = self.cached_token_history.clone();
+        let cached_image_key_arc = self.cached_image_key.clone();
+        let cached_rope_deltas_arc = self.cached_rope_deltas.clone();
         let model_config = self.config.clone();
         let fa_idx = self.fa_idx;
+        let think_end_id = tokenizer.think_end_id();
+        let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
         let tokenizer_for_decode = tokenizer.clone();
 
         // Clone vision fields if images present
@@ -671,29 +766,109 @@ impl Qwen3_5MoeModel {
                 .read()
                 .map_err(|_| Error::from_reason("Failed to acquire lm_head read lock"))?;
 
-            // Reset and init caches (already holding write lock)
-            if let Some(ref mut caches) = *caches_guard {
-                for cache in caches.iter_mut() {
-                    cache.reset();
-                }
-            }
-            let new_caches = (0..model_config.num_layers as usize)
-                .map(|i| {
-                    if model_config.is_linear_layer(i) {
-                        Qwen3_5LayerCache::new_linear()
+            // === VLM: pre-compute expanded tokens and image cache key for prefix matching ===
+            let (expanded_tokens, image_cache_key, vlm_processed) =
+                if let (true, Some(_), Some(img_proc)) = (
+                    has_images,
+                    vision_encoder_arc.as_ref(),
+                    image_processor_arc.as_ref(),
+                ) {
+                    let sms = spatial_merge_size.unwrap_or(2);
+                    let all_images = extract_images_from_messages(&messages);
+                    let image_refs: Vec<&[u8]> = all_images.iter().map(|v| v.as_slice()).collect();
+                    let processed = img_proc.process_many(&image_refs)?;
+                    let num_image_tokens = compute_num_image_tokens(&processed.grid_thw(), sms)?;
+                    let final_tokens = inject_image_placeholders(&tokens, num_image_tokens);
+                    let key = compute_image_cache_key(&all_images);
+                    (Some(final_tokens), key, Some(processed))
+                } else {
+                    (None, 0u64, None)
+                };
+
+            // For prefix matching, use expanded tokens (with image placeholders) for VLM
+            let tokens_for_matching = expanded_tokens.as_deref().unwrap_or(&tokens);
+
+            // === Cache reuse: prefix verification ===
+            let cached_token_history_guard = cached_token_history_arc
+                .read()
+                .map_err(|_| Error::from_reason("Failed to read cached token history"))?;
+            let cached_prefix_len = if reuse_cache {
+                let cached = &*cached_token_history_guard;
+                if has_images {
+                    // VLM: also check that image_cache_key matches
+                    let cached_img_key = cached_image_key_arc
+                        .read()
+                        .map_err(|_| Error::from_reason("Failed to read cached image key"))?;
+                    if let Some(cached_key) = *cached_img_key {
+                        if cached_key == image_cache_key
+                            && !cached.is_empty()
+                            && tokens_for_matching.len() >= cached.len()
+                            && tokens_for_matching[..cached.len()] == cached[..]
+                            && caches_guard.is_some()
+                        {
+                            cached.len()
+                        } else {
+                            0
+                        }
                     } else {
-                        Qwen3_5LayerCache::new_full_attention()
+                        0
                     }
-                })
-                .collect();
-            *caches_guard = Some(new_caches);
+                } else {
+                    // Text-only: existing logic
+                    if !cached.is_empty()
+                        && tokens.len() >= cached.len()
+                        && tokens[..cached.len()] == cached[..]
+                        && caches_guard.is_some()
+                    {
+                        cached.len()
+                    } else {
+                        0
+                    }
+                }
+            } else {
+                0
+            };
+            drop(cached_token_history_guard);
+
+            let prefill_tokens = if cached_prefix_len > 0 {
+                // Prefix matches — incremental prefill (only new tokens)
+                info!(
+                    "Cache reuse: {} cached tokens, {} new tokens to prefill (vlm={})",
+                    cached_prefix_len,
+                    tokens_for_matching.len() - cached_prefix_len,
+                    has_images
+                );
+                tokens_for_matching[cached_prefix_len..].to_vec()
+            } else {
+                // No match — full reset + full prefill
+                if let Some(ref mut caches) = *caches_guard {
+                    for cache in caches.iter_mut() {
+                        cache.reset();
+                    }
+                }
+                let new_caches = (0..model_config.num_layers as usize)
+                    .map(|i| {
+                        if model_config.is_linear_layer(i) {
+                            Qwen3_5LayerCache::new_linear()
+                        } else {
+                            Qwen3_5LayerCache::new_full_attention()
+                        }
+                    })
+                    .collect();
+                *caches_guard = Some(new_caches);
+                tokens.clone()
+            };
 
             let eos_id = model_config.eos_token_id as u32;
             let mut generated_tokens: Vec<u32> = Vec::new();
             let mut finish_reason = String::from("length");
 
             // Track token history for repetition penalty
-            let mut token_history: Vec<u32> = tokens.clone();
+            let mut token_history: Vec<u32> = if let Some(ref et) = expanded_tokens {
+                et.clone()
+            } else {
+                tokens.clone()
+            };
 
             let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
             let generation_stream = Stream::new(DeviceType::Gpu);
@@ -709,58 +884,16 @@ impl Qwen3_5MoeModel {
             // Profiler — covers both compiled and rust chat decode paths
             let mut profiler =
                 crate::decode_profiler::DecodeProfiler::new("moe_chat", "qwen3_5_moe");
-            profiler.set_prompt_tokens(tokens.len() as u32);
+            profiler.set_prompt_tokens(prefill_tokens.len() as u32);
             profiler.snapshot_memory_before();
 
             // === VLM or text prefill branching ===
             profiler.begin_prefill();
-            let (mut last_logits, seq_len) = if let (true, Some(vision_enc), Some(img_proc)) = (
-                has_images,
-                vision_encoder_arc.as_ref(),
-                image_processor_arc.as_ref(),
-            ) {
-                // --- VLM path: process images and run VLM prefill ---
-                let sms = spatial_merge_size.unwrap_or(2);
-                let all_images = extract_images_from_messages(&messages);
-
-                // Process images and inject placeholders
-                let image_refs: Vec<&[u8]> = all_images.iter().map(|v| v.as_slice()).collect();
-                let processed = img_proc.process_many(&image_refs)?;
-                let num_image_tokens = compute_num_image_tokens(&processed.grid_thw(), sms)?;
-                let final_tokens = inject_image_placeholders(&tokens, num_image_tokens);
-
-                // Compute vision cache key from raw image bytes
-                let image_cache_key = compute_image_cache_key(&all_images);
-
-                let input_ids =
-                    MxArray::from_uint32(&final_tokens, &[1, final_tokens.len() as i64])?;
-
-                // Update token history with final tokens (including image placeholders)
-                token_history = final_tokens.clone();
-
-                // VLM prefill using Rust path with M-RoPE position IDs
-                let (logits, _rope_deltas) = vlm_prefill_moe(
-                    &input_ids,
-                    image_cache_key,
-                    &processed,
-                    vision_enc,
-                    sms,
-                    &embedding_weight,
-                    &mut layers_guard,
-                    &mut caches_guard,
-                    &final_norm_guard,
-                    &lm_head_guard,
-                    generation_stream,
-                    fa_idx,
-                    Some(&embedding_weight_t),
-                    &vision_cache,
-                )?;
-
-                let vlm_seq_len = final_tokens.len() as i64;
-                (logits, vlm_seq_len)
-            } else {
-                // --- Standard text prefill path ---
-                let prompt = MxArray::from_uint32(&tokens, &[1, tokens.len() as i64])?;
+            let (mut last_logits, seq_len) = if has_images && cached_prefix_len > 0 {
+                // --- VLM cache reuse: same images, incremental text-only prefill ---
+                let expanded = expanded_tokens.as_ref().unwrap();
+                let prompt =
+                    MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
 
                 let logits = forward_inner(
                     &prompt,
@@ -776,7 +909,74 @@ impl Qwen3_5MoeModel {
                 let seq_len = logits.shape_at(1)?;
                 let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
                 let last_logits = last_logits.squeeze(Some(&[1]))?;
-                (last_logits, seq_len)
+                // seq_len is the TOTAL expanded tokens (cached + new)
+                (last_logits, expanded.len() as i64)
+            } else if let (true, Some(vision_enc), Some(_)) = (
+                has_images,
+                vision_encoder_arc.as_ref(),
+                image_processor_arc.as_ref(),
+            ) {
+                // --- VLM path: full VLM prefill (no cache reuse) ---
+                let sms = spatial_merge_size.unwrap_or(2);
+                let final_tokens = expanded_tokens.as_ref().unwrap();
+                let processed = vlm_processed.as_ref().unwrap();
+
+                let input_ids =
+                    MxArray::from_uint32(final_tokens, &[1, final_tokens.len() as i64])?;
+
+                // VLM prefill using Rust path with M-RoPE position IDs
+                let (logits, rope_deltas) = vlm_prefill_moe(
+                    &input_ids,
+                    image_cache_key,
+                    processed,
+                    vision_enc,
+                    sms,
+                    &embedding_weight,
+                    &mut layers_guard,
+                    &mut caches_guard,
+                    &final_norm_guard,
+                    &lm_head_guard,
+                    generation_stream,
+                    fa_idx,
+                    Some(&embedding_weight_t),
+                    &vision_cache,
+                )?;
+
+                // Adjust RoPE offset for VLM M-RoPE position correction
+                if rope_deltas != 0 && use_cpp {
+                    unsafe {
+                        mlx_sys::mlx_qwen35_moe_adjust_offset(rope_deltas as i32);
+                    }
+                }
+
+                // Save rope_deltas for cache reuse on subsequent turns
+                if let Ok(mut rd) = cached_rope_deltas_arc.write() {
+                    *rd = Some(rope_deltas as i32);
+                }
+
+                let vlm_seq_len = final_tokens.len() as i64;
+                (logits, vlm_seq_len)
+            } else {
+                // --- Standard text prefill path ---
+                let prompt =
+                    MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
+
+                let logits = forward_inner(
+                    &prompt,
+                    &embedding_weight,
+                    &mut layers_guard,
+                    &mut caches_guard,
+                    &final_norm_guard,
+                    &lm_head_guard,
+                    fa_idx,
+                    Some(&embedding_weight_t),
+                )?;
+
+                let seq_len = logits.shape_at(1)?;
+                let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
+                let last_logits = last_logits.squeeze(Some(&[1]))?;
+                // seq_len for the C++ init is the TOTAL tokens (cached + new)
+                (last_logits, tokens.len() as i64)
             };
             profiler.end_prefill();
 
@@ -860,6 +1060,23 @@ impl Qwen3_5MoeModel {
                 }
                 // C++ has copied arrays into its own globals — safe to release
                 drop(caches_guard);
+
+                // Reapply rope_deltas from the original VLM prefill
+                // (VLM cache reuse skips vlm_prefill, so C++ offset is unset)
+                if has_images
+                    && cached_prefix_len > 0
+                    && let Ok(rd) = cached_rope_deltas_arc.read()
+                    && let Some(delta) = *rd
+                {
+                    unsafe {
+                        mlx_sys::mlx_qwen35_moe_adjust_offset(delta);
+                    }
+                }
+
+                // For text-only conversations, clear any stale cached rope deltas
+                if !has_images && let Ok(mut rd) = cached_rope_deltas_arc.write() {
+                    *rd = None;
+                }
 
                 // C++ decode loop (all locks dropped — C++ owns the state)
                 // Pipelined: submit forward(N+1) BEFORE eval(N) so GPU
@@ -945,6 +1162,38 @@ impl Qwen3_5MoeModel {
 
                 profiler.snapshot_memory_after();
                 profiler.report();
+
+                // === Export caches from C++ before MoeResetGuard drops ===
+                if reuse_cache {
+                    let num_layers = model_config.num_layers as usize;
+                    let mut export_ptrs: Vec<*mut mlx_sys::mlx_array> =
+                        vec![std::ptr::null_mut(); num_layers * 2];
+                    let exported = unsafe {
+                        mlx_sys::mlx_qwen35_moe_export_caches(
+                            export_ptrs.as_mut_ptr(),
+                            (num_layers * 2) as i32,
+                        )
+                    };
+                    if exported > 0 {
+                        let cache_offset = unsafe { mlx_sys::mlx_qwen35_moe_get_cache_offset() };
+                        let mut new_caches = Vec::with_capacity(num_layers);
+                        for i in 0..num_layers {
+                            let p0 = export_ptrs[i * 2];
+                            let p1 = export_ptrs[i * 2 + 1];
+                            let mut lc = if model_config.is_linear_layer(i) {
+                                Qwen3_5LayerCache::new_linear()
+                            } else {
+                                Qwen3_5LayerCache::new_full_attention()
+                            };
+                            lc.import_ptrs(p0, p1, cache_offset);
+                            new_caches.push(lc);
+                        }
+                        let mut cg = caches_arc.write().map_err(|_| {
+                            Error::from_reason("Failed to acquire caches lock for cache export")
+                        })?;
+                        *cg = Some(new_caches);
+                    }
+                }
                 // _moe_guard dropped here, calling mlx_qwen35_moe_reset()
             } else {
                 // Rust fallback decode loop (pipelined)
@@ -1044,19 +1293,63 @@ impl Qwen3_5MoeModel {
                 drop(lm_head_guard);
             }
 
+            // === Save token history and image key for cache reuse on next call ===
+            if reuse_cache {
+                // For VLM, save the expanded token history (with image placeholders)
+                let mut full_history = if let Some(ref et) = expanded_tokens {
+                    et.clone()
+                } else {
+                    tokens.clone()
+                };
+                // Only include tokens that were actually forwarded through the model.
+                // When stopped at max_tokens ("length"), the last token was never forwarded
+                // (the pipelined loop skips forward on the final step).
+                let history_tokens = if finish_reason == "length" && !generated_tokens.is_empty() {
+                    &generated_tokens[..generated_tokens.len() - 1]
+                } else {
+                    &generated_tokens
+                };
+                full_history.extend_from_slice(history_tokens);
+                if let Ok(mut th) = cached_token_history_arc.write() {
+                    *th = full_history;
+                }
+                // Save image cache key (Some for VLM, None for text-only)
+                if let Ok(mut ik) = cached_image_key_arc.write() {
+                    *ik = if has_images {
+                        Some(image_cache_key)
+                    } else {
+                        None
+                    };
+                }
+            } else {
+                // reuseCache: false — clear all cache state to free GPU memory
+                if let Ok(mut cg) = caches_arc.write() {
+                    *cg = None;
+                }
+                if let Ok(mut th) = cached_token_history_arc.write() {
+                    th.clear();
+                }
+                if let Ok(mut ik) = cached_image_key_arc.write() {
+                    *ik = None;
+                }
+                if let Ok(mut rd) = cached_rope_deltas_arc.write() {
+                    *rd = None;
+                }
+            }
+
             // Compute performance metrics if requested
             let performance = if let (Some(gen_start), Some(first_tok)) =
                 (generation_start, first_token_instant)
             {
                 let generation_end = std::time::Instant::now();
-                let prompt_tokens = tokens.len() as f64;
+                let actual_prefill_toks = prefill_tokens.len() as f64;
                 let gen_tokens = generated_tokens.len() as f64;
                 let ttft_ms = first_tok.duration_since(gen_start).as_secs_f64() * 1000.0;
                 let decode_ms = generation_end.duration_since(first_tok).as_secs_f64() * 1000.0;
                 Some(crate::profiling::PerformanceMetrics {
                     ttft_ms,
                     prefill_tokens_per_second: if ttft_ms > 0.0 {
-                        prompt_tokens / (ttft_ms / 1000.0)
+                        actual_prefill_toks / (ttft_ms / 1000.0)
                     } else {
                         0.0
                     },
@@ -1079,8 +1372,12 @@ impl Qwen3_5MoeModel {
 
             let num_tokens = generated_tokens.len() as u32;
 
-            // Parse tool calls and thinking from the generated text
-            let (clean_text, tool_calls, thinking) = tools::parse_generation_output(&text);
+            let think_tag = if tools::has_think_end_token(&generated_tokens, think_end_id) {
+                think_end_str.as_deref()
+            } else {
+                None
+            };
+            let (clean_text, tool_calls, thinking) = tools::split_at_think_end(&text, think_tag);
 
             // If we have valid tool calls, override finish reason
             let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
@@ -1131,8 +1428,10 @@ impl Qwen3_5MoeModel {
             tools: None,
             enable_thinking: None,
             report_performance: None,
+            reuse_cache: None,
         });
 
+        let reuse_cache = config.reuse_cache.unwrap_or(true);
         let report_perf = config.report_performance.unwrap_or(false);
 
         let tokenizer = self
@@ -1150,8 +1449,13 @@ impl Qwen3_5MoeModel {
         let final_norm_arc = self.final_norm.clone();
         let lm_head_arc = self.lm_head.clone();
         let caches_arc = self.caches.clone();
+        let cached_token_history_arc = self.cached_token_history.clone();
+        let cached_image_key_arc = self.cached_image_key.clone();
+        let cached_rope_deltas_arc = self.cached_rope_deltas.clone();
         let model_config = self.config.clone();
         let fa_idx = self.fa_idx;
+        let think_end_id_stream = tokenizer.think_end_id();
+        let think_end_str_stream = tokenizer.think_end_str().map(|s| s.to_string());
         let tokenizer_for_decode = tokenizer.clone();
 
         // Clone vision fields if images present
@@ -1235,29 +1539,111 @@ impl Qwen3_5MoeModel {
                         .read()
                         .map_err(|_| Error::from_reason("Failed to acquire lm_head read lock"))?;
 
-                    // Reset and init caches
-                    if let Some(ref mut caches) = *caches_guard {
-                        for cache in caches.iter_mut() {
-                            cache.reset();
-                        }
-                    }
-                    let new_caches = (0..model_config.num_layers as usize)
-                        .map(|i| {
-                            if model_config.is_linear_layer(i) {
-                                Qwen3_5LayerCache::new_linear()
+                    // === VLM: pre-compute expanded tokens and image cache key for prefix matching ===
+                    let (expanded_tokens, image_cache_key, vlm_processed) =
+                        if let (true, Some(_), Some(img_proc)) = (
+                            has_images,
+                            vision_encoder_arc.as_ref(),
+                            image_processor_arc.as_ref(),
+                        ) {
+                            let sms = spatial_merge_size.unwrap_or(2);
+                            let all_images = extract_images_from_messages(&messages);
+                            let image_refs: Vec<&[u8]> =
+                                all_images.iter().map(|v| v.as_slice()).collect();
+                            let processed = img_proc.process_many(&image_refs)?;
+                            let num_image_tokens =
+                                compute_num_image_tokens(&processed.grid_thw(), sms)?;
+                            let final_tokens = inject_image_placeholders(&tokens, num_image_tokens);
+                            let key = compute_image_cache_key(&all_images);
+                            (Some(final_tokens), key, Some(processed))
+                        } else {
+                            (None, 0u64, None)
+                        };
+
+                    // For prefix matching, use expanded tokens (with image placeholders) for VLM
+                    let tokens_for_matching = expanded_tokens.as_deref().unwrap_or(&tokens);
+
+                    // === Cache reuse: prefix verification ===
+                    let cached_token_history_guard = cached_token_history_arc
+                        .read()
+                        .map_err(|_| Error::from_reason("Failed to read cached token history"))?;
+                    let cached_prefix_len = if reuse_cache {
+                        let cached = &*cached_token_history_guard;
+                        if has_images {
+                            // VLM: also check that image_cache_key matches
+                            let cached_img_key = cached_image_key_arc.read().map_err(|_| {
+                                Error::from_reason("Failed to read cached image key")
+                            })?;
+                            if let Some(cached_key) = *cached_img_key {
+                                if cached_key == image_cache_key
+                                    && !cached.is_empty()
+                                    && tokens_for_matching.len() >= cached.len()
+                                    && tokens_for_matching[..cached.len()] == cached[..]
+                                    && caches_guard.is_some()
+                                {
+                                    cached.len()
+                                } else {
+                                    0
+                                }
                             } else {
-                                Qwen3_5LayerCache::new_full_attention()
+                                0
                             }
-                        })
-                        .collect();
-                    *caches_guard = Some(new_caches);
+                        } else {
+                            // Text-only: existing logic
+                            if !cached.is_empty()
+                                && tokens.len() >= cached.len()
+                                && tokens[..cached.len()] == cached[..]
+                                && caches_guard.is_some()
+                            {
+                                cached.len()
+                            } else {
+                                0
+                            }
+                        }
+                    } else {
+                        0
+                    };
+                    drop(cached_token_history_guard);
+
+                    let prefill_tokens = if cached_prefix_len > 0 {
+                        // Prefix matches — incremental prefill (only new tokens)
+                        info!(
+                            "Cache reuse: {} cached tokens, {} new tokens to prefill (vlm={})",
+                            cached_prefix_len,
+                            tokens_for_matching.len() - cached_prefix_len,
+                            has_images
+                        );
+                        tokens_for_matching[cached_prefix_len..].to_vec()
+                    } else {
+                        // No match — full reset + full prefill
+                        if let Some(ref mut caches) = *caches_guard {
+                            for cache in caches.iter_mut() {
+                                cache.reset();
+                            }
+                        }
+                        let new_caches = (0..model_config.num_layers as usize)
+                            .map(|i| {
+                                if model_config.is_linear_layer(i) {
+                                    Qwen3_5LayerCache::new_linear()
+                                } else {
+                                    Qwen3_5LayerCache::new_full_attention()
+                                }
+                            })
+                            .collect();
+                        *caches_guard = Some(new_caches);
+                        tokens.clone()
+                    };
 
                     let eos_id = model_config.eos_token_id as u32;
                     let mut generated_tokens: Vec<u32> = Vec::new();
                     let mut finish_reason = String::from("length");
 
                     // Track token history for repetition penalty
-                    let mut token_history: Vec<u32> = tokens.clone();
+                    let mut token_history: Vec<u32> = if let Some(ref et) = expanded_tokens {
+                        et.clone()
+                    } else {
+                        tokens.clone()
+                    };
 
                     let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
                     let generation_stream = Stream::new(DeviceType::Gpu);
@@ -1277,80 +1663,104 @@ impl Qwen3_5MoeModel {
                         "moe_chat_stream",
                         "qwen3_5_moe",
                     );
-                    profiler.set_prompt_tokens(tokens.len() as u32);
+                    profiler.set_prompt_tokens(prefill_tokens.len() as u32);
                     profiler.snapshot_memory_before();
 
                     // === VLM or text prefill branching ===
                     profiler.begin_prefill();
-                    let (mut last_logits, seq_len) =
-                        if let (true, Some(vision_enc), Some(img_proc)) = (
-                            has_images,
-                            vision_encoder_arc.as_ref(),
-                            image_processor_arc.as_ref(),
-                        ) {
-                            // --- VLM path: process images and run VLM prefill ---
-                            let sms = spatial_merge_size.unwrap_or(2);
-                            let all_images = extract_images_from_messages(&messages);
+                    let (mut last_logits, seq_len) = if has_images && cached_prefix_len > 0 {
+                        // --- VLM cache reuse: same images, incremental text-only prefill ---
+                        let expanded = expanded_tokens.as_ref().unwrap();
+                        let prompt = MxArray::from_uint32(
+                            &prefill_tokens,
+                            &[1, prefill_tokens.len() as i64],
+                        )?;
 
-                            // Process images and inject placeholders
-                            let image_refs: Vec<&[u8]> =
-                                all_images.iter().map(|v| v.as_slice()).collect();
-                            let processed = img_proc.process_many(&image_refs)?;
-                            let num_image_tokens =
-                                compute_num_image_tokens(&processed.grid_thw(), sms)?;
-                            let final_tokens = inject_image_placeholders(&tokens, num_image_tokens);
+                        let logits = forward_inner(
+                            &prompt,
+                            &embedding_weight,
+                            &mut layers_guard,
+                            &mut caches_guard,
+                            &final_norm_guard,
+                            &lm_head_guard,
+                            fa_idx,
+                            Some(&embedding_weight_t),
+                        )?;
 
-                            // Compute vision cache key from raw image bytes
-                            let image_cache_key = compute_image_cache_key(&all_images);
+                        let seq_len = logits.shape_at(1)?;
+                        let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
+                        let last_logits = last_logits.squeeze(Some(&[1]))?;
+                        // seq_len is the TOTAL expanded tokens (cached + new)
+                        (last_logits, expanded.len() as i64)
+                    } else if let (true, Some(vision_enc), Some(_)) = (
+                        has_images,
+                        vision_encoder_arc.as_ref(),
+                        image_processor_arc.as_ref(),
+                    ) {
+                        // --- VLM path: full VLM prefill (no cache reuse) ---
+                        let sms = spatial_merge_size.unwrap_or(2);
+                        let final_tokens = expanded_tokens.as_ref().unwrap();
+                        let processed = vlm_processed.as_ref().unwrap();
 
-                            let input_ids = MxArray::from_uint32(
-                                &final_tokens,
-                                &[1, final_tokens.len() as i64],
-                            )?;
+                        let input_ids =
+                            MxArray::from_uint32(final_tokens, &[1, final_tokens.len() as i64])?;
 
-                            // Update token history with final tokens (including image placeholders)
-                            token_history = final_tokens.clone();
+                        // VLM prefill using Rust path with M-RoPE position IDs
+                        let (logits, rope_deltas) = vlm_prefill_moe(
+                            &input_ids,
+                            image_cache_key,
+                            processed,
+                            vision_enc,
+                            sms,
+                            &embedding_weight,
+                            &mut layers_guard,
+                            &mut caches_guard,
+                            &final_norm_guard,
+                            &lm_head_guard,
+                            generation_stream,
+                            fa_idx,
+                            Some(&embedding_weight_t),
+                            &vision_cache_stream,
+                        )?;
 
-                            // VLM prefill using Rust path with M-RoPE position IDs
-                            let (logits, _rope_deltas) = vlm_prefill_moe(
-                                &input_ids,
-                                image_cache_key,
-                                &processed,
-                                vision_enc,
-                                sms,
-                                &embedding_weight,
-                                &mut layers_guard,
-                                &mut caches_guard,
-                                &final_norm_guard,
-                                &lm_head_guard,
-                                generation_stream,
-                                fa_idx,
-                                Some(&embedding_weight_t),
-                                &vision_cache_stream,
-                            )?;
+                        // Adjust RoPE offset for VLM M-RoPE position correction
+                        if rope_deltas != 0 && use_cpp {
+                            unsafe {
+                                mlx_sys::mlx_qwen35_moe_adjust_offset(rope_deltas as i32);
+                            }
+                        }
 
-                            let vlm_seq_len = final_tokens.len() as i64;
-                            (logits, vlm_seq_len)
-                        } else {
-                            // --- Standard text prefill path ---
-                            let prompt = MxArray::from_uint32(&tokens, &[1, tokens.len() as i64])?;
+                        // Save rope_deltas for cache reuse on subsequent turns
+                        if let Ok(mut rd) = cached_rope_deltas_arc.write() {
+                            *rd = Some(rope_deltas as i32);
+                        }
 
-                            let logits = forward_inner(
-                                &prompt,
-                                &embedding_weight,
-                                &mut layers_guard,
-                                &mut caches_guard,
-                                &final_norm_guard,
-                                &lm_head_guard,
-                                fa_idx,
-                                Some(&embedding_weight_t),
-                            )?;
+                        let vlm_seq_len = final_tokens.len() as i64;
+                        (logits, vlm_seq_len)
+                    } else {
+                        // --- Standard text prefill path ---
+                        let prompt = MxArray::from_uint32(
+                            &prefill_tokens,
+                            &[1, prefill_tokens.len() as i64],
+                        )?;
 
-                            let seq_len = logits.shape_at(1)?;
-                            let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
-                            let last_logits = last_logits.squeeze(Some(&[1]))?;
-                            (last_logits, seq_len)
-                        };
+                        let logits = forward_inner(
+                            &prompt,
+                            &embedding_weight,
+                            &mut layers_guard,
+                            &mut caches_guard,
+                            &final_norm_guard,
+                            &lm_head_guard,
+                            fa_idx,
+                            Some(&embedding_weight_t),
+                        )?;
+
+                        let seq_len = logits.shape_at(1)?;
+                        let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
+                        let last_logits = last_logits.squeeze(Some(&[1]))?;
+                        // seq_len for the C++ init is the TOTAL tokens (cached + new)
+                        (last_logits, tokens.len() as i64)
+                    };
                     profiler.end_prefill();
 
                     // Apply repetition penalty to prefill logits
@@ -1433,6 +1843,23 @@ impl Qwen3_5MoeModel {
                         }
                         // C++ has copied arrays into its own globals — safe to release
                         drop(caches_guard);
+
+                        // Reapply rope_deltas from the original VLM prefill
+                        // (VLM cache reuse skips vlm_prefill, so C++ offset is unset)
+                        if has_images
+                            && cached_prefix_len > 0
+                            && let Ok(rd) = cached_rope_deltas_arc.read()
+                            && let Some(delta) = *rd
+                        {
+                            unsafe {
+                                mlx_sys::mlx_qwen35_moe_adjust_offset(delta);
+                            }
+                        }
+
+                        // For text-only conversations, clear any stale cached rope deltas
+                        if !has_images && let Ok(mut rd) = cached_rope_deltas_arc.write() {
+                            *rd = None;
+                        }
 
                         // C++ decode loop (pipelined — submit N+1 before eval N)
                         profiler.set_label("moe_chat_stream_compiled");
@@ -1517,6 +1944,41 @@ impl Qwen3_5MoeModel {
                         }
                         profiler.snapshot_memory_after();
                         profiler.report();
+
+                        // === Export caches from C++ before MoeResetGuard drops ===
+                        if reuse_cache {
+                            let num_layers = model_config.num_layers as usize;
+                            let mut export_ptrs: Vec<*mut mlx_sys::mlx_array> =
+                                vec![std::ptr::null_mut(); num_layers * 2];
+                            let exported = unsafe {
+                                mlx_sys::mlx_qwen35_moe_export_caches(
+                                    export_ptrs.as_mut_ptr(),
+                                    (num_layers * 2) as i32,
+                                )
+                            };
+                            if exported > 0 {
+                                let cache_offset =
+                                    unsafe { mlx_sys::mlx_qwen35_moe_get_cache_offset() };
+                                let mut new_caches = Vec::with_capacity(num_layers);
+                                for i in 0..num_layers {
+                                    let p0 = export_ptrs[i * 2];
+                                    let p1 = export_ptrs[i * 2 + 1];
+                                    let mut lc = if model_config.is_linear_layer(i) {
+                                        Qwen3_5LayerCache::new_linear()
+                                    } else {
+                                        Qwen3_5LayerCache::new_full_attention()
+                                    };
+                                    lc.import_ptrs(p0, p1, cache_offset);
+                                    new_caches.push(lc);
+                                }
+                                let mut cg = caches_arc.write().map_err(|_| {
+                                    Error::from_reason(
+                                        "Failed to acquire caches lock for cache export",
+                                    )
+                                })?;
+                                *cg = Some(new_caches);
+                            }
+                        }
                         // _moe_guard dropped here, calling mlx_qwen35_moe_reset()
                     } else {
                         // Rust fallback decode loop (pipelined)
@@ -1620,12 +2082,56 @@ impl Qwen3_5MoeModel {
                         drop(lm_head_guard);
                     }
 
+                    // === Save token history and image key for cache reuse on next call ===
+                    if reuse_cache {
+                        // For VLM, save the expanded token history (with image placeholders)
+                        let mut full_history = if let Some(ref et) = expanded_tokens {
+                            et.clone()
+                        } else {
+                            tokens.clone()
+                        };
+                        // Only include tokens that were actually forwarded through the model.
+                        // When stopped at max_tokens ("length"), the last token was never forwarded
+                        // (the pipelined loop skips forward on the final step).
+                        let history_tokens =
+                            if finish_reason == "length" && !generated_tokens.is_empty() {
+                                &generated_tokens[..generated_tokens.len() - 1]
+                            } else {
+                                &generated_tokens
+                            };
+                        full_history.extend_from_slice(history_tokens);
+                        if let Ok(mut th) = cached_token_history_arc.write() {
+                            *th = full_history;
+                        }
+                        // Save image cache key (Some for VLM, None for text-only)
+                        if let Ok(mut ik) = cached_image_key_arc.write() {
+                            *ik = if has_images {
+                                Some(image_cache_key)
+                            } else {
+                                None
+                            };
+                        }
+                    } else {
+                        if let Ok(mut cg) = caches_arc.write() {
+                            *cg = None;
+                        }
+                        if let Ok(mut th) = cached_token_history_arc.write() {
+                            th.clear();
+                        }
+                        if let Ok(mut ik) = cached_image_key_arc.write() {
+                            *ik = None;
+                        }
+                        if let Ok(mut rd) = cached_rope_deltas_arc.write() {
+                            *rd = None;
+                        }
+                    }
+
                     // Compute performance metrics if requested
                     let performance = if let (Some(gen_start), Some(first_tok)) =
                         (generation_start, first_token_instant)
                     {
                         let generation_end = std::time::Instant::now();
-                        let prompt_tokens = tokens.len() as f64;
+                        let actual_prefill_toks = prefill_tokens.len() as f64;
                         let gen_tokens = generated_tokens.len() as f64;
                         let ttft_ms = first_tok.duration_since(gen_start).as_secs_f64() * 1000.0;
                         let decode_ms =
@@ -1633,7 +2139,7 @@ impl Qwen3_5MoeModel {
                         Some(crate::profiling::PerformanceMetrics {
                             ttft_ms,
                             prefill_tokens_per_second: if ttft_ms > 0.0 {
-                                prompt_tokens / (ttft_ms / 1000.0)
+                                actual_prefill_toks / (ttft_ms / 1000.0)
                             } else {
                                 0.0
                             },
@@ -1657,8 +2163,14 @@ impl Qwen3_5MoeModel {
 
                     let num_tokens = generated_tokens.len() as u32;
 
-                    // Parse tool calls and thinking from the generated text
-                    let (clean_text, tool_calls, thinking) = tools::parse_generation_output(&text);
+                    let think_tag =
+                        if tools::has_think_end_token(&generated_tokens, think_end_id_stream) {
+                            think_end_str_stream.as_deref()
+                        } else {
+                            None
+                        };
+                    let (clean_text, tool_calls, thinking) =
+                        tools::split_at_think_end(&text, think_tag);
 
                     // If we have valid tool calls, override finish reason
                     let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
@@ -2247,6 +2759,9 @@ impl Qwen3_5MoeModel {
                 entries: HashMap::new(),
                 generation: 0,
             })),
+            cached_token_history: Arc::new(RwLock::new(Vec::new())),
+            cached_image_key: Arc::new(RwLock::new(None)),
+            cached_rope_deltas: Arc::new(RwLock::new(None)),
         })
     }
 

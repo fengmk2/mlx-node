@@ -8,6 +8,7 @@ pub mod layer_cache;
 pub mod model;
 pub mod persistence;
 pub mod processing;
+pub mod prompt_cache;
 pub mod quantized_linear;
 pub mod rms_norm_gated;
 pub mod vision;

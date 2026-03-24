@@ -158,6 +158,10 @@ pub struct Qwen3Tokenizer {
     bos_token_id: Option<u32>,
     /// Jinja2 chat template loaded from tokenizer_config.json
     chat_template: Option<String>,
+    /// Token ID for `</think>` or `</longcat_think>` (None if not in vocabulary).
+    think_end_id: Option<u32>,
+    /// The actual think-end string (e.g., `"</think>"` or `"</longcat_think>"`).
+    think_end_str: Option<String>,
 }
 
 #[napi]
@@ -185,12 +189,16 @@ impl Qwen3Tokenizer {
                 // Load chat template from tokenizer_config.json (in same directory)
                 let chat_template = Self::load_chat_template(&tokenizer_path);
 
+                let (think_end_id, think_end_str) = Self::detect_think_end(&tokenizer);
+
                 Ok(Self {
                     tokenizer: Arc::new(tokenizer),
                     pad_token_id: ENDOFTEXT_TOKEN_ID,
                     eos_token_id: IM_END_TOKEN_ID,
                     bos_token_id: None, // Qwen3 doesn't use BOS by default
                     chat_template,
+                    think_end_id,
+                    think_end_str,
                 })
             })
             .await
@@ -266,12 +274,16 @@ impl Qwen3Tokenizer {
         // Load chat template from tokenizer_config.json (in same directory)
         let chat_template = Self::load_chat_template(tokenizer_path.to_string_lossy().as_ref());
 
+        let (think_end_id, think_end_str) = Self::detect_think_end(&tokenizer);
+
         Ok(Self {
             tokenizer: Arc::new(tokenizer),
             pad_token_id: ENDOFTEXT_TOKEN_ID,
             eos_token_id: IM_END_TOKEN_ID,
-            bos_token_id: None, // Qwen3 doesn't use BOS by default
+            bos_token_id: None,
             chat_template,
+            think_end_id,
+            think_end_str,
         })
     }
 
@@ -975,12 +987,16 @@ impl Qwen3Tokenizer {
         // Load chat template from tokenizer_config.json (in same directory)
         let chat_template = Self::load_chat_template(tokenizer_path);
 
+        let (think_end_id, think_end_str) = Self::detect_think_end(&tokenizer);
+
         Ok(Self {
             tokenizer: Arc::new(tokenizer),
             pad_token_id: ENDOFTEXT_TOKEN_ID,
             eos_token_id: IM_END_TOKEN_ID,
-            bos_token_id: None, // Qwen3 doesn't use BOS by default
+            bos_token_id: None,
             chat_template,
+            think_end_id,
+            think_end_str,
         })
     }
 
@@ -1049,7 +1065,33 @@ impl Clone for Qwen3Tokenizer {
             eos_token_id: self.eos_token_id,
             bos_token_id: self.bos_token_id,
             chat_template: self.chat_template.clone(),
+            think_end_id: self.think_end_id,
+            think_end_str: self.think_end_str.clone(),
         }
+    }
+}
+
+impl Qwen3Tokenizer {
+    /// Detect think-end token from tokenizer vocabulary.
+    /// Returns (token_id, token_string) for whichever variant is found.
+    fn detect_think_end(tokenizer: &Tokenizer) -> (Option<u32>, Option<String>) {
+        let vocab = tokenizer.get_vocab(true);
+        for tag in &["</think>", "</longcat_think>"] {
+            if let Some(&id) = vocab.get(*tag) {
+                return (Some(id), Some(tag.to_string()));
+            }
+        }
+        (None, None)
+    }
+
+    /// Get the think-end token ID, if the tokenizer has thinking support.
+    pub fn think_end_id(&self) -> Option<u32> {
+        self.think_end_id
+    }
+
+    /// Get the think-end string (e.g., `"</think>"` or `"</longcat_think>"`).
+    pub fn think_end_str(&self) -> Option<&str> {
+        self.think_end_str.as_deref()
     }
 }
 

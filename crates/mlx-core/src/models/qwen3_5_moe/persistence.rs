@@ -428,6 +428,9 @@ fn apply_weights(
 
     // Helper: try MXFP8 builder first (if applicable), then affine builder.
     // Checks per-layer overrides before falling back to global defaults.
+    // For merged projections (in_proj_qkvz, in_proj_ba), also checks the
+    // pre-merge component names (in_proj_qkv, in_proj_z, in_proj_b, in_proj_a)
+    // since config.json stores overrides using the original HuggingFace names.
     let try_build_ql = |params: &HashMap<String, MxArray>, prefix: &str| {
         if is_mxfp8 && let Some(ql) = try_build_mxfp8_quantized_linear(params, prefix) {
             return Some(ql);
@@ -435,6 +438,44 @@ fn apply_weights(
         let (bits, gs) = per_layer_quant
             .get(prefix)
             .copied()
+            .or_else(|| {
+                // Merged projection fallback: try pre-merge component names
+                if prefix.ends_with(".in_proj_qkvz") {
+                    let base = prefix.strip_suffix(".in_proj_qkvz").unwrap();
+                    let qkv = per_layer_quant.get(&format!("{}.in_proj_qkv", base));
+                    let z = per_layer_quant.get(&format!("{}.in_proj_z", base));
+                    match (qkv, z) {
+                        (Some(&a), Some(&b)) if a != b => {
+                            warn!(
+                                "Merged in_proj_qkvz has conflicting overrides: \
+                                 qkv={:?}, z={:?}. Using higher precision.",
+                                a, b
+                            );
+                            Some(if a.0 > b.0 { a } else { b })
+                        }
+                        (Some(&a), _) | (_, Some(&a)) => Some(a),
+                        _ => None,
+                    }
+                } else if prefix.ends_with(".in_proj_ba") {
+                    let base = prefix.strip_suffix(".in_proj_ba").unwrap();
+                    let b_val = per_layer_quant.get(&format!("{}.in_proj_b", base));
+                    let a_val = per_layer_quant.get(&format!("{}.in_proj_a", base));
+                    match (b_val, a_val) {
+                        (Some(&x), Some(&y)) if x != y => {
+                            warn!(
+                                "Merged in_proj_ba has conflicting overrides: \
+                                 b={:?}, a={:?}. Using higher precision.",
+                                x, y
+                            );
+                            Some(if x.0 > y.0 { x } else { y })
+                        }
+                        (Some(&x), _) | (_, Some(&x)) => Some(x),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            })
             .unwrap_or((quant_bits, quant_group_size));
         try_build_quantized_linear(params, prefix, gs, bits)
     };
