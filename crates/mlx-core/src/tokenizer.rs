@@ -48,6 +48,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 use tokenizers::{EncodeInput, Encoding, Tokenizer};
+use tracing::warn;
 
 /// Special token IDs for Qwen3 models
 const ENDOFTEXT_TOKEN_ID: u32 = 151643;
@@ -849,9 +850,13 @@ impl Qwen3Tokenizer {
                         params_obj.insert("type".to_string(), serde_json::json!(params.r#type));
                         if let Some(props) = &params.properties {
                             // Parse the JSON string to include it properly
-                            if let Ok(props_val) = serde_json::from_str::<serde_json::Value>(props)
-                            {
-                                params_obj.insert("properties".to_string(), props_val);
+                            match serde_json::from_str::<serde_json::Value>(props) {
+                                Ok(props_val) => {
+                                    params_obj.insert("properties".to_string(), props_val);
+                                }
+                                Err(e) => {
+                                    warn!("Failed to parse tool properties JSON: {}", e);
+                                }
                             }
                         }
                         if let Some(req) = &params.required {
@@ -886,8 +891,10 @@ impl Qwen3Tokenizer {
                                 call_obj.insert("id".to_string(), serde_json::json!(id));
                             }
                             call_obj.insert("name".to_string(), serde_json::json!(tc.name));
-                            call_obj
-                                .insert("arguments".to_string(), serde_json::json!(tc.arguments));
+                            let args_value =
+                                serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                                    .unwrap_or_else(|_| serde_json::json!(tc.arguments));
+                            call_obj.insert("arguments".to_string(), args_value);
                             serde_json::Value::Object(call_obj)
                         })
                         .collect();

@@ -5888,7 +5888,6 @@ impl Qwen3Model {
             // Decode loop
             const DECODE_CLEANUP_INTERVAL: i32 = 256;
             let one_arr = MxArray::from_int32(&[1], &[1])?;
-
             for step in 0..max_new_tokens {
                 let _stream_ctx = StreamContext::new(generation_stream);
 

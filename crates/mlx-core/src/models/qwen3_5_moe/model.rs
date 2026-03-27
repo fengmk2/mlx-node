@@ -1111,7 +1111,6 @@ impl Qwen3_5MoeModel {
                 // Rep penalty uses token_history as-of graph build time (one
                 // token behind), matching Python mlx-lm's pipelining behavior.
                 profiler.set_label("moe_chat_compiled");
-
                 for step in 0..max_new_tokens {
                     // Build and submit graph for step N+1 before waiting for N
                     let next_y = if step + 1 < max_new_tokens {
@@ -1241,7 +1240,6 @@ impl Qwen3_5MoeModel {
             } else {
                 // Rust fallback decode loop (pipelined)
                 profiler.set_label("moe_chat_rust");
-
                 for step in 0..max_new_tokens {
                     // Build and submit graph for step N+1 before waiting for N
                     let next_y = if step + 1 < max_new_tokens {
