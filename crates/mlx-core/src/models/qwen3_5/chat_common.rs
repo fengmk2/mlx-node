@@ -195,6 +195,11 @@ impl ReasoningTracker {
         self.think_end_id
             .expect("should_force_think_end was true but think_end_id is None")
     }
+
+    /// Number of tokens generated during reasoning (inside <think>...</think>).
+    pub fn reasoning_token_count(&self) -> u32 {
+        self.thinking_token_count.max(0) as u32
+    }
 }
 
 /// Compute TTFT / prefill tok/s / decode tok/s performance metrics.
@@ -292,6 +297,8 @@ pub(crate) fn finalize_chat_result(
     performance: Option<crate::profiling::PerformanceMetrics>,
     include_reasoning: bool,
     thinking_enabled: bool,
+    prompt_tokens: u32,
+    reasoning_tokens: u32,
 ) -> Result<ChatResult> {
     let text = tokenizer
         .decode_sync(generated_tokens, true)
@@ -323,6 +330,8 @@ pub(crate) fn finalize_chat_result(
         tool_calls,
         thinking,
         num_tokens,
+        prompt_tokens,
+        reasoning_tokens,
         finish_reason,
         raw_text: text,
         performance,
@@ -541,6 +550,8 @@ macro_rules! decode_loop {
                         tool_calls: None,
                         thinking: None,
                         num_tokens: None,
+                        prompt_tokens: None,
+                        reasoning_tokens: None,
                         raw_text: None,
                         performance: None,
                         is_reasoning: Some(_is_reasoning),

@@ -119,7 +119,7 @@ export declare class Gemma4Model {
   /** Load a Gemma4 model from a directory. */
   static load(modelPath: string): Promise<Gemma4Model>;
   /** Chat with the model using a list of messages. */
-  chat(messages: Array<ChatMessage>, config?: Gemma4ChatConfig | undefined | null): Promise<Gemma4ChatResult>;
+  chat(messages: Array<ChatMessage>, config?: Gemma4ChatConfig | undefined | null): Promise<ChatResult>;
 }
 
 /** Result from text generation with detailed metadata */
@@ -784,7 +784,7 @@ export declare class QianfanOCRModel {
    *
    * High-level API: processes images, formats prompt, generates, and decodes.
    */
-  chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<QianfanChatResult>;
+  chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
    * Streaming chat with the model.
    *
@@ -1412,6 +1412,27 @@ export declare class Qwen3Tokenizer {
 }
 
 /**
+ * Response store for OpenAI Responses API persistence.
+ *
+ * Stores responses in SQLite to support `previous_response_id`
+ * for multi-turn conversation state.
+ */
+export declare class ResponseStore {
+  /** Open (or create) a response store at the given path. */
+  static open(path: string): Promise<ResponseStore>;
+  /** Store a response. */
+  store(response: StoredResponseRecord): Promise<void>;
+  /** Get a single response by ID. */
+  get(id: string): Promise<StoredResponseRecord | null>;
+  /** Get the full conversation chain for a response (oldest first). */
+  getChain(id: string): Promise<Array<StoredResponseRecord>>;
+  /** Delete a response by ID. Returns true if a row was deleted. */
+  delete(id: string): Promise<boolean>;
+  /** Delete expired responses. Returns the number of rows deleted. */
+  cleanupExpired(): Promise<number>;
+}
+
+/**
  * SFT Training Engine
  *
  * Thin coordinator that routes all MLX operations through the model thread.
@@ -1994,6 +2015,8 @@ export interface ChatResult {
   toolCalls: Array<ToolCallResult>;
   thinking?: string;
   numTokens: number;
+  promptTokens: number;
+  reasoningTokens: number;
   finishReason: string;
   rawText: string;
   /** Performance metrics (present when `reportPerformance: true` in config) */
@@ -2020,6 +2043,8 @@ export interface ChatStreamChunk {
   toolCalls?: Array<ToolCallResult>;
   thinking?: string;
   numTokens?: number;
+  promptTokens?: number;
+  reasoningTokens?: number;
   rawText?: string;
   /** Performance metrics (only present in the final chunk when `reportPerformance: true`) */
   performance?: PerformanceMetrics;
@@ -2333,15 +2358,6 @@ export interface Gemma4ChatConfig {
    * `Some(false)` = disabled, `Some(true)` = enabled.
    */
   enableThinking?: boolean;
-}
-
-/** Gemma4 chat result. */
-export interface Gemma4ChatResult {
-  text: string;
-  numTokens: number;
-  finishReason: string;
-  /** Performance metrics (always present). */
-  performance?: PerformanceMetrics;
 }
 
 /**
@@ -3084,24 +3100,6 @@ export interface ProfilingSummary {
   avgPrefillMs: number;
 }
 
-/** Result from a Qianfan-OCR chat() call. */
-export interface QianfanChatResult {
-  /** Generated text (with thinking/tool_call tags stripped) */
-  text: string;
-  /** Parsed tool calls (if any) */
-  toolCalls: Array<ToolCallResult>;
-  /** Thinking content (text inside <think>...</think> tags) */
-  thinking?: string;
-  /** Number of generated tokens */
-  numTokens: number;
-  /** Why generation stopped: "stop", "length", or "repetition" */
-  finishReason: string;
-  /** Raw generated text before parsing */
-  rawText: string;
-  /** Performance metrics (only present when `reportPerformance: true`) */
-  performance?: PerformanceMetrics;
-}
-
 /** Full Qianfan-OCR model configuration */
 export interface QianfanOcrConfig {
   visionConfig: InternVisionConfig;
@@ -3515,6 +3513,22 @@ export interface StepSummary {
   numToolCalls: number;
   eosCount: number;
   lengthCount: number;
+}
+
+/** A stored response record exposed to JavaScript. */
+export interface StoredResponseRecord {
+  id: string;
+  createdAt: number;
+  model: string;
+  status: string;
+  instructions?: string;
+  inputJson: string;
+  outputJson: string;
+  outputText: string;
+  usageJson: string;
+  previousResponseId?: string;
+  configJson?: string;
+  expiresAt?: number;
 }
 
 /** A table structure */

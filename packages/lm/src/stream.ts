@@ -21,6 +21,8 @@ export interface ChatStreamFinal {
   toolCalls: ToolCallResult[];
   thinking: string | null;
   numTokens: number;
+  promptTokens: number;
+  reasoningTokens: number;
   rawText: string;
   performance?: PerformanceMetrics;
 }
@@ -91,6 +93,8 @@ export async function* _createChatStream(
             toolCalls: chunk.toolCalls ?? [],
             thinking: chunk.thinking ?? null,
             numTokens: chunk.numTokens!,
+            promptTokens: chunk.promptTokens ?? 0,
+            reasoningTokens: chunk.reasoningTokens ?? 0,
             rawText: chunk.rawText!,
             performance: chunk.performance ?? undefined,
           } as ChatStreamFinal;
