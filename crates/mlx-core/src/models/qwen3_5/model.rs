@@ -461,6 +461,13 @@ pub(crate) struct ChatDecodeInputs {
     /// `true` when the VLM prefill has already run the compiled init.
     /// `false` for text-only paths and the session delta path.
     pub vlm_compiled_init_done: bool,
+    /// `true` when this invocation is a session DELTA continuation
+    /// (text-only append on top of the live KV cache). Drives the
+    /// post-decode save pathway: deltas keep `cached_image_key` sticky
+    /// so image attention state baked into the KV caches by a prior
+    /// prefill stays addressable; prefills (re)set the key based on
+    /// the fresh turn's `has_images`.
+    pub is_delta: bool,
 
     // --- Compiled-path state --------------------------------------------
     /// `true` when this model owns the compiled weights and the compiled
@@ -998,8 +1005,9 @@ impl Qwen35Inner {
                 let all_images = extract_images_from_messages(&messages);
                 let image_refs: Vec<&[u8]> = all_images.iter().map(|v| v.as_slice()).collect();
                 let processed_pre = img_proc.process_many(&image_refs)?;
-                let num_image_tokens = compute_num_image_tokens(&processed_pre.grid_thw(), sms)?;
-                let expanded = inject_image_placeholders(&tokens, num_image_tokens);
+                let per_image_token_counts =
+                    compute_image_token_counts_per_image(&processed_pre.grid_thw(), sms)?;
+                let expanded = inject_image_placeholders(&tokens, &per_image_token_counts);
                 let cache_key = compute_image_cache_key(&all_images);
                 (expanded, cache_key, Some(processed_pre))
             } else {
@@ -1178,6 +1186,7 @@ impl Qwen35Inner {
             last_logits,
             seq_len,
             vlm_compiled_init_done,
+            is_delta: false,
             use_compiled,
             has_images,
             cached_prefix_len,
@@ -1244,11 +1253,14 @@ impl Qwen35Inner {
                 "chat_tokens_delta_sync requires a non-empty delta",
             ));
         }
-        if self.cached_image_key.is_some() {
-            return Err(Error::from_reason(
-                "chat_tokens_delta_sync is text-only; session currently holds image state",
-            ));
-        }
+        // A populated `cached_image_key` means the live KV cache carries
+        // attention state for images seen on the preceding prefill. The
+        // delta path appends a text delta on top of that — the image
+        // context stays intact and the model can keep reasoning about
+        // it. We do NOT reject here; the outer `chat_session_continue_*`
+        // gate already rejects IMAGE-SET CHANGES (non-empty new images
+        // that don't match the cached key) with a prefixed error the TS
+        // `ChatSession` can catch and route through `chatSessionStart`.
 
         let report_perf = config.report_performance.unwrap_or(false);
 
@@ -1359,6 +1371,7 @@ impl Qwen35Inner {
             last_logits,
             seq_len: total_seq_len,
             vlm_compiled_init_done: false,
+            is_delta: true,
             use_compiled,
             has_images: false,
             cached_prefix_len,
@@ -1500,6 +1513,7 @@ impl Qwen35Inner {
             last_logits,
             seq_len,
             vlm_compiled_init_done,
+            is_delta,
             use_compiled,
             has_images,
             cached_prefix_len,
@@ -1590,10 +1604,17 @@ impl Qwen35Inner {
                     );
                 }
 
-                // VLM cache reuse: apply saved rope_deltas
-                if has_images
-                    && cached_prefix_len > 0
-                    && let Some(delta) = self.cached_rope_deltas
+                // Re-apply the saved M-RoPE offset when the compiled
+                // state is being (re)initialized from a KV cache that
+                // encodes image attention — see
+                // `chat_common::should_reapply_rope_delta`.
+                if let Some(delta) = self.cached_rope_deltas
+                    && chat_common::should_reapply_rope_delta(
+                        true,
+                        is_delta,
+                        has_images,
+                        cached_prefix_len,
+                    )
                 {
                     unsafe {
                         mlx_sys::mlx_qwen35_compiled_adjust_offset(delta);
@@ -1601,8 +1622,9 @@ impl Qwen35Inner {
                 }
             }
 
-            // For text-only, clear stale rope deltas
-            if !has_images {
+            // Clear stale rope deltas only on fresh text-only prefills —
+            // see `chat_common::should_clear_rope_delta`.
+            if chat_common::should_clear_rope_delta(is_delta, has_images) {
                 self.cached_rope_deltas = None;
             }
 
@@ -1715,20 +1737,37 @@ impl Qwen35Inner {
             );
         }
 
-        // Save cache state
-        save_cache_state_direct(
-            p.reuse_cache,
-            has_images,
-            &generated_tokens,
-            &finish_reason,
-            &save_tokens,
-            save_expanded_tokens.as_deref(),
-            save_image_cache_key,
-            &mut self.cached_token_history,
-            &mut self.cached_image_key,
-            &mut self.cached_rope_deltas,
-            &mut self.caches,
-        );
+        // Save cache state. Delta continuations preserve
+        // `cached_image_key` — the KV cache still holds the prior
+        // prefill's image attention state even though this turn was
+        // text-only. Prefill paths (re)set the key based on the fresh
+        // turn's `has_images`.
+        if is_delta {
+            chat_common::save_cache_state_after_delta(
+                p.reuse_cache,
+                &generated_tokens,
+                &finish_reason,
+                &save_tokens,
+                &mut self.cached_token_history,
+                &mut self.cached_image_key,
+                &mut self.cached_rope_deltas,
+                &mut self.caches,
+            );
+        } else {
+            save_cache_state_direct(
+                p.reuse_cache,
+                has_images,
+                &generated_tokens,
+                &finish_reason,
+                &save_tokens,
+                save_expanded_tokens.as_deref(),
+                save_image_cache_key,
+                &mut self.cached_token_history,
+                &mut self.cached_image_key,
+                &mut self.cached_rope_deltas,
+                &mut self.caches,
+            );
+        }
 
         let performance = compute_performance_metrics(
             generation_start,
@@ -1986,13 +2025,11 @@ impl Qwen35Inner {
             );
             return;
         }
-        if self.cached_image_key.is_some() {
-            send_stream_error(
-                &stream_tx,
-                "chat_stream_tokens_delta is text-only; session currently holds image state",
-            );
-            return;
-        }
+        // Text-only deltas are allowed on sessions whose KV cache carries
+        // prior image attention state — see `chat_tokens_delta_sync` for
+        // the full rationale. The outer `chat_stream_session_continue`
+        // gate already filters IMAGE-SET CHANGES via the
+        // `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` prefix path.
 
         // All guards passed — enter the prefill+decode helper. Any error
         // returned from here propagates as an mpsc error, same as
@@ -2180,8 +2217,20 @@ impl Qwen35Inner {
                     prefill_len,
                 );
             }
-            // Text-only path: clear stale rope deltas.
-            self.cached_rope_deltas = None;
+            // Re-apply the saved M-RoPE offset if the session carries
+            // image state. The delta prefill just ran against the live
+            // KV caches, which still encode the prior VLM prefill's
+            // image attention; without re-applying the offset here, the
+            // newly-built compiled graph would use a sequential M-RoPE
+            // position and misposition all decoded tokens relative to
+            // the cached image patches. `cached_rope_deltas` stays
+            // alive across deltas so chained text-only turns on the
+            // same image session keep the offset.
+            if let Some(delta) = self.cached_rope_deltas {
+                unsafe {
+                    mlx_sys::mlx_qwen35_compiled_adjust_offset(delta);
+                }
+            }
 
             profiler.set_label("chat_stream_delta_compiled");
 
@@ -2302,17 +2351,14 @@ impl Qwen35Inner {
 
         // Save cache state unconditionally — even on cancellation, the
         // partial generated_tokens must be appended so the session stays
-        // consistent for the next turn. `has_images` is always false on
-        // the delta path and we pass the full pre-decode snapshot as the
-        // text-only `save_tokens`.
-        save_cache_state_direct(
+        // consistent for the next turn. Delta continuations preserve
+        // `cached_image_key` so the next turn's cache-prefix verify
+        // still sees the prior prefill's image state.
+        chat_common::save_cache_state_after_delta(
             p.reuse_cache,
-            false,
             &generated_tokens,
             &finish_reason,
             &save_tokens,
-            None,
-            0,
             &mut self.cached_token_history,
             &mut self.cached_image_key,
             &mut self.cached_rope_deltas,
@@ -2472,8 +2518,9 @@ impl Qwen35Inner {
                 let all_images = extract_images_from_messages(&messages);
                 let image_refs: Vec<&[u8]> = all_images.iter().map(|v| v.as_slice()).collect();
                 let processed_pre = img_proc.process_many(&image_refs)?;
-                let num_image_tokens = compute_num_image_tokens(&processed_pre.grid_thw(), sms)?;
-                let expanded = inject_image_placeholders(&tokens, num_image_tokens);
+                let per_image_token_counts =
+                    compute_image_token_counts_per_image(&processed_pre.grid_thw(), sms)?;
+                let expanded = inject_image_placeholders(&tokens, &per_image_token_counts);
                 let cache_key = compute_image_cache_key(&all_images);
                 (expanded, cache_key, Some(processed_pre))
             } else {
@@ -5251,39 +5298,99 @@ pub(crate) fn extract_images_from_messages(messages: &[ChatMessage]) -> Vec<Vec<
     all_images
 }
 
-/// Compute the number of merged image tokens from a processed grid_thw array.
-pub(crate) fn compute_num_image_tokens(grid: &MxArray, spatial_merge_size: i32) -> Result<usize> {
+/// Compute the per-image merged-token count from a processed grid_thw
+/// array. Each entry is the number of `IMAGE_TOKEN_ID` slots that image
+/// must occupy in the prompt so the vision embeddings align 1:1 with the
+/// corresponding token positions.
+pub(crate) fn compute_image_token_counts_per_image(
+    grid: &MxArray,
+    spatial_merge_size: i32,
+) -> Result<Vec<usize>> {
     grid.eval();
     let grid_data = grid.to_int32()?;
     let merge_factor = spatial_merge_size * spatial_merge_size;
-    let mut num_tokens = 0usize;
+    let mut counts = Vec::with_capacity(grid_data.len() / 3);
     for i in 0..(grid_data.len() / 3) {
         let t = grid_data[i * 3];
         let h = grid_data[i * 3 + 1];
         let w = grid_data[i * 3 + 2];
-        num_tokens += ((t * h * w) / merge_factor) as usize;
+        counts.push(((t * h * w) / merge_factor) as usize);
     }
-    Ok(num_tokens)
+    Ok(counts)
 }
 
-/// Ensure image token placeholders are present in the tokenized output.
+/// Ensure the tokenized prompt contains the right number of
+/// `IMAGE_TOKEN_ID` placeholders — one per vision patch, in the order
+/// produced by the chat template.
 ///
-/// If the chat template didn't inject `IMAGE_TOKEN_ID` placeholders,
-/// splice `num_image_tokens` of them after position 0 (after BOS).
-/// Always returns an owned Vec.
-pub(crate) fn inject_image_placeholders(tokens: &[u32], num_image_tokens: usize) -> Vec<u32> {
+/// Three input shapes are accepted:
+///
+/// 1. **Template emitted one `<|image_pad|>` per image** (the proper
+///    Qwen VLM shape, produced by
+///    `tokenizer::serialize_message_for_jinja` when the user turn
+///    carries images). Each placeholder is expanded in-place to its
+///    image's grid count. This keeps the vision tokens inside the user
+///    turn — `get_rope_index` builds correct M-RoPE positions and the
+///    model attends to the image in-context.
+///
+/// 2. **Template already emitted the fully expanded count** (non-Qwen
+///    templates that inline the full patch run). Pass through unchanged.
+///
+/// 3. **Template emitted zero placeholders** (non-VLM template, or a
+///    VLM template that silently drops vision markers). Splice the
+///    total count right after BOS as a last-resort fallback. Vision
+///    tokens land outside the user turn; this usually still produces
+///    sensible output for simple prompts but M-RoPE position IDs are
+///    suboptimal.
+pub(crate) fn inject_image_placeholders(
+    tokens: &[u32],
+    per_image_token_counts: &[usize],
+) -> Vec<u32> {
+    let total: usize = per_image_token_counts.iter().sum();
+    if total == 0 {
+        return tokens.to_vec();
+    }
     let existing = tokens
         .iter()
         .filter(|&&t| t == IMAGE_TOKEN_ID as u32)
         .count();
-    if num_image_tokens > 0 && existing == 0 {
+
+    if existing == 0 {
+        // Case 3 — fallback splice after BOS.
         let mut new_tokens = tokens.to_vec();
-        let placeholders: Vec<u32> = vec![IMAGE_TOKEN_ID as u32; num_image_tokens];
+        let placeholders: Vec<u32> = vec![IMAGE_TOKEN_ID as u32; total];
         new_tokens.splice(1..1, placeholders);
-        new_tokens
-    } else {
-        tokens.to_vec()
+        return new_tokens;
     }
+
+    if existing == per_image_token_counts.len() {
+        // Case 1 — one placeholder per image; expand each in place to
+        // its grid count. Capacity pre-sized to the final length so no
+        // reallocations.
+        let mut new_tokens: Vec<u32> = Vec::with_capacity(tokens.len() + total - existing);
+        let mut img_iter = per_image_token_counts.iter().copied();
+        for &t in tokens {
+            if t == IMAGE_TOKEN_ID as u32 {
+                match img_iter.next() {
+                    Some(count) => {
+                        new_tokens.extend(std::iter::repeat_n(IMAGE_TOKEN_ID as u32, count));
+                    }
+                    None => {
+                        // More placeholders than images — preserve as-is
+                        // and let `get_rope_index` surface the mismatch.
+                        new_tokens.push(t);
+                    }
+                }
+            } else {
+                new_tokens.push(t);
+            }
+        }
+        return new_tokens;
+    }
+
+    // Case 2 (existing == total) or unknown shape — return as-is.
+    // `get_rope_index` will surface any mismatch.
+    tokens.to_vec()
 }
 
 /// Compute M-RoPE position IDs for VLM
@@ -5322,14 +5429,33 @@ pub(crate) fn get_rope_index(
         let end = start + seq_len as usize;
         let batch_tokens: Vec<i32> = input_ids_data[start..end].to_vec();
 
-        let mut image_positions: Vec<usize> = Vec::new();
-        for (i, &token) in batch_tokens.iter().enumerate() {
-            if token == image_token_id {
-                image_positions.push(i);
+        // Scan `batch_tokens` for maximal contiguous runs of
+        // `image_token_id`. After the tokenizer fix that serialises
+        // one `<|image_pad|>` per image inline in the user turn and
+        // `inject_image_placeholders` expands each marker in place,
+        // the prompt can carry MULTIPLE separated image runs when
+        // history is replayed (e.g. two image-bearing user turns
+        // joined by an assistant reply). Flattening the span from
+        // `positions[0]` to `positions[last]` the way the old
+        // single-span code did would skip every interior text token
+        // between runs and blow up the downstream shape check.
+        let mut image_runs: Vec<(usize, usize)> = Vec::new();
+        {
+            let mut i = 0;
+            while i < batch_tokens.len() {
+                if batch_tokens[i] == image_token_id {
+                    let start = i;
+                    while i < batch_tokens.len() && batch_tokens[i] == image_token_id {
+                        i += 1;
+                    }
+                    image_runs.push((start, i));
+                } else {
+                    i += 1;
+                }
             }
         }
 
-        if image_positions.is_empty() {
+        if image_runs.is_empty() {
             for i in 0..seq_len {
                 all_position_ids[0].push(i);
                 all_position_ids[1].push(i);
@@ -5364,58 +5490,140 @@ pub(crate) fn get_rope_index(
             total_expected_tokens += num_tokens;
         }
 
-        if total_expected_tokens != image_positions.len() {
+        let total_image_tokens: usize = image_runs.iter().map(|(s, e)| e - s).sum();
+        if total_expected_tokens != total_image_tokens {
             return Err(Error::new(
                 Status::GenericFailure,
                 format!(
                     "Image token count mismatch: expected {} from grid, found {} in prompt",
-                    total_expected_tokens,
-                    image_positions.len()
+                    total_expected_tokens, total_image_tokens,
                 ),
             ));
         }
 
-        // Build position IDs
-        let image_start = image_positions[0];
-        let image_end = image_positions[image_positions.len() - 1] + 1;
+        // Two token layouts are valid here:
+        //
+        //  (a) N runs, one per image — the proper Qwen VLM shape after
+        //      the tokenizer serialiser emits a `{type:"image"}` part
+        //      per image and `inject_image_placeholders` expands each
+        //      marker in place. Per-run length must match its grid.
+        //
+        //  (b) 1 big run whose length equals the grids' total —
+        //      the fallback layout for chat templates that emit no
+        //      `<|image_pad|>` markers, where
+        //      `inject_image_placeholders` crams every image's tokens
+        //      into a single splice after BOS. No text gap sits between
+        //      images in this layout, so the position walk collapses
+        //      consecutive sub-runs into one contiguous span without
+        //      emitting any interior text.
+        //
+        // We canonicalise both into a `per_image_offsets: Vec<(start,
+        // grid_info)>` list of length `num_images` and feed it to the
+        // position walk below. Any other shape is ambiguous (we'd have
+        // to guess which grid goes with which run) — reject it.
+        let per_image_offsets: Vec<(usize, (i64, i64, i64, usize))> = if image_runs.len()
+            == num_images
+        {
+            // Case (a): validate per-run length, then pair by ordinal.
+            for (run_idx, (run_start, run_end)) in image_runs.iter().enumerate() {
+                let expected = image_token_info[run_idx].3;
+                let actual = run_end - run_start;
+                if expected != actual {
+                    return Err(Error::new(
+                        Status::GenericFailure,
+                        format!(
+                            "Image run {run_idx} has {actual} placeholder tokens but its grid expects {expected}",
+                        ),
+                    ));
+                }
+            }
+            image_runs
+                .iter()
+                .zip(image_token_info.iter().copied())
+                .map(|((start, _), info)| (*start, info))
+                .collect()
+        } else if image_runs.len() == 1 {
+            // Case (b): fallback splice — synthesise per-image start
+            // offsets by walking `image_token_info` lengths from the
+            // single run's start. Total was already validated against
+            // `total_expected_tokens` above, so this just distributes
+            // the shared span across the grids.
+            let big_start = image_runs[0].0;
+            let mut offsets = Vec::with_capacity(num_images);
+            let mut cursor = big_start;
+            for info in image_token_info.iter().copied() {
+                offsets.push((cursor, info));
+                cursor += info.3;
+            }
+            offsets
+        } else {
+            return Err(Error::new(
+                Status::GenericFailure,
+                format!(
+                    "Image run layout mismatch: prompt carries {} contiguous image-token runs but {} images \
+                     were processed; expected either one run per image or a single contiguous fallback run \
+                     containing every image's tokens.",
+                    image_runs.len(),
+                    num_images,
+                ),
+            ));
+        };
 
-        // Text before images: sequential
-        for i in 0..image_start {
-            all_position_ids[0].push(i as i64);
-            all_position_ids[1].push(i as i64);
-            all_position_ids[2].push(i as i64);
-        }
+        // End of the last image token in the token stream — everything
+        // beyond is trailing text. For case (a) this is the last run's
+        // end; for case (b) it's the shared run's end. In both cases
+        // it equals `image_runs.last().unwrap().1`.
+        let last_image_end = image_runs.last().expect("at least one run").1;
 
-        // Image tokens: 2D spatial positions
-        let mut current_pos = image_start as i64;
-        let mut max_pos = image_start as i64;
+        // Emit positions by walking the sequence: text gap, image,
+        // text gap, image, … final text gap. `current_pos` carries the
+        // M-RoPE counter forward across both text and image segments so
+        // every token gets a monotonically non-decreasing position id
+        // in each axis. Synthesised case-(b) sub-runs sit back-to-back
+        // so their text-gap loops iterate zero times between them —
+        // the walk collapses naturally.
+        let mut cursor: usize = 0;
+        let mut current_pos: i64 = 0;
 
-        for (llm_grid_t, llm_grid_h, llm_grid_w, _) in &image_token_info {
-            for t_idx in 0..*llm_grid_t {
-                for h_idx in 0..*llm_grid_h {
-                    for w_idx in 0..*llm_grid_w {
-                        all_position_ids[0].push(current_pos + t_idx);
-                        all_position_ids[1].push(current_pos + h_idx);
-                        all_position_ids[2].push(current_pos + w_idx);
+        for (run_start, info) in per_image_offsets.iter().copied() {
+            // Text gap before this image run (zero-length for adjacent
+            // case-(b) sub-runs after the first).
+            for _ in cursor..run_start {
+                all_position_ids[0].push(current_pos);
+                all_position_ids[1].push(current_pos);
+                all_position_ids[2].push(current_pos);
+                current_pos += 1;
+            }
+
+            // Spatial positions for the image at this run
+            let (llm_grid_t, llm_grid_h, llm_grid_w, count) = info;
+            let image_base = current_pos;
+            for t_idx in 0..llm_grid_t {
+                for h_idx in 0..llm_grid_h {
+                    for w_idx in 0..llm_grid_w {
+                        all_position_ids[0].push(image_base + t_idx);
+                        all_position_ids[1].push(image_base + h_idx);
+                        all_position_ids[2].push(image_base + w_idx);
                     }
                 }
             }
-            let img_max = current_pos
-                + std::cmp::max(
-                    *llm_grid_t - 1,
-                    std::cmp::max(*llm_grid_h - 1, *llm_grid_w - 1),
-                );
-            max_pos = std::cmp::max(max_pos, img_max);
-            current_pos = img_max + 1;
+            let max_axis = std::cmp::max(
+                llm_grid_t - 1,
+                std::cmp::max(llm_grid_h - 1, llm_grid_w - 1),
+            );
+            current_pos = image_base + max_axis + 1;
+            cursor = run_start + count;
         }
 
-        // Text after images: continue from max
-        let next_pos = max_pos + 1;
-        for i in image_end..seq_len as usize {
-            let pos = next_pos + (i - image_end) as i64;
-            all_position_ids[0].push(pos);
-            all_position_ids[1].push(pos);
-            all_position_ids[2].push(pos);
+        // Trailing text after the last image (run in case (a), sub-run
+        // end in case (b) — both resolve to `last_image_end`).
+        debug_assert_eq!(cursor, last_image_end);
+        let _ = last_image_end;
+        for _ in cursor..seq_len as usize {
+            all_position_ids[0].push(current_pos);
+            all_position_ids[1].push(current_pos);
+            all_position_ids[2].push(current_pos);
+            current_pos += 1;
         }
     }
 
@@ -5801,4 +6009,321 @@ pub(crate) fn vlm_prepare_vision_features(
     );
 
     Ok((inputs_embeds, position_ids, rope_deltas))
+}
+
+#[cfg(test)]
+mod image_placeholder_tests {
+    use super::*;
+
+    const BOS: u32 = 1;
+    const USER: u32 = 100;
+    const TEXT: u32 = 200;
+    const IMG: u32 = IMAGE_TOKEN_ID as u32;
+
+    #[test]
+    fn expands_single_placeholder_per_image_inline() {
+        // Template emitted: BOS, USER, <|image_pad|>, TEXT
+        // Expected: BOS, USER, <|image_pad|>×5, TEXT  (vision wrapper stays
+        // INSIDE the user turn instead of getting spliced after BOS).
+        let tokens = vec![BOS, USER, IMG, TEXT];
+        let out = inject_image_placeholders(&tokens, &[5]);
+        assert_eq!(out, vec![BOS, USER, IMG, IMG, IMG, IMG, IMG, TEXT]);
+    }
+
+    #[test]
+    fn expands_distinct_grid_counts_for_multiple_images_in_order() {
+        // Two images with different grid sizes — each placeholder must be
+        // replaced by its own image's count, not the other way around.
+        let tokens = vec![BOS, IMG, TEXT, IMG];
+        let out = inject_image_placeholders(&tokens, &[2, 3]);
+        assert_eq!(out, vec![BOS, IMG, IMG, TEXT, IMG, IMG, IMG]);
+    }
+
+    #[test]
+    fn empty_counts_is_passthrough() {
+        let tokens = vec![BOS, USER, TEXT];
+        let out = inject_image_placeholders(&tokens, &[]);
+        assert_eq!(out, tokens);
+    }
+
+    #[test]
+    fn fallback_splices_total_after_bos_when_template_emitted_none() {
+        // Case 3: template didn't emit any placeholder. Fallback splice
+        // preserved for non-VLM templates / silent vision-dropping
+        // templates.
+        let tokens = vec![BOS, USER, TEXT];
+        let out = inject_image_placeholders(&tokens, &[3]);
+        assert_eq!(out, vec![BOS, IMG, IMG, IMG, USER, TEXT]);
+    }
+
+    #[test]
+    fn fully_expanded_input_passes_through_unchanged() {
+        // Case 2: template already emitted the full 5-token run. `existing`
+        // (5) != `per_image.len()` (1) so the "one-per-image" branch
+        // doesn't fire; total (5) matches so no fallback splice either.
+        let tokens = vec![BOS, USER, IMG, IMG, IMG, IMG, IMG, TEXT];
+        let out = inject_image_placeholders(&tokens, &[5]);
+        assert_eq!(out, tokens);
+    }
+
+    #[test]
+    fn preserves_relative_position_of_surrounding_tokens() {
+        // Regression guard: every non-IMG token must survive in its
+        // original relative order.
+        let tokens = vec![BOS, USER, 10, 11, IMG, 12, 13];
+        let out = inject_image_placeholders(&tokens, &[4]);
+        assert_eq!(out, vec![BOS, USER, 10, 11, IMG, IMG, IMG, IMG, 12, 13]);
+    }
+}
+
+#[cfg(test)]
+mod rope_index_tests {
+    //! `get_rope_index` builds M-RoPE position IDs for VLM prefill. The
+    //! pre-fix implementation collapsed every `IMAGE_TOKEN_ID` in the
+    //! prompt to a single contiguous span from `positions[0]` to
+    //! `positions[last]`; a multi-turn history with two image-bearing
+    //! user turns joined by an assistant reply silently skipped every
+    //! interior text token, leaving `all_position_ids` shorter than
+    //! `seq_len` and crashing the downstream reshape with a cryptic
+    //! "length mismatch". These tests pin per-run indexing against that
+    //! regression.
+    use super::*;
+    use crate::array::MxArray;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    const IMG: i32 = IMAGE_TOKEN_ID;
+    const TEXT_A: i32 = 100;
+    const TEXT_B: i32 = 200;
+
+    /// MLX's MPS backend is not re-entrant — every test that touches an
+    /// `MxArray` must hold this mutex so only one such test runs at a
+    /// time across the test binary.
+    fn mlx_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// Encode a flat `Vec<i32>` token stream as a `[1, seq_len]`
+    /// `MxArray` and a `[num_images, 3]` grid array (or `None`) to
+    /// feed `get_rope_index`.
+    fn mk_inputs(tokens: &[i32], grids: &[(i64, i64, i64)]) -> (MxArray, Option<MxArray>) {
+        let seq_len = tokens.len() as i64;
+        let input_ids = MxArray::from_int32(tokens, &[1, seq_len]).unwrap();
+        let grid = if grids.is_empty() {
+            None
+        } else {
+            let flat: Vec<i32> = grids
+                .iter()
+                .flat_map(|(t, h, w)| [*t as i32, *h as i32, *w as i32])
+                .collect();
+            Some(MxArray::from_int32(&flat, &[grids.len() as i64, 3]).unwrap())
+        };
+        (input_ids, grid)
+    }
+
+    fn extract_positions(pos: &MxArray) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
+        // pos shape [3, 1, seq_len] — flatten to Vec<i32> and split.
+        pos.eval();
+        let flat = pos.to_int32().unwrap();
+        let n = flat.len() / 3;
+        (
+            flat[0..n].to_vec(),
+            flat[n..2 * n].to_vec(),
+            flat[2 * n..3 * n].to_vec(),
+        )
+    }
+
+    #[test]
+    fn pure_text_prompt_gets_sequential_positions() {
+        let _g = mlx_lock().lock().unwrap();
+        let tokens = vec![TEXT_A, TEXT_B, TEXT_A, TEXT_B];
+        let (ids, grid) = mk_inputs(&tokens, &[]);
+        let (pos, rope_deltas) = get_rope_index(&ids, grid.as_ref(), 2, IMG).unwrap();
+        let (t, h, w) = extract_positions(&pos);
+        assert_eq!(t, vec![0, 1, 2, 3]);
+        assert_eq!(h, vec![0, 1, 2, 3]);
+        assert_eq!(w, vec![0, 1, 2, 3]);
+        assert_eq!(rope_deltas, 0);
+    }
+
+    #[test]
+    fn single_image_run_preserves_baseline_shape() {
+        let _g = mlx_lock().lock().unwrap();
+        // 2 text + (grid 2x2x2=8 tokens after spatial_merge=2, so t=2,h=4,w=4, split=2
+        //   → llm grid 2×2×2 = 8 image tokens) + 2 text
+        let tokens: Vec<i32> = [TEXT_A, TEXT_B]
+            .iter()
+            .chain(std::iter::repeat_n(&IMG, 8))
+            .chain([TEXT_A, TEXT_B].iter())
+            .copied()
+            .collect();
+        let (ids, grid) = mk_inputs(&tokens, &[(2, 4, 4)]);
+        let (pos, _) = get_rope_index(&ids, grid.as_ref(), 2, IMG).unwrap();
+        let (t, h, w) = extract_positions(&pos);
+        // Leading text
+        assert_eq!(&t[..2], &[0, 1]);
+        assert_eq!(&h[..2], &[0, 1]);
+        // Image span starts at 2; with llm_grid_t=2 h=2 w=2 → max_axis=1
+        // so current_pos advances to 2 + 1 + 1 = 4 after the image.
+        // Trailing text: 4, 5
+        assert_eq!(&t[10..], &[4, 5]);
+        assert_eq!(&h[10..], &[4, 5]);
+        assert_eq!(&w[10..], &[4, 5]);
+    }
+
+    #[test]
+    fn two_image_runs_separated_by_text_emits_every_position() {
+        // THE regression test for the P2 bug — pre-fix this crashed the
+        // downstream reshape with a length mismatch.
+        let _g = mlx_lock().lock().unwrap();
+        let mut tokens: Vec<i32> = Vec::new();
+        tokens.push(TEXT_A); // position 0
+        tokens.extend(std::iter::repeat_n(IMG, 8)); // 1 image → llm 2×2×2=8
+        tokens.push(TEXT_A); // interior text between images
+        tokens.push(TEXT_B);
+        tokens.extend(std::iter::repeat_n(IMG, 8)); // 2nd image → same grid
+        tokens.push(TEXT_A); // trailing text
+
+        let (ids, grid) = mk_inputs(&tokens, &[(2, 4, 4), (2, 4, 4)]);
+        let (pos, _) = get_rope_index(&ids, grid.as_ref(), 2, IMG).unwrap();
+        let (t, _h, _w) = extract_positions(&pos);
+
+        // seq_len == tokens.len() — every token must have a position
+        // (the old single-span path dropped the interior text entries,
+        // which then failed the reshape at the end of get_rope_index).
+        assert_eq!(
+            t.len(),
+            tokens.len(),
+            "position count must equal token count"
+        );
+
+        // Leading text at pos 0
+        assert_eq!(t[0], 0);
+        // Image 1 at base=1, max_axis=1 → current_pos after = 3
+        // Interior text: 3, 4
+        assert_eq!(t[9], 3);
+        assert_eq!(t[10], 4);
+        // Image 2 at base=5, max_axis=1 → current_pos after = 7
+        // Trailing text: 7
+        assert_eq!(*t.last().unwrap(), 7);
+    }
+
+    #[test]
+    fn leading_image_run_no_text_prefix() {
+        let _g = mlx_lock().lock().unwrap();
+        let tokens: Vec<i32> = std::iter::repeat_n(IMG, 8)
+            .chain([TEXT_A, TEXT_B].iter().copied())
+            .collect();
+        let (ids, grid) = mk_inputs(&tokens, &[(2, 4, 4)]);
+        let (pos, _) = get_rope_index(&ids, grid.as_ref(), 2, IMG).unwrap();
+        let (t, _, _) = extract_positions(&pos);
+        assert_eq!(t.len(), tokens.len());
+        // Image at base=0, max_axis=1 → current_pos=2 after, trailing text 2, 3
+        assert_eq!(&t[8..], &[2, 3]);
+    }
+
+    #[test]
+    fn trailing_image_run_no_text_suffix() {
+        let _g = mlx_lock().lock().unwrap();
+        let tokens: Vec<i32> = [TEXT_A, TEXT_B]
+            .iter()
+            .copied()
+            .chain(std::iter::repeat_n(IMG, 8))
+            .collect();
+        let (ids, grid) = mk_inputs(&tokens, &[(2, 4, 4)]);
+        let (pos, _) = get_rope_index(&ids, grid.as_ref(), 2, IMG).unwrap();
+        let (t, _, _) = extract_positions(&pos);
+        assert_eq!(t.len(), tokens.len());
+        assert_eq!(&t[..2], &[0, 1]);
+    }
+
+    #[test]
+    fn run_count_must_match_image_count() {
+        // 2 image runs in the prompt but only 1 grid supplied — ambiguous
+        // pairing; reject.
+        let _g = mlx_lock().lock().unwrap();
+        let mut tokens = vec![TEXT_A];
+        tokens.extend(std::iter::repeat_n(IMG, 4));
+        tokens.push(TEXT_A);
+        tokens.extend(std::iter::repeat_n(IMG, 4));
+        let (ids, grid) = mk_inputs(&tokens, &[(2, 4, 4)]);
+        let err = match get_rope_index(&ids, grid.as_ref(), 2, IMG) {
+            Ok(_) => panic!("expected get_rope_index to error"),
+            Err(e) => e,
+        };
+        assert!(
+            err.reason.contains("Image run layout mismatch"),
+            "got: {}",
+            err.reason
+        );
+    }
+
+    #[test]
+    fn per_run_length_must_match_its_grid_count() {
+        // 2 runs, 2 grids — but run 0 has too few tokens for grid 0.
+        let _g = mlx_lock().lock().unwrap();
+        let mut tokens = vec![TEXT_A];
+        tokens.extend(std::iter::repeat_n(IMG, 4)); // should be 8 for (2,4,4)
+        tokens.push(TEXT_A);
+        tokens.extend(std::iter::repeat_n(IMG, 12)); // compensates the total, but per-run wrong
+        let (ids, grid) = mk_inputs(&tokens, &[(2, 4, 4), (2, 4, 4)]);
+        let err = match get_rope_index(&ids, grid.as_ref(), 2, IMG) {
+            Ok(_) => panic!("expected get_rope_index to error"),
+            Err(e) => e,
+        };
+        assert!(err.reason.contains("Image run 0"), "got: {}", err.reason);
+    }
+
+    #[test]
+    fn multi_image_fallback_single_contiguous_run_is_accepted() {
+        // Fallback case (b): chat template emits zero `<|image_pad|>`
+        // markers and `inject_image_placeholders` crams every image's
+        // tokens into a single splice after BOS. For N images with
+        // distinct grids, the prompt carries ONE big contiguous run of
+        // `sum(per_image_counts)` image tokens. The old strict guard
+        // rejected this as "run layout mismatch" even though it was
+        // the legitimate fallback layout that previously worked via
+        // the old single-span position walk. The new path synthesises
+        // per-image sub-run offsets from the shared span and emits
+        // correct M-RoPE positions for each image.
+        let _g = mlx_lock().lock().unwrap();
+        // Two 1×2×2 grids → 4 image tokens each, 8 total.
+        let mut tokens = vec![TEXT_A];
+        tokens.extend(std::iter::repeat_n(IMG, 8));
+        tokens.push(TEXT_B);
+        let (ids, grid) = mk_inputs(&tokens, &[(1, 4, 4), (1, 4, 4)]);
+        let (pos, _) = get_rope_index(&ids, grid.as_ref(), 2, IMG)
+            .expect("fallback single-run layout for two images must be accepted");
+        let (t, _, _) = extract_positions(&pos);
+        assert_eq!(t.len(), tokens.len(), "every token must have a position");
+        // Leading text at 0.
+        assert_eq!(t[0], 0);
+        // First image base = 1, llm grid 1×2×2, max_axis=1 → current_pos
+        // after = 3. Next image base = 3, max_axis=1 → current_pos
+        // after = 5. Trailing TEXT_B at 5.
+        assert_eq!(*t.last().unwrap(), 5);
+    }
+
+    #[test]
+    fn multi_image_fallback_with_distinct_grids_preserves_per_image_offsets() {
+        // Same fallback shape but with DIFFERENT grid sizes per image —
+        // the synthesised sub-run offsets must distribute the shared
+        // span correctly (image[0] consumes its own count tokens,
+        // image[1] starts right after).
+        let _g = mlx_lock().lock().unwrap();
+        // image 0: 1×2×2 → 4 tokens. image 1: 1×4×4 → 16 tokens. Total 20.
+        let mut tokens = vec![TEXT_A];
+        tokens.extend(std::iter::repeat_n(IMG, 20));
+        tokens.push(TEXT_B);
+        let (ids, grid) = mk_inputs(&tokens, &[(1, 4, 4), (1, 8, 8)]);
+        let (pos, _) = get_rope_index(&ids, grid.as_ref(), 2, IMG)
+            .expect("fallback layout with distinct per-image grids must succeed");
+        let (t, _, _) = extract_positions(&pos);
+        assert_eq!(t.len(), tokens.len());
+        assert_eq!(t[0], 0);
+        // image 0 base=1, max_axis = max(0,1,1) = 1 → current_pos = 3
+        // image 1 base=3, max_axis = max(0,3,3) = 3 → current_pos = 7
+        // Trailing TEXT_B at 7.
+        assert_eq!(*t.last().unwrap(), 7);
+    }
 }

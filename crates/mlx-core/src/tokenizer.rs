@@ -662,7 +662,14 @@ impl Qwen3Tokenizer {
 
     /// Sanitize all messages (role validation + content injection prevention).
     /// Called once before any formatting path to ensure consistent security.
-    /// Note: images are not cloned as they are not used in template formatting.
+    ///
+    /// Images are preserved (cloned byte-for-byte) — VLM Jinja templates
+    /// need them to emit the `<|vision_start|><|image_pad|><|vision_end|>`
+    /// wrapper inline in the user turn via
+    /// [`serialize_message_for_jinja`]. `Uint8Array` has no `Clone` impl
+    /// (it holds a raw JS buffer reference), so we rebuild each array
+    /// with `with_data_copied` from its underlying slice. Byte content
+    /// is not subject to ChatML text sanitisation.
     fn sanitize_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
         messages
             .iter()
@@ -672,7 +679,11 @@ impl Qwen3Tokenizer {
                 tool_calls: msg.tool_calls.clone(),
                 tool_call_id: msg.tool_call_id.clone(),
                 reasoning_content: msg.reasoning_content.clone(),
-                images: None,
+                images: msg.images.as_ref().map(|imgs| {
+                    imgs.iter()
+                        .map(|img| Uint8Array::with_data_copied(img.as_ref()))
+                        .collect()
+                }),
             })
             .collect()
     }
@@ -948,56 +959,8 @@ impl Qwen3Tokenizer {
         });
 
         // Convert messages to JSON-serializable format (already sanitized by caller)
-        let messages_value: Vec<serde_json::Value> = messages
-            .iter()
-            .map(|msg| {
-                let mut obj = serde_json::Map::new();
-                obj.insert("role".to_string(), serde_json::json!(msg.role));
-                obj.insert("content".to_string(), serde_json::json!(msg.content));
-
-                if let Some(tool_calls) = &msg.tool_calls {
-                    let calls: Vec<serde_json::Value> = tool_calls
-                        .iter()
-                        .map(|tc| {
-                            let mut call_obj = serde_json::Map::new();
-                            if let Some(id) = &tc.id {
-                                call_obj.insert("id".to_string(), serde_json::json!(id));
-                            }
-                            // Flat format (backward compat with some templates)
-                            call_obj.insert("name".to_string(), serde_json::json!(tc.name));
-                            // Parse arguments
-                            let args_value =
-                                serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                                    .unwrap_or_else(|_| serde_json::json!(tc.arguments));
-                            call_obj.insert("arguments".to_string(), args_value.clone());
-                            // Wrapped format (Gemma4/OpenAI standard: tool_call.function.name)
-                            call_obj.insert(
-                                "function".to_string(),
-                                serde_json::json!({
-                                    "name": tc.name,
-                                    "arguments": args_value,
-                                }),
-                            );
-                            serde_json::Value::Object(call_obj)
-                        })
-                        .collect();
-                    obj.insert("tool_calls".to_string(), serde_json::json!(calls));
-                }
-
-                if let Some(tool_call_id) = &msg.tool_call_id {
-                    obj.insert("tool_call_id".to_string(), serde_json::json!(tool_call_id));
-                }
-
-                if let Some(reasoning) = &msg.reasoning_content {
-                    obj.insert(
-                        "reasoning_content".to_string(),
-                        serde_json::json!(reasoning),
-                    );
-                }
-
-                serde_json::Value::Object(obj)
-            })
-            .collect();
+        let messages_value: Vec<serde_json::Value> =
+            messages.iter().map(serialize_message_for_jinja).collect();
 
         // Build context for Jinja2 template
         // Note: enable_thinking defaults to true to allow model to think naturally.
@@ -1263,6 +1226,82 @@ impl Qwen3Tokenizer {
     }
 }
 
+/// Serialize a single `ChatMessage` into the shape Jinja chat templates
+/// expect.
+///
+/// Mirrors the Python reference `mlx-vlm/mlx_vlm/prompt_utils.py`'s
+/// `_format_list_with_image`: when a `user` message carries one or more
+/// images, `content` is rendered as a content-parts array
+/// `[{type:"text", text:...}, {type:"image"}, ...]` so VLM Jinja templates
+/// (Qwen3/3.5/3.6 VL, Gemma4, etc.) emit the `<|vision_start|>
+/// <|image_pad|><|vision_end|>` wrapper inline in the user turn.
+/// Otherwise `content` stays a plain string — preserving byte-for-byte
+/// parity with every text-only template path.
+///
+/// `msg.images` is `#[serde(skip)]` so a direct `serde_json::to_value(msg)`
+/// would drop images entirely, which is why this helper exists.
+pub(crate) fn serialize_message_for_jinja(msg: &ChatMessage) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("role".to_string(), serde_json::json!(msg.role));
+
+    let has_images = msg.images.as_ref().is_some_and(|imgs| !imgs.is_empty());
+
+    if has_images && msg.role == "user" {
+        let mut parts: Vec<serde_json::Value> = Vec::new();
+        if !msg.content.is_empty() {
+            parts.push(serde_json::json!({ "type": "text", "text": msg.content }));
+        }
+        // SAFETY: `is_some_and` above ensured this is Some and non-empty.
+        for _ in msg.images.as_ref().unwrap() {
+            parts.push(serde_json::json!({ "type": "image" }));
+        }
+        obj.insert("content".to_string(), serde_json::Value::Array(parts));
+    } else {
+        obj.insert("content".to_string(), serde_json::json!(msg.content));
+    }
+
+    if let Some(tool_calls) = &msg.tool_calls {
+        let calls: Vec<serde_json::Value> = tool_calls
+            .iter()
+            .map(|tc| {
+                let mut call_obj = serde_json::Map::new();
+                if let Some(id) = &tc.id {
+                    call_obj.insert("id".to_string(), serde_json::json!(id));
+                }
+                // Flat format (backward compat with some templates)
+                call_obj.insert("name".to_string(), serde_json::json!(tc.name));
+                // Parse arguments
+                let args_value = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                    .unwrap_or_else(|_| serde_json::json!(tc.arguments));
+                call_obj.insert("arguments".to_string(), args_value.clone());
+                // Wrapped format (Gemma4/OpenAI standard: tool_call.function.name)
+                call_obj.insert(
+                    "function".to_string(),
+                    serde_json::json!({
+                        "name": tc.name,
+                        "arguments": args_value,
+                    }),
+                );
+                serde_json::Value::Object(call_obj)
+            })
+            .collect();
+        obj.insert("tool_calls".to_string(), serde_json::json!(calls));
+    }
+
+    if let Some(tool_call_id) = &msg.tool_call_id {
+        obj.insert("tool_call_id".to_string(), serde_json::json!(tool_call_id));
+    }
+
+    if let Some(reasoning) = &msg.reasoning_content {
+        obj.insert(
+            "reasoning_content".to_string(),
+            serde_json::json!(reasoning),
+        );
+    }
+
+    serde_json::Value::Object(obj)
+}
+
 fn encoding_to_uint32_array<'env>(
     env: &'env Env,
     encoding: Encoding,
@@ -1278,5 +1317,267 @@ fn encoding_to_uint32_array<'env>(
                 drop(encoding);
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use minijinja::{Environment, context};
+
+    fn user_msg(content: &str, num_images: usize) -> ChatMessage {
+        let images = if num_images > 0 {
+            Some(
+                (0..num_images)
+                    .map(|i| Uint8Array::new(vec![i as u8; 4]))
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        ChatMessage {
+            role: "user".to_string(),
+            content: content.to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            images,
+        }
+    }
+
+    #[test]
+    fn text_only_user_renders_content_as_string() {
+        // Preserves the existing shape for every text-only template path —
+        // any change here would fork the byte-for-byte parity the
+        // text-only suite (Qwen3, Qwen3.5, LFM2, Gemma4) relies on.
+        let msg = user_msg("Hello", 0);
+        let v = serialize_message_for_jinja(&msg);
+        assert_eq!(v["role"], "user");
+        assert!(v["content"].is_string());
+        assert_eq!(v["content"], "Hello");
+    }
+
+    #[test]
+    fn user_with_one_image_emits_content_array_with_text_and_image() {
+        let msg = user_msg("Describe this.", 1);
+        let v = serialize_message_for_jinja(&msg);
+        assert_eq!(v["role"], "user");
+        let parts = v["content"].as_array().expect("content is an array");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "Describe this.");
+        assert_eq!(parts[1]["type"], "image");
+    }
+
+    #[test]
+    fn user_with_multiple_images_emits_one_image_part_per_image() {
+        let msg = user_msg("Compare.", 3);
+        let v = serialize_message_for_jinja(&msg);
+        let parts = v["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 4);
+        assert_eq!(parts[0]["type"], "text");
+        for (i, part) in parts.iter().enumerate().skip(1) {
+            assert_eq!(part["type"], "image", "part {i} should be image");
+        }
+    }
+
+    #[test]
+    fn user_image_without_text_omits_text_part() {
+        // Empty content + one image → just the image part, no empty text
+        // block. Matches mlx-vlm's `_format_list_with_image` output.
+        let msg = user_msg("", 1);
+        let v = serialize_message_for_jinja(&msg);
+        let parts = v["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"], "image");
+    }
+
+    #[test]
+    fn non_user_role_with_images_keeps_content_as_string() {
+        // Only the user turn should ever ship images in practice; system /
+        // assistant / tool keep their flat `content: string` shape so
+        // templates that don't expect arrays on those roles keep working.
+        let mut msg = user_msg("A reply", 2);
+        msg.role = "assistant".to_string();
+        let v = serialize_message_for_jinja(&msg);
+        assert!(v["content"].is_string());
+        assert_eq!(v["content"], "A reply");
+    }
+
+    #[test]
+    fn user_images_none_is_equivalent_to_text_only() {
+        let mut msg = user_msg("Hi", 0);
+        msg.images = None;
+        let v = serialize_message_for_jinja(&msg);
+        assert_eq!(v["content"], "Hi");
+    }
+
+    #[test]
+    fn user_images_empty_vec_is_equivalent_to_text_only() {
+        // `is_some_and(|imgs| !imgs.is_empty())` must reject Some([]) too,
+        // or the array branch would emit a content-array with just the
+        // text part and trip downstream Jinja templates that only branch
+        // on string-vs-array.
+        let mut msg = user_msg("Hi", 0);
+        msg.images = Some(Vec::new());
+        let v = serialize_message_for_jinja(&msg);
+        assert_eq!(v["content"], "Hi");
+    }
+
+    /// Render a minimal Jinja template that mimics the relevant slice of
+    /// the Qwen3.6 VL chat template (see
+    /// `.cache/models/Qwen3.6-35b-a3b-UD-Q4_K_XL-mlx/chat_template.jinja`)
+    /// to verify the content-array path actually produces the vision
+    /// wrapper inline inside the user turn — not spliced after BOS by the
+    /// `inject_image_placeholders` fallback.
+    #[test]
+    fn rendered_prompt_includes_vision_wrapper_for_user_image() {
+        let template = r#"{%- for message in messages -%}
+<|im_start|>{{ message.role }}
+{%- if message.content is string -%}
+{{ message.content }}
+{%- else -%}
+{%- for item in message.content -%}
+{%- if 'image' in item or item.type == 'image' -%}
+<|vision_start|><|image_pad|><|vision_end|>
+{%- elif 'text' in item -%}
+{{ item.text }}
+{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+<|im_end|>
+{% endfor -%}"#;
+
+        let mut env = Environment::new();
+        env.add_template("chat", template).unwrap();
+        let tmpl = env.get_template("chat").unwrap();
+
+        let msg = user_msg("What is this?", 1);
+        let messages_value: Vec<serde_json::Value> = vec![serialize_message_for_jinja(&msg)];
+
+        let rendered = tmpl
+            .render(context! { messages => messages_value })
+            .unwrap();
+
+        assert!(
+            rendered.contains("<|vision_start|><|image_pad|><|vision_end|>"),
+            "rendered prompt missing vision wrapper:\n{rendered}",
+        );
+        // The wrapper must land INSIDE the user turn, after the text.
+        let start_idx = rendered.find("<|im_start|>user").unwrap();
+        let end_idx = rendered[start_idx..].find("<|im_end|>").unwrap() + start_idx;
+        let user_turn = &rendered[start_idx..end_idx];
+        assert!(
+            user_turn.contains("<|vision_start|>"),
+            "vision wrapper not inside user turn: {user_turn}",
+        );
+        assert!(
+            user_turn.contains("What is this?"),
+            "user text missing from user turn: {user_turn}",
+        );
+    }
+
+    /// `sanitize_messages` sits between `apply_chat_template(_sync)` and
+    /// `render_chat_template_jinja2` on every production path. If it
+    /// zeroes `images`, `serialize_message_for_jinja` sees
+    /// `msg.images: None` and the VLM content-array branch never fires,
+    /// so the template falls back to the post-BOS `inject_image_placeholders`
+    /// splice (vision tokens outside the user turn). Guard against that
+    /// regression directly.
+    #[test]
+    fn sanitize_messages_preserves_user_images_byte_for_byte() {
+        let original = vec![
+            ChatMessage {
+                role: "user".to_string(),
+                content: "describe these".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                images: Some(vec![
+                    Uint8Array::new(vec![0x01, 0x02, 0x03, 0x04]),
+                    Uint8Array::new(vec![0xaa, 0xbb, 0xcc]),
+                ]),
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "ok".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                images: None,
+            },
+        ];
+
+        let sanitized = Qwen3Tokenizer::sanitize_messages_public(&original);
+
+        assert_eq!(sanitized.len(), 2);
+        let user = &sanitized[0];
+        assert_eq!(user.role, "user");
+        let imgs = user
+            .images
+            .as_ref()
+            .expect("user images must survive sanitise");
+        assert_eq!(imgs.len(), 2);
+        assert_eq!(imgs[0].as_ref(), &[0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(imgs[1].as_ref(), &[0xaa, 0xbb, 0xcc]);
+
+        // assistant path unchanged: still None.
+        assert!(sanitized[1].images.is_none());
+    }
+
+    /// End-to-end: sanitize → serialize → Jinja render. Covers the exact
+    /// composition production runs every turn. The direct-serialize test
+    /// above only proves the helper itself is correct — this one proves
+    /// the production chain is correct.
+    #[test]
+    fn sanitize_then_render_emits_vision_wrapper_in_user_turn() {
+        let template = r#"{%- for message in messages -%}
+<|im_start|>{{ message.role }}
+{%- if message.content is string -%}
+{{ message.content }}
+{%- else -%}
+{%- for item in message.content -%}
+{%- if 'image' in item or item.type == 'image' -%}
+<|vision_start|><|image_pad|><|vision_end|>
+{%- elif 'text' in item -%}
+{{ item.text }}
+{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+<|im_end|>
+{% endfor -%}"#;
+
+        let mut env = Environment::new();
+        env.add_template("chat", template).unwrap();
+        let tmpl = env.get_template("chat").unwrap();
+
+        let msgs = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "What is this?".to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            images: Some(vec![Uint8Array::new(vec![0; 4])]),
+        }];
+
+        let sanitized = Qwen3Tokenizer::sanitize_messages_public(&msgs);
+        let messages_value: Vec<serde_json::Value> =
+            sanitized.iter().map(serialize_message_for_jinja).collect();
+
+        let rendered = tmpl
+            .render(context! { messages => messages_value })
+            .unwrap();
+
+        let start_idx = rendered.find("<|im_start|>user").unwrap();
+        let end_idx = rendered[start_idx..].find("<|im_end|>").unwrap() + start_idx;
+        let user_turn = &rendered[start_idx..end_idx];
+        assert!(
+            user_turn.contains("<|vision_start|><|image_pad|><|vision_end|>"),
+            "vision wrapper not inside user turn after sanitize: {user_turn}",
+        );
+        assert!(
+            user_turn.contains("What is this?"),
+            "user text missing from user turn after sanitize: {user_turn}",
+        );
     }
 }

@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vite-plus/test';
 
-import { mapRequest, reconstructMessagesFromChain } from '../../packages/server/src/mappers/request.js';
+import {
+  mapRequest,
+  reconstructMessagesFromChain,
+  stringifyStoredInputMessages,
+} from '../../packages/server/src/mappers/request.js';
 
 describe('mapRequest', () => {
   it('maps a string input to a single user message', () => {
@@ -512,6 +516,314 @@ describe('mapRequest', () => {
       ]);
     });
   });
+
+  describe('assistant history replay (client-echoed input[])', () => {
+    it('accepts output_text content parts when a client replays an assistant message', () => {
+      // Clients that do not use `previous_response_id` (pi-ai, Codex) replay
+      // the prior assistant turn as `{type:"message",role:"assistant",content:[{type:"output_text",...}]}`.
+      // Rejecting output_text breaks cold-start multi-turn outright.
+      const { messages } = mapRequest({
+        model: 'test-model',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Remember 42.' }] },
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: "Got it. I'll remember 42.", annotations: [] }],
+          } as any,
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'What number?' }] },
+        ],
+      });
+
+      expect(messages).toEqual([
+        { role: 'user', content: 'Remember 42.' },
+        { role: 'assistant', content: "Got it. I'll remember 42." },
+        { role: 'user', content: 'What number?' },
+      ]);
+    });
+
+    it('coalesces a replayed reasoning item onto the trailing assistant message', () => {
+      // Real pi-ai payload shape: user → reasoning → message(assistant) → user.
+      // The reasoning summary must land as `reasoningContent` on the assistant turn.
+      const { messages } = mapRequest({
+        model: 'test-model',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Hi' }] },
+          {
+            type: 'reasoning',
+            id: 'rs_1',
+            summary: [{ type: 'summary_text', text: 'Let me think briefly.' }],
+          } as any,
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Hello!', annotations: [] }],
+          } as any,
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Bye' }] },
+        ],
+      });
+
+      expect(messages).toEqual([
+        { role: 'user', content: 'Hi' },
+        { role: 'assistant', content: 'Hello!', reasoningContent: 'Let me think briefly.' },
+        { role: 'user', content: 'Bye' },
+      ]);
+    });
+
+    it('coalesces reasoning + function_call into one assistant turn', () => {
+      const { messages } = mapRequest({
+        model: 'test-model',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Weather in SF?' }] },
+          {
+            type: 'reasoning',
+            summary: [{ type: 'summary_text', text: 'Tool required.' }],
+          } as any,
+          {
+            type: 'function_call',
+            id: 'fc-1',
+            call_id: 'call_a',
+            name: 'get_weather',
+            arguments: '{"city":"SF"}',
+          },
+        ],
+      });
+
+      expect(messages).toEqual([
+        { role: 'user', content: 'Weather in SF?' },
+        {
+          role: 'assistant',
+          content: '',
+          reasoningContent: 'Tool required.',
+          toolCalls: [{ name: 'get_weather', arguments: '{"city":"SF"}', id: 'call_a' }],
+        },
+      ]);
+    });
+
+    it('emits reasoning-only turn as a standalone assistant message when no trailing content', () => {
+      // Turn 1 ran out of budget inside thinking → client replays a lone reasoning item.
+      const { messages } = mapRequest({
+        model: 'test-model',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Think briefly.' }] },
+          {
+            type: 'reasoning',
+            summary: [{ type: 'summary_text', text: 'thinking only.' }],
+          } as any,
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Continue.' }] },
+        ],
+      });
+
+      expect(messages).toEqual([
+        { role: 'user', content: 'Think briefly.' },
+        { role: 'assistant', content: '', reasoningContent: 'thinking only.' },
+        { role: 'user', content: 'Continue.' },
+      ]);
+    });
+
+    it('treats a replayed refusal part as text for model re-ingestion', () => {
+      const { messages } = mapRequest({
+        model: 'test-model',
+        input: [
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'refusal', refusal: 'I cannot help with that.' }],
+          } as any,
+        ],
+      });
+
+      expect(messages).toEqual([{ role: 'assistant', content: 'I cannot help with that.' }]);
+    });
+  });
+
+  describe('input_image content parts', () => {
+    it('decodes a base64 data URL into raw image bytes attached to the user turn', () => {
+      // 2x2 red PNG.
+      const b64 =
+        'iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAFUlEQVR4nGP8z8DwnwEDMGEKDQYxAEiRAP9t2B9IAAAAAElFTkSuQmCC';
+      const { messages } = mapRequest({
+        model: 'test-model',
+        input: [
+          {
+            type: 'message',
+            role: 'user',
+            content: [
+              { type: 'input_text', text: 'What is in this image?' },
+              { type: 'input_image', image_url: `data:image/png;base64,${b64}` },
+            ],
+          },
+        ],
+      });
+
+      expect(messages).toHaveLength(1);
+      const u = messages[0];
+      expect(u.role).toBe('user');
+      expect(u.content).toBe('What is in this image?');
+      expect(u.images).toBeDefined();
+      expect(u.images).toHaveLength(1);
+      expect(Buffer.from(u.images![0]).subarray(0, 4)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    });
+
+    it('rejects input_image with a remote http(s) URL', () => {
+      expect(() =>
+        mapRequest({
+          model: 'test-model',
+          input: [
+            {
+              type: 'message',
+              role: 'user',
+              content: [{ type: 'input_image', image_url: 'https://example.com/cat.png' }],
+            },
+          ],
+        }),
+      ).toThrow(/base64 data URL/);
+    });
+
+    it('rejects input_image attached to a non-user message', () => {
+      expect(() =>
+        mapRequest({
+          model: 'test-model',
+          input: [
+            {
+              type: 'message',
+              role: 'assistant',
+              content: [{ type: 'input_image', image_url: 'data:image/png;base64,AA==' }],
+            } as any,
+          ],
+        }),
+      ).toThrow(/only allowed on user messages/);
+    });
+  });
+
+  describe('text/image part ordering', () => {
+    // The flat internal `ChatMessage` shape cannot express a text part
+    // that appears AFTER an image part in the same message: the
+    // downstream Jinja serializer always renders text first, then all
+    // images. Reject ambiguous orderings rather than silently reorder
+    // them and change the caller's intent. Mirrors the rejection in
+    // `anthropic-request.ts` for its own user-turn shape.
+    const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+
+    it('rejects [input_text, input_image, input_text] (text after image)', () => {
+      expect(() =>
+        mapRequest({
+          model: 'test-model',
+          input: [
+            {
+              type: 'message',
+              role: 'user',
+              content: [
+                { type: 'input_text', text: 'before' },
+                { type: 'input_image', image_url: `data:image/png;base64,${png}` },
+                { type: 'input_text', text: 'after' },
+              ],
+            },
+          ],
+        }),
+      ).toThrow(/text content part after an image part in the same message/i);
+    });
+
+    it('rejects [input_image, input_text] (image first, text after)', () => {
+      // Silently reordering `[image, text]` to `[text, image]` would flip
+      // caption-vs-question framing for VLM prompts.
+      expect(() =>
+        mapRequest({
+          model: 'test-model',
+          input: [
+            {
+              type: 'message',
+              role: 'user',
+              content: [
+                { type: 'input_image', image_url: `data:image/png;base64,${png}` },
+                { type: 'input_text', text: 'what is this?' },
+              ],
+            },
+          ],
+        }),
+      ).toThrow(/text content part after an image part/i);
+    });
+
+    it('rejects [output_text, input_image, output_text] on replayed assistant messages', () => {
+      // `output_text` is a text-like part too. Reject text-after-image
+      // uniformly regardless of the text variant.
+      expect(() =>
+        mapRequest({
+          model: 'test-model',
+          input: [
+            {
+              type: 'message',
+              role: 'user',
+              content: [
+                { type: 'output_text', text: 'before', annotations: [] },
+                { type: 'input_image', image_url: `data:image/png;base64,${png}` },
+                { type: 'output_text', text: 'after', annotations: [] },
+              ],
+            } as any,
+          ],
+        }),
+      ).toThrow(/text content part after an image part/i);
+    });
+
+    it('accepts [input_text, input_image] (text before image — representable)', () => {
+      const { messages } = mapRequest({
+        model: 'test-model',
+        input: [
+          {
+            type: 'message',
+            role: 'user',
+            content: [
+              { type: 'input_text', text: 'what colour?' },
+              { type: 'input_image', image_url: `data:image/png;base64,${png}` },
+            ],
+          },
+        ],
+      });
+      expect(messages).toHaveLength(1);
+      expect(messages[0].content).toBe('what colour?');
+      expect(messages[0].images).toHaveLength(1);
+    });
+
+    it('accepts [input_text, input_text, input_image, input_image] (all text before all images)', () => {
+      const { messages } = mapRequest({
+        model: 'test-model',
+        input: [
+          {
+            type: 'message',
+            role: 'user',
+            content: [
+              { type: 'input_text', text: 'compare ' },
+              { type: 'input_text', text: 'these:' },
+              { type: 'input_image', image_url: `data:image/png;base64,${png}` },
+              { type: 'input_image', image_url: `data:image/png;base64,${png}` },
+            ],
+          },
+        ],
+      });
+      expect(messages).toHaveLength(1);
+      expect(messages[0].content).toBe('compare these:');
+      expect(messages[0].images).toHaveLength(2);
+    });
+
+    it('accepts images-only content (no ordering ambiguity)', () => {
+      const { messages } = mapRequest({
+        model: 'test-model',
+        input: [
+          {
+            type: 'message',
+            role: 'user',
+            content: [
+              { type: 'input_image', image_url: `data:image/png;base64,${png}` },
+              { type: 'input_image', image_url: `data:image/png;base64,${png}` },
+            ],
+          },
+        ],
+      });
+      expect(messages).toHaveLength(1);
+      expect(messages[0].content).toBe('');
+      expect(messages[0].images).toHaveLength(2);
+    });
+  });
 });
 
 describe('reconstructMessagesFromChain', () => {
@@ -772,5 +1084,114 @@ describe('reconstructMessagesFromChain', () => {
     // Pin that `reasoningContent` is absent, not present-but-empty — some downstream
     // paths distinguish `undefined` from `''` when deciding whether to emit <think>.
     expect(messages[1]).not.toHaveProperty('reasoningContent');
+  });
+});
+
+describe('stored-input codec (images round-trip)', () => {
+  // `StoredResponseRecord.inputJson` is serialised with
+  // `stringifyStoredInputMessages` and re-parsed by
+  // `reconstructMessagesFromChain`. Plain `JSON.stringify` would turn
+  // `Uint8Array([1,2,3])` into `{"0":1,"1":2,"2":3}`, which fails the
+  // NAPI `Uint8Array` coercion on cold replay through
+  // `previous_response_id` chains that carry images. Guard that
+  // round-trip here.
+  it('encodes Uint8Array images as base64 in the stored JSON', () => {
+    const msgs = [
+      {
+        role: 'user' as const,
+        content: 'look',
+        images: [new Uint8Array([0xff, 0x00, 0x01, 0x02])],
+      },
+    ];
+    const json = stringifyStoredInputMessages(msgs);
+    const parsedRaw = JSON.parse(json);
+    expect(parsedRaw[0].images).toHaveLength(1);
+    expect(parsedRaw[0].images[0]).toEqual({ __u8__: Buffer.from([0xff, 0x00, 0x01, 0x02]).toString('base64') });
+    // Regression guard: the legacy numeric-keyed shape MUST NOT appear.
+    expect(parsedRaw[0].images[0]).not.toHaveProperty('0');
+  });
+
+  it('reconstructs images back to Uint8Array instances with identical bytes', () => {
+    const bytes = new Uint8Array([10, 20, 30, 40, 50]);
+    const inputJson = stringifyStoredInputMessages([
+      {
+        role: 'user',
+        content: 'round-trip me',
+        images: [bytes],
+      },
+    ]);
+    const [msg] = reconstructMessagesFromChain([{ inputJson, outputJson: '[]' }]);
+    expect(msg.role).toBe('user');
+    expect(msg.images).toBeDefined();
+    expect(msg.images).toHaveLength(1);
+    // `Buffer.from(_, 'base64')` returns a Uint8Array subclass — satisfies
+    // the NAPI `Array<Uint8Array>` type check downstream.
+    expect(msg.images![0]).toBeInstanceOf(Uint8Array);
+    expect(Array.from(msg.images![0])).toEqual(Array.from(bytes));
+  });
+
+  it('preserves multiple images across round-trip in order', () => {
+    const inputJson = stringifyStoredInputMessages([
+      {
+        role: 'user',
+        content: 'compare',
+        images: [new Uint8Array([1]), new Uint8Array([2, 2]), new Uint8Array([3, 3, 3])],
+      },
+    ]);
+    const [msg] = reconstructMessagesFromChain([{ inputJson, outputJson: '[]' }]);
+    expect(msg.images).toHaveLength(3);
+    expect(Array.from(msg.images![0])).toEqual([1]);
+    expect(Array.from(msg.images![1])).toEqual([2, 2]);
+    expect(Array.from(msg.images![2])).toEqual([3, 3, 3]);
+  });
+
+  it('leaves image-less messages unchanged (byte-for-byte parity with plain JSON.stringify)', () => {
+    const msgs = [
+      { role: 'user' as const, content: 'no images here' },
+      { role: 'assistant' as const, content: 'reply' },
+    ];
+    expect(stringifyStoredInputMessages(msgs)).toBe(JSON.stringify(msgs));
+  });
+
+  it('does not rehydrate unrelated objects that happen to carry a __u8__ key', () => {
+    // Defensive: the reviver keys on the exact sentinel shape
+    // `{__u8__: "<base64>"}`. A user-supplied message whose `content`
+    // is a literal JSON string containing that substring must not be
+    // transformed — the sentinel only appears inside the `images` array,
+    // and only via `stringifyStoredInputMessages`.
+    const inputJson = JSON.stringify([{ role: 'user', content: 'here is a fake sentinel: {"__u8__":"deadbeef"}' }]);
+    const [msg] = reconstructMessagesFromChain([{ inputJson, outputJson: '[]' }]);
+    expect(typeof msg.content).toBe('string');
+    expect(msg.content).toContain('__u8__');
+    expect(msg.images).toBeUndefined();
+  });
+
+  it('round-trips images when they arrive as Node Buffer (matches mapRequest output)', () => {
+    // Regression guard: `resolveMessageContent` used to push raw `Buffer`
+    // instances into `msg.images`. `Buffer.prototype.toJSON` is invoked
+    // by `JSON.stringify` BEFORE the replacer, so a naive
+    // `value instanceof Uint8Array` check would skip the sentinel even
+    // though `Buffer extends Uint8Array` at the class level. The
+    // replacer must handle the `{type:"Buffer",data:[...]}` shape too
+    // so stored history stays rehydratable regardless of which producer
+    // built the ChatMessage.
+    const bytes = [0xde, 0xad, 0xbe, 0xef];
+    const inputJson = stringifyStoredInputMessages([
+      {
+        role: 'user',
+        content: 'buffer input',
+        images: [Buffer.from(bytes) as unknown as Uint8Array],
+      },
+    ]);
+    // Wire shape must be the sentinel, NOT `{type:"Buffer",data:[...]}`.
+    const wire = JSON.parse(inputJson);
+    expect(wire[0].images[0]).toEqual({ __u8__: Buffer.from(bytes).toString('base64') });
+    expect(wire[0].images[0]).not.toHaveProperty('type');
+    expect(wire[0].images[0]).not.toHaveProperty('data');
+
+    const [msg] = reconstructMessagesFromChain([{ inputJson, outputJson: '[]' }]);
+    expect(msg.images).toHaveLength(1);
+    expect(msg.images![0]).toBeInstanceOf(Uint8Array);
+    expect(Array.from(msg.images![0])).toEqual(bytes);
   });
 });

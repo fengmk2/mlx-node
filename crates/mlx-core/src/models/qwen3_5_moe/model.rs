@@ -11,7 +11,7 @@ use crate::model_thread::{ResponseTx, StreamTx};
 use crate::models::paddleocr_vl::processing::ProcessedImages;
 use crate::models::qwen3_5::model::{
     ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle, VisionCache, VisionCacheInner,
-    compute_num_image_tokens, eval_layer_caches, extract_images_from_messages,
+    compute_image_token_counts_per_image, eval_layer_caches, extract_images_from_messages,
     inject_image_placeholders, vlm_prepare_vision_features,
 };
 use crate::models::qwen3_5::processing::Qwen35VLImageProcessor;
@@ -724,8 +724,9 @@ impl Qwen35MoeInner {
                 let all_images = extract_images_from_messages(&messages);
                 let image_refs: Vec<&[u8]> = all_images.iter().map(|v| v.as_slice()).collect();
                 let processed_pre = img_proc.process_many(&image_refs)?;
-                let num_image_tokens = compute_num_image_tokens(&processed_pre.grid_thw(), sms)?;
-                let expanded = inject_image_placeholders(&tokens, num_image_tokens);
+                let per_image_token_counts =
+                    compute_image_token_counts_per_image(&processed_pre.grid_thw(), sms)?;
+                let expanded = inject_image_placeholders(&tokens, &per_image_token_counts);
                 let cache_key = compute_image_cache_key(&all_images);
                 (expanded, cache_key, Some(processed_pre))
             } else {
@@ -1223,8 +1224,9 @@ impl Qwen35MoeInner {
                 let all_images = extract_images_from_messages(&messages);
                 let image_refs: Vec<&[u8]> = all_images.iter().map(|v| v.as_slice()).collect();
                 let processed_pre = img_proc.process_many(&image_refs)?;
-                let num_image_tokens = compute_num_image_tokens(&processed_pre.grid_thw(), sms)?;
-                let expanded = inject_image_placeholders(&tokens, num_image_tokens);
+                let per_image_token_counts =
+                    compute_image_token_counts_per_image(&processed_pre.grid_thw(), sms)?;
+                let expanded = inject_image_placeholders(&tokens, &per_image_token_counts);
                 let cache_key = compute_image_cache_key(&all_images);
                 (expanded, cache_key, Some(processed_pre))
             } else {
@@ -1776,11 +1778,13 @@ impl Qwen35MoeInner {
                 "chat_tokens_delta_sync requires a non-empty delta",
             ));
         }
-        if self.cached_image_key.is_some() {
-            return Err(Error::from_reason(
-                "chat_tokens_delta_sync is text-only; session currently holds image state",
-            ));
-        }
+        // Text-only delta on image-bearing cache is intentional — the KV
+        // cache retains the image attention state from the prior prefill.
+        // See the sibling guard's doc in `qwen3_5/model.rs`. The outer
+        // `chat_session_continue_sync` gate filters real image-set
+        // changes with the `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:`
+        // prefix so the TS `ChatSession` can route those through
+        // `chatSessionStart`.
 
         let report_perf = config.report_performance.unwrap_or(false);
 
@@ -1955,8 +1959,20 @@ impl Qwen35MoeInner {
                 );
             }
 
-            // Text-only delta path: clear stale rope deltas.
-            self.cached_rope_deltas = None;
+            // Re-apply the saved M-RoPE offset if the session carries
+            // image state. The delta prefill just ran against the live
+            // KV caches, which still encode the prior VLM prefill's
+            // image attention; without re-applying the offset here, the
+            // newly-built compiled graph would use a sequential M-RoPE
+            // position and misposition all decoded tokens relative to
+            // the cached image patches. `cached_rope_deltas` stays
+            // alive across deltas so chained text-only turns on the
+            // same image session keep the offset.
+            if let Some(delta) = self.cached_rope_deltas {
+                unsafe {
+                    mlx_sys::mlx_qwen35_moe_adjust_offset(delta);
+                }
+            }
 
             profiler.set_label("moe_chat_delta_compiled");
 
@@ -2060,16 +2076,18 @@ impl Qwen35MoeInner {
             );
         }
 
-        // Save cache state. `has_images` is always false on the delta path
-        // and we pass the full pre-decode snapshot as the text-only save.
-        save_cache_state_direct(
+        // Save cache state. Delta continuations preserve
+        // `cached_image_key` — the live KV cache still encodes the prior
+        // prefill's image attention state even though this turn is
+        // text-only, and a subsequent cache-prefix verify needs that
+        // key to stay in place so a later image-bearing turn correctly
+        // flags an image-set change instead of being accepted on the
+        // delta path.
+        chat_common::save_cache_state_after_delta(
             p.reuse_cache,
-            false,
             &generated_tokens,
             &finish_reason,
             &save_tokens,
-            None,
-            0,
             &mut self.cached_token_history,
             &mut self.cached_image_key,
             &mut self.cached_rope_deltas,
@@ -2377,13 +2395,10 @@ impl Qwen35MoeInner {
             );
             return;
         }
-        if self.cached_image_key.is_some() {
-            send_stream_error(
-                &stream_tx,
-                "chat_stream_tokens_delta is text-only; session currently holds image state",
-            );
-            return;
-        }
+        // Text-only streaming deltas are allowed over image-bearing
+        // cache — see the sync sibling for the rationale. Real image-set
+        // changes are caught by the outer `chat_stream_session_continue`
+        // gate.
 
         let cb = StreamSender(stream_tx.clone());
         let result =
@@ -2575,8 +2590,18 @@ impl Qwen35MoeInner {
                 );
             }
 
-            // Text-only delta path: clear stale rope deltas.
-            self.cached_rope_deltas = None;
+            // Re-apply the saved M-RoPE offset if the session carries
+            // image state. See the sync sibling for the full rationale:
+            // the live KV caches still encode the prior VLM prefill's
+            // image attention, so the offset must re-apply here for
+            // tokens to position correctly. `cached_rope_deltas` stays
+            // alive across deltas so chained streaming text-only turns
+            // on the same image session keep the offset.
+            if let Some(delta) = self.cached_rope_deltas {
+                unsafe {
+                    mlx_sys::mlx_qwen35_moe_adjust_offset(delta);
+                }
+            }
 
             profiler.set_label("moe_chat_stream_delta_compiled");
 
@@ -2698,15 +2723,13 @@ impl Qwen35MoeInner {
 
         // Save cache state unconditionally — even on cancellation, the
         // partial generated_tokens must be appended so the session stays
-        // consistent for the next turn.
-        save_cache_state_direct(
+        // consistent for the next turn. Delta stream preserves
+        // `cached_image_key` (see the sync sibling's rationale).
+        chat_common::save_cache_state_after_delta(
             p.reuse_cache,
-            false,
             &generated_tokens,
             &finish_reason,
             &save_tokens,
-            None,
-            0,
             &mut self.cached_token_history,
             &mut self.cached_image_key,
             &mut self.cached_rope_deltas,
