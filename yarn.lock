@@ -2295,21 +2295,14 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@oxc-project/runtime@npm:=0.124.0":
-  version: 0.124.0
-  resolution: "@oxc-project/runtime@npm:0.124.0"
-  checksum: 10c0/1c113a126bf73def81033595575f69d94dff48177e17f712d778de986591f42198a2ed6ca884b1ac80e71b3594db66c2efed3f63e00446395791d20da1f62129
+"@oxc-project/runtime@npm:=0.126.0":
+  version: 0.126.0
+  resolution: "@oxc-project/runtime@npm:0.126.0"
+  checksum: 10c0/33b489b52abee2577a65eb176e31bf81e51e4ad8fbf6d71930364e6fae164f7b01f053395bc541dbb83513f68d65b563cda2801a3e36550cac891c5f6971a2ee
   languageName: node
   linkType: hard
 
-"@oxc-project/types@npm:=0.124.0":
-  version: 0.124.0
-  resolution: "@oxc-project/types@npm:0.124.0"
-  checksum: 10c0/9564ee3ce41f4b87802ffd0d62a7602d27f4503fbd39c1bedab98d54fde06e2ac254a8f85d8f679af1281a26e8fc7aa053fadbb3e09e786b38178eb38a8e2fb3
-  languageName: node
-  linkType: hard
-
-"@oxc-project/types@npm:^0.126.0":
+"@oxc-project/types@npm:=0.126.0, @oxc-project/types@npm:^0.126.0":
   version: 0.126.0
   resolution: "@oxc-project/types@npm:0.126.0"
   checksum: 10c0/ad0bb774d63b6529bfbe7cc0808c9368c5de6038938256eabc868cf7f812b8d304a7a57800b1cfc09bf02566c396be8148d3153fb2c5fee273ccd8f0a9fd8751
@@ -2449,44 +2442,44 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@oxlint-tsgolint/darwin-arm64@npm:0.20.0":
-  version: 0.20.0
-  resolution: "@oxlint-tsgolint/darwin-arm64@npm:0.20.0"
+"@oxlint-tsgolint/darwin-arm64@npm:0.21.1":
+  version: 0.21.1
+  resolution: "@oxlint-tsgolint/darwin-arm64@npm:0.21.1"
   conditions: os=darwin & cpu=arm64
   languageName: node
   linkType: hard
 
-"@oxlint-tsgolint/darwin-x64@npm:0.20.0":
-  version: 0.20.0
-  resolution: "@oxlint-tsgolint/darwin-x64@npm:0.20.0"
+"@oxlint-tsgolint/darwin-x64@npm:0.21.1":
+  version: 0.21.1
+  resolution: "@oxlint-tsgolint/darwin-x64@npm:0.21.1"
   conditions: os=darwin & cpu=x64
   languageName: node
   linkType: hard
 
-"@oxlint-tsgolint/linux-arm64@npm:0.20.0":
-  version: 0.20.0
-  resolution: "@oxlint-tsgolint/linux-arm64@npm:0.20.0"
+"@oxlint-tsgolint/linux-arm64@npm:0.21.1":
+  version: 0.21.1
+  resolution: "@oxlint-tsgolint/linux-arm64@npm:0.21.1"
   conditions: os=linux & cpu=arm64
   languageName: node
   linkType: hard
 
-"@oxlint-tsgolint/linux-x64@npm:0.20.0":
-  version: 0.20.0
-  resolution: "@oxlint-tsgolint/linux-x64@npm:0.20.0"
+"@oxlint-tsgolint/linux-x64@npm:0.21.1":
+  version: 0.21.1
+  resolution: "@oxlint-tsgolint/linux-x64@npm:0.21.1"
   conditions: os=linux & cpu=x64
   languageName: node
   linkType: hard
 
-"@oxlint-tsgolint/win32-arm64@npm:0.20.0":
-  version: 0.20.0
-  resolution: "@oxlint-tsgolint/win32-arm64@npm:0.20.0"
+"@oxlint-tsgolint/win32-arm64@npm:0.21.1":
+  version: 0.21.1
+  resolution: "@oxlint-tsgolint/win32-arm64@npm:0.21.1"
   conditions: os=win32 & cpu=arm64
   languageName: node
   linkType: hard
 
-"@oxlint-tsgolint/win32-x64@npm:0.20.0":
-  version: 0.20.0
-  resolution: "@oxlint-tsgolint/win32-x64@npm:0.20.0"
+"@oxlint-tsgolint/win32-x64@npm:0.21.1":
+  version: 0.21.1
+  resolution: "@oxlint-tsgolint/win32-x64@npm:0.21.1"
   conditions: os=win32 & cpu=x64
   languageName: node
   linkType: hard
@@ -2779,19 +2772,19 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@voidzero-dev/vite-plus-core@npm:0.1.18":
-  version: 0.1.18
-  resolution: "@voidzero-dev/vite-plus-core@npm:0.1.18"
+"@voidzero-dev/vite-plus-core@npm:0.1.19-alpha.3":
+  version: 0.1.19-alpha.3
+  resolution: "@voidzero-dev/vite-plus-core@npm:0.1.19-alpha.3"
   dependencies:
-    "@oxc-project/runtime": "npm:=0.124.0"
-    "@oxc-project/types": "npm:=0.124.0"
+    "@oxc-project/runtime": "npm:=0.126.0"
+    "@oxc-project/types": "npm:=0.126.0"
     fsevents: "npm:~2.3.3"
     lightningcss: "npm:^1.30.2"
     postcss: "npm:^8.5.6"
   peerDependencies:
     "@arethetypeswrong/core": ^0.18.1
-    "@tsdown/css": 0.21.8
-    "@tsdown/exe": 0.21.8
+    "@tsdown/css": 0.21.9
+    "@tsdown/exe": 0.21.9
     "@types/node": ^20.19.0 || >=22.12.0
     "@vitejs/devtools": ^0.1.0
     esbuild: ^0.27.0 || ^0.28.0
@@ -2847,59 +2840,59 @@ __metadata:
       optional: true
     yaml:
       optional: true
-  checksum: 10c0/62ba5dd3b1fb28448f20716aa551c74379e66a20a279bc5e2f7df3bad36057d9b43edb951114e312f9e711215452b1a6ae039872646bb9a6d9d7e19fc73348b8
+  checksum: 10c0/6fff16c5b7bda7d88ca563a14fb57b65354629c51b7157357df57debf71903af02964cd30290c523dda8ce8c824bf6b852b708ada057325bcc0ff8773e6f60bd
   languageName: node
   linkType: hard
 
-"@voidzero-dev/vite-plus-darwin-arm64@npm:0.1.18":
-  version: 0.1.18
-  resolution: "@voidzero-dev/vite-plus-darwin-arm64@npm:0.1.18"
+"@voidzero-dev/vite-plus-darwin-arm64@npm:0.1.19-alpha.3":
+  version: 0.1.19-alpha.3
+  resolution: "@voidzero-dev/vite-plus-darwin-arm64@npm:0.1.19-alpha.3"
   conditions: os=darwin & cpu=arm64
   languageName: node
   linkType: hard
 
-"@voidzero-dev/vite-plus-darwin-x64@npm:0.1.18":
-  version: 0.1.18
-  resolution: "@voidzero-dev/vite-plus-darwin-x64@npm:0.1.18"
+"@voidzero-dev/vite-plus-darwin-x64@npm:0.1.19-alpha.3":
+  version: 0.1.19-alpha.3
+  resolution: "@voidzero-dev/vite-plus-darwin-x64@npm:0.1.19-alpha.3"
   conditions: os=darwin & cpu=x64
   languageName: node
   linkType: hard
 
-"@voidzero-dev/vite-plus-linux-arm64-gnu@npm:0.1.18":
-  version: 0.1.18
-  resolution: "@voidzero-dev/vite-plus-linux-arm64-gnu@npm:0.1.18"
+"@voidzero-dev/vite-plus-linux-arm64-gnu@npm:0.1.19-alpha.3":
+  version: 0.1.19-alpha.3
+  resolution: "@voidzero-dev/vite-plus-linux-arm64-gnu@npm:0.1.19-alpha.3"
   conditions: os=linux & cpu=arm64 & libc=glibc
   languageName: node
   linkType: hard
 
-"@voidzero-dev/vite-plus-linux-arm64-musl@npm:0.1.18":
-  version: 0.1.18
-  resolution: "@voidzero-dev/vite-plus-linux-arm64-musl@npm:0.1.18"
+"@voidzero-dev/vite-plus-linux-arm64-musl@npm:0.1.19-alpha.3":
+  version: 0.1.19-alpha.3
+  resolution: "@voidzero-dev/vite-plus-linux-arm64-musl@npm:0.1.19-alpha.3"
   conditions: os=linux & cpu=arm64 & libc=musl
   languageName: node
   linkType: hard
 
-"@voidzero-dev/vite-plus-linux-x64-gnu@npm:0.1.18":
-  version: 0.1.18
-  resolution: "@voidzero-dev/vite-plus-linux-x64-gnu@npm:0.1.18"
+"@voidzero-dev/vite-plus-linux-x64-gnu@npm:0.1.19-alpha.3":
+  version: 0.1.19-alpha.3
+  resolution: "@voidzero-dev/vite-plus-linux-x64-gnu@npm:0.1.19-alpha.3"
   conditions: os=linux & cpu=x64 & libc=glibc
   languageName: node
   linkType: hard
 
-"@voidzero-dev/vite-plus-linux-x64-musl@npm:0.1.18":
-  version: 0.1.18
-  resolution: "@voidzero-dev/vite-plus-linux-x64-musl@npm:0.1.18"
+"@voidzero-dev/vite-plus-linux-x64-musl@npm:0.1.19-alpha.3":
+  version: 0.1.19-alpha.3
+  resolution: "@voidzero-dev/vite-plus-linux-x64-musl@npm:0.1.19-alpha.3"
   conditions: os=linux & cpu=x64 & libc=musl
   languageName: node
   linkType: hard
 
-"@voidzero-dev/vite-plus-test@npm:0.1.18, vitest@npm:@voidzero-dev/vite-plus-test@latest":
-  version: 0.1.18
-  resolution: "@voidzero-dev/vite-plus-test@npm:0.1.18"
+"@voidzero-dev/vite-plus-test@npm:0.1.19-alpha.3, vitest@npm:@voidzero-dev/vite-plus-test@0.1.19-alpha.3":
+  version: 0.1.19-alpha.3
+  resolution: "@voidzero-dev/vite-plus-test@npm:0.1.19-alpha.3"
   dependencies:
     "@standard-schema/spec": "npm:^1.1.0"
     "@types/chai": "npm:^5.2.2"
-    "@voidzero-dev/vite-plus-core": "npm:0.1.18"
+    "@voidzero-dev/vite-plus-core": "npm:0.1.19-alpha.3"
     es-module-lexer: "npm:^1.7.0"
     obug: "npm:^2.1.1"
     pixelmatch: "npm:^7.1.0"
@@ -2939,20 +2932,20 @@ __metadata:
       optional: true
     vite:
       optional: false
-  checksum: 10c0/88b1b146219c19fbbe6375c3eee552093a07d4af55c11be5f226d8731ef71e5da0e9e7c862dd975b070679f5b7bf1d30ed49dfb9352575befef1dc0b589ad802
+  checksum: 10c0/e706bf658ac680fa22eed28dcba11555f79bc94828f2a4af3cad5c8020e05e94e85800d43395502c2a2b4b0c26b55e241856cf844e6049b10cd7f0986f765c37
   languageName: node
   linkType: hard
 
-"@voidzero-dev/vite-plus-win32-arm64-msvc@npm:0.1.18":
-  version: 0.1.18
-  resolution: "@voidzero-dev/vite-plus-win32-arm64-msvc@npm:0.1.18"
+"@voidzero-dev/vite-plus-win32-arm64-msvc@npm:0.1.19-alpha.3":
+  version: 0.1.19-alpha.3
+  resolution: "@voidzero-dev/vite-plus-win32-arm64-msvc@npm:0.1.19-alpha.3"
   conditions: os=win32 & cpu=arm64
   languageName: node
   linkType: hard
 
-"@voidzero-dev/vite-plus-win32-x64-msvc@npm:0.1.18":
-  version: 0.1.18
-  resolution: "@voidzero-dev/vite-plus-win32-x64-msvc@npm:0.1.18"
+"@voidzero-dev/vite-plus-win32-x64-msvc@npm:0.1.19-alpha.3":
+  version: 0.1.19-alpha.3
+  resolution: "@voidzero-dev/vite-plus-win32-x64-msvc@npm:0.1.19-alpha.3"
   conditions: os=win32 & cpu=x64
   languageName: node
   linkType: hard
@@ -4064,7 +4057,7 @@ __metadata:
     oxc-parser: "npm:^0.126.0"
     prettier: "npm:^3.8.3"
     typescript: "npm:^6.0.3"
-    vite-plus: "npm:^0.1.18"
+    vite-plus: "npm:0.1.19-alpha.3"
     vitest: "npm:^4.1.4"
   languageName: unknown
   linkType: soft
@@ -4318,16 +4311,16 @@ __metadata:
   languageName: node
   linkType: hard
 
-"oxlint-tsgolint@npm:=0.20.0":
-  version: 0.20.0
-  resolution: "oxlint-tsgolint@npm:0.20.0"
+"oxlint-tsgolint@npm:=0.21.1":
+  version: 0.21.1
+  resolution: "oxlint-tsgolint@npm:0.21.1"
   dependencies:
-    "@oxlint-tsgolint/darwin-arm64": "npm:0.20.0"
-    "@oxlint-tsgolint/darwin-x64": "npm:0.20.0"
-    "@oxlint-tsgolint/linux-arm64": "npm:0.20.0"
-    "@oxlint-tsgolint/linux-x64": "npm:0.20.0"
-    "@oxlint-tsgolint/win32-arm64": "npm:0.20.0"
-    "@oxlint-tsgolint/win32-x64": "npm:0.20.0"
+    "@oxlint-tsgolint/darwin-arm64": "npm:0.21.1"
+    "@oxlint-tsgolint/darwin-x64": "npm:0.21.1"
+    "@oxlint-tsgolint/linux-arm64": "npm:0.21.1"
+    "@oxlint-tsgolint/linux-x64": "npm:0.21.1"
+    "@oxlint-tsgolint/win32-arm64": "npm:0.21.1"
+    "@oxlint-tsgolint/win32-x64": "npm:0.21.1"
   dependenciesMeta:
     "@oxlint-tsgolint/darwin-arm64":
       optional: true
@@ -4343,7 +4336,7 @@ __metadata:
       optional: true
   bin:
     tsgolint: bin/tsgolint.js
-  checksum: 10c0/9521a8e6aaea637592cda093bfb9220eb8a728bfccc980cc82de0011ed84733f1a42c629dfff8574a023e40e48c2dcdaf1675f0cf11aa92d164d5ccca1305c52
+  checksum: 10c0/7f175543d5d7adf6b5df16735de9105aec6c882e71ccd1b6f337d6bccb681ae3099020992ca0482d8ce0b2e6d0d43ba4201d10e299ba292a468cfdfb24ccaa11
   languageName: node
   linkType: hard
 
@@ -4876,24 +4869,24 @@ __metadata:
   languageName: node
   linkType: hard
 
-"vite-plus@npm:^0.1.18, vite-plus@npm:latest":
-  version: 0.1.18
-  resolution: "vite-plus@npm:0.1.18"
+"vite-plus@npm:0.1.19-alpha.3":
+  version: 0.1.19-alpha.3
+  resolution: "vite-plus@npm:0.1.19-alpha.3"
   dependencies:
-    "@oxc-project/types": "npm:=0.124.0"
-    "@voidzero-dev/vite-plus-core": "npm:0.1.18"
-    "@voidzero-dev/vite-plus-darwin-arm64": "npm:0.1.18"
-    "@voidzero-dev/vite-plus-darwin-x64": "npm:0.1.18"
-    "@voidzero-dev/vite-plus-linux-arm64-gnu": "npm:0.1.18"
-    "@voidzero-dev/vite-plus-linux-arm64-musl": "npm:0.1.18"
-    "@voidzero-dev/vite-plus-linux-x64-gnu": "npm:0.1.18"
-    "@voidzero-dev/vite-plus-linux-x64-musl": "npm:0.1.18"
-    "@voidzero-dev/vite-plus-test": "npm:0.1.18"
-    "@voidzero-dev/vite-plus-win32-arm64-msvc": "npm:0.1.18"
-    "@voidzero-dev/vite-plus-win32-x64-msvc": "npm:0.1.18"
+    "@oxc-project/types": "npm:=0.126.0"
+    "@voidzero-dev/vite-plus-core": "npm:0.1.19-alpha.3"
+    "@voidzero-dev/vite-plus-darwin-arm64": "npm:0.1.19-alpha.3"
+    "@voidzero-dev/vite-plus-darwin-x64": "npm:0.1.19-alpha.3"
+    "@voidzero-dev/vite-plus-linux-arm64-gnu": "npm:0.1.19-alpha.3"
+    "@voidzero-dev/vite-plus-linux-arm64-musl": "npm:0.1.19-alpha.3"
+    "@voidzero-dev/vite-plus-linux-x64-gnu": "npm:0.1.19-alpha.3"
+    "@voidzero-dev/vite-plus-linux-x64-musl": "npm:0.1.19-alpha.3"
+    "@voidzero-dev/vite-plus-test": "npm:0.1.19-alpha.3"
+    "@voidzero-dev/vite-plus-win32-arm64-msvc": "npm:0.1.19-alpha.3"
+    "@voidzero-dev/vite-plus-win32-x64-msvc": "npm:0.1.19-alpha.3"
     oxfmt: "npm:=0.45.0"
     oxlint: "npm:=1.60.0"
-    oxlint-tsgolint: "npm:=0.20.0"
+    oxlint-tsgolint: "npm:=0.21.1"
   dependenciesMeta:
     "@voidzero-dev/vite-plus-darwin-arm64":
       optional: true
@@ -4915,7 +4908,7 @@ __metadata:
     oxfmt: bin/oxfmt
     oxlint: bin/oxlint
     vp: bin/vp
-  checksum: 10c0/ac144286201fa527f3604ab2f0470a4b67f70a8e6accb9215d18369dd24cbc58ce3533591eaa078660444f40e6f25700e8559ae6c4beed2d31ecf0fa7ee05b0a
+  checksum: 10c0/9df3b4247e0813a531d2cc49ab708bc322df644e419907893659a6f49c7d411397911a00a396a90f6546bfcb02c3dd747cefb065b8ea82565422aef33be70dca
   languageName: node
   linkType: hard
 
