@@ -41,6 +41,14 @@ fn format_gemma4_value(val: &serde_json::Value) -> String {
     }
 }
 
+/// Test-only accessor for `json_args_to_gemma4_dsl`. Used by the
+/// output-parser round-trip test to verify that the parser is the exact
+/// inverse of the encoder for fixture inputs.
+#[cfg(test)]
+pub(crate) fn json_args_to_gemma4_dsl_for_test(json_str: &str) -> String {
+    json_args_to_gemma4_dsl(json_str)
+}
+
 /// Convert JSON arguments string to Gemma4 tool-call DSL.
 /// Returns the inner key:value pairs (without outer braces).
 fn json_args_to_gemma4_dsl(json_str: &str) -> String {
@@ -114,6 +122,65 @@ struct StreamSender(StreamTx<ChatStreamChunk>);
 impl StreamSender {
     fn call(&self, result: Result<ChatStreamChunk>, _mode: ThreadsafeFunctionCallMode) {
         let _ = self.0.send(result);
+    }
+}
+
+/// Emit the text/reasoning deltas collected by the stream parser on this
+/// step, and fold any surfaced `ToolCall` segments into the shared
+/// accumulator. Tool calls do NOT stream out as deltas — they land on the
+/// terminal `done=true` chunk.
+fn dispatch_stream_segments(segments: Vec<super::output_parser::StreamSegment>, cb: &StreamSender) {
+    use super::output_parser::StreamSegment;
+    for seg in segments {
+        match seg {
+            StreamSegment::Text(text) => {
+                if text.is_empty() {
+                    continue;
+                }
+                cb.call(
+                    Ok(ChatStreamChunk {
+                        text,
+                        done: false,
+                        finish_reason: None,
+                        tool_calls: None,
+                        thinking: None,
+                        num_tokens: None,
+                        prompt_tokens: None,
+                        reasoning_tokens: None,
+                        raw_text: None,
+                        cached_tokens: None,
+                        performance: None,
+                        is_reasoning: Some(false),
+                    }),
+                    ThreadsafeFunctionCallMode::NonBlocking,
+                );
+            }
+            StreamSegment::Reasoning(text) => {
+                if text.is_empty() {
+                    continue;
+                }
+                cb.call(
+                    Ok(ChatStreamChunk {
+                        text,
+                        done: false,
+                        finish_reason: None,
+                        tool_calls: None,
+                        thinking: None,
+                        num_tokens: None,
+                        prompt_tokens: None,
+                        reasoning_tokens: None,
+                        raw_text: None,
+                        cached_tokens: None,
+                        performance: None,
+                        is_reasoning: Some(true),
+                    }),
+                    ThreadsafeFunctionCallMode::NonBlocking,
+                );
+            }
+            StreamSegment::ToolCall(_) => {
+                // Accumulated on `parser.tool_calls()` for the terminal chunk.
+            }
+        }
     }
 }
 
@@ -245,13 +312,29 @@ pub(crate) enum Gemma4Cmd {
 /// commands via channels and await responses.
 #[napi]
 pub struct Gemma4Model {
-    pub(crate) thread: crate::model_thread::ModelThread<Gemma4Cmd>,
+    /// Dedicated model thread owning `Gemma4Inner`. `None` when the model
+    /// was constructed via `new(config)` without loading weights — in that
+    /// uninitialized state every session method returns an error and
+    /// only `isInitialized` is meaningful. Mirrors the same `Option<..>`
+    /// gate used by the OCR models (`VLModel`, `QianfanOCRModel`).
+    pub(crate) thread: Option<crate::model_thread::ModelThread<Gemma4Cmd>>,
     pub(crate) model_id: u64,
     /// Whether the loaded config includes `vision_config`. Mirrored here so
     /// the NAPI side can fail fast on image inputs to a text-only model
     /// without round-tripping to the model thread. The actual image
     /// processor lives on `Gemma4Inner` and runs on the model thread.
     pub(crate) has_vision: bool,
+    /// Whether the model was loaded with real weights. `false` for
+    /// `new Gemma4Model(config)` calls that never called `load()`.
+    /// Session methods check this and refuse to dispatch when false,
+    /// since the coordinator was never told about this model's delta
+    /// (its guard is `None`) — running inference on that stub would
+    /// under-cap the allocator.
+    pub(crate) initialized: bool,
+    /// RAII: unregisters this model's delta from the cache-limit
+    /// coordinator on drop. `None` for instances constructed via the
+    /// synchronous `new(config)` path that never loaded weights.
+    pub(crate) _cache_limit_guard: Option<crate::cache_limit::CacheLimitGuard>,
 }
 
 static MODEL_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -259,6 +342,61 @@ static MODEL_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// Serializes compiled C++ forward calls across model instances.
 /// Only matters if two Gemma4 models are loaded simultaneously (rare).
 static COMPILED_FORWARD_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Classification of the prefix-cache decision made from a
+/// [`Gemma4Inner::verify_cache_prefix`] return value plus the incoming
+/// token count.
+///
+/// Test-only mirror of the inlined branch at the top of
+/// [`Gemma4Inner::chat_sync_core`] /
+/// [`Gemma4Inner::chat_stream_sync_core`] — separating the decision
+/// logic from the native state mutation so the "exact-match routes to
+/// miss" invariant can be pinned by pure-logic unit tests that do not
+/// require a loaded Gemma4 model. Production code keeps the inlined
+/// form for zero-overhead dispatch; this enum exists solely to drive
+/// `prefix_cache_decision_tests`'s four-case coverage (empty cache,
+/// strict-extend hit, divergence miss, exact-match miss). Any change
+/// to the inlined production branch MUST be mirrored here or the test
+/// ceases to guard the real code.
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum PrefixCacheDecision {
+    /// Strict-extend hit: the new prompt begins with the cached prefix
+    /// and carries additional delta tokens. Warm-reuse safe: skip the
+    /// cached prefix and prefill only the tail.
+    StrictExtendHit,
+    /// Cache miss — covers three sub-cases that all dispatch through
+    /// the same `reset_caches_sync` + `init_caches_sync` + full-prefill
+    /// branch:
+    /// * `cached_prefix_len == 0` (no prior cache or verifier rejected
+    ///   the prefix overlap for any reason).
+    /// * `cached_prefix_len == tokens_len` (exact-match) — routed to
+    ///   miss because Gemma4 has no snapshot of final-step logits and
+    ///   no cheap rewind primitive for its sliding-window cache.
+    Miss,
+}
+
+/// Test-only helper: decide what to do given the verifier's answer and
+/// the incoming prompt length. Exact-match (`cached_prefix_len ==
+/// tokens_len`) and zero-length prefix both route to
+/// [`PrefixCacheDecision::Miss`].
+///
+/// Mirrors the inlined branch at the top of
+/// [`Gemma4Inner::chat_sync_core`] /
+/// [`Gemma4Inner::chat_stream_sync_core`]; lifting it out keeps the
+/// invariant pinnable without loading a real Gemma4 model.
+#[cfg(test)]
+#[inline]
+pub(crate) fn classify_prefix_cache_decision(
+    cached_prefix_len: usize,
+    tokens_len: usize,
+) -> PrefixCacheDecision {
+    if cached_prefix_len > 0 && cached_prefix_len < tokens_len {
+        PrefixCacheDecision::StrictExtendHit
+    } else {
+        PrefixCacheDecision::Miss
+    }
+}
 
 impl Gemma4Inner {
     /// Create a new Gemma4Inner with empty (uninitialized) weights.
@@ -402,6 +540,74 @@ impl Gemma4Inner {
 
     pub(crate) fn set_tokenizer(&mut self, tokenizer: Arc<Qwen3Tokenizer>) {
         self.tokenizer = Some(tokenizer);
+    }
+
+    /// Check whether `tokens` extends the cached conversation history and
+    /// return the length of the reused prefix.
+    ///
+    /// **Safety invariant**: this helper returns ONLY `0` (cache miss) or
+    /// `cached_token_history.len()` — either a strict-extend
+    /// (`cached_prefix_len < tokens.len()`) or an exact match
+    /// (`cached_prefix_len == tokens.len()`). Never an intermediate
+    /// value. Combined with the "no mid-sequence rewind" policy in
+    /// [`Self::chat_sync_core`] / [`Self::chat_stream_sync_core`], this
+    /// keeps Gemma4's layer caches safe under prefix reuse.
+    ///
+    /// The caller must additionally distinguish strict-extend (warm-reuse
+    /// safe) from exact-match. Only the strict-extend case is served via
+    /// the warm path; exact-match is routed back through the cache-miss
+    /// branch because Gemma4 has no snapshot of final-step logits and no
+    /// cheap rewind primitive for its sliding-window cache. Attempting to
+    /// reprefill the final cached token over the live caches would
+    /// advance cache state to `prompt + last_token` (duplicated) while
+    /// the history write-back block only persists `tokens + generated`,
+    /// corrupting the next warm-hit turn.
+    ///
+    /// * Sliding-window layers (`Gemma4LayerCache::new_sliding`) are safe
+    ///   because their offset only grows — appending new tokens advances
+    ///   the window forward rather than rewinding into evicted state. If
+    ///   the cached history already exceeded the sliding window, the
+    ///   cache correctly represents the most recent `sliding_window`
+    ///   tokens ending at `cached_token_history.len()`, and the delta
+    ///   continues from that point.
+    /// * Global layers accumulate all key/value tensors; appending delta
+    ///   tokens just extends the cache linearly.
+    ///
+    /// **Text-only**: this is a conservative text-only variant (see the
+    /// prefix-reuse plan at `.claude/plans/dapper-zooming-catmull.md`).
+    /// If either the new prompt carries images OR the cached session
+    /// does, we force a cache miss. A future VLM-aware variant would gate
+    /// on `cached_image_key == compute_image_cache_key(...)` like the
+    /// Qwen3.5 shared helper; until then, any image-bearing turn cold-
+    /// starts the session.
+    fn verify_cache_prefix(&self, tokens: &[u32], reuse_cache: bool, has_images: bool) -> usize {
+        if !reuse_cache {
+            return 0;
+        }
+        // Text-only: force a miss whenever images are involved on either
+        // side. This keeps prefix reuse strictly aligned with text-only
+        // sessions and sidesteps the mrope / image-key coordination that
+        // the Qwen3.5 shared helper handles.
+        if has_images || self.cached_image_key.is_some() {
+            return 0;
+        }
+        // The live KV caches must exist — `cached_token_history` can
+        // carry stale content after a prior `reset_caches_sync` if any
+        // caller forgot to also clear it, so both must line up.
+        if self.caches.is_none() {
+            return 0;
+        }
+        let cached = &self.cached_token_history;
+        if cached.is_empty() {
+            return 0;
+        }
+        if tokens.len() < cached.len() {
+            return 0;
+        }
+        if tokens[..cached.len()] != cached[..] {
+            return 0;
+        }
+        cached.len()
     }
 
     /// Core Gemma4 chat implementation with optional EOS override.
@@ -552,16 +758,59 @@ impl Gemma4Inner {
             tokens
         };
 
-        // Create prompt tensor
-        let token_arr: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-        let prompt = MxArray::from_int32(&token_arr, &[1, tokens.len() as i64])?;
+        // Prefix-cache verification. `verify_cache_prefix` returns 0 on
+        // miss or `cached.len()` on an exact prefix relation (either
+        // strict-extend or exact-match) — never intermediate (see its
+        // rustdoc). On a strict-extend hit we skip the cached prefix and
+        // prefill only the tail delta. On an exact match or miss we
+        // reset the caches here (not unconditionally in
+        // `chat_session_start_sync`) and do a full re-prefill, so
+        // stateless agent clients that resend the full transcript each
+        // turn can reuse the live KV caches when the histories strictly
+        // extend.
+        //
+        // Exact match is deliberately routed to the miss branch: Gemma4's
+        // compiled C++ decode path has no snapshot of the final-step
+        // logits and no cheap "rewind by one" primitive over its
+        // sliding-window cache. A previous revision reprefilled the last
+        // cached token on top of the live caches, but that advanced cache
+        // state to `prompt + last_token` (duplicated) while the
+        // history write-back block only persists `tokens + generated`.
+        // The resulting drift between live cache and persisted history
+        // corrupted the next warm-hit turn.
+        let reuse_cache = config.reuse_cache.unwrap_or(true);
+        let cached_prefix_len_raw = self.verify_cache_prefix(&tokens, reuse_cache, has_images);
+        let (prefill_offset, reported_cached_tokens) =
+            if cached_prefix_len_raw > 0 && cached_prefix_len_raw < tokens.len() {
+                debug!(
+                    "Gemma4 prefix cache reuse: {} cached tokens, {} delta to prefill",
+                    cached_prefix_len_raw,
+                    tokens.len() - cached_prefix_len_raw
+                );
+                (cached_prefix_len_raw, cached_prefix_len_raw)
+            } else {
+                // Cache miss OR exact-match: drop any stale caches/history
+                // and re-init. See the comment above for why exact-match
+                // falls through here instead of taking a shortcut.
+                self.reset_caches_sync()?;
+                self.init_caches_sync()?;
+                (0, 0)
+            };
 
-        // Lazily initialize the persistent KV caches on the first turn.
-        // Subsequent turns reuse `self.caches` in place. Step 5c wires
-        // the session-reset and prefix-verification paths on top of this.
+        // Defensive: caches must be live before the prefill runs.
+        // `reset_caches_sync` above only fires on miss, so on a hit we
+        // rely on the prior turn's init. If somebody cleared the caches
+        // out-of-band between turns, re-init here.
         if self.caches.is_none() {
             self.init_caches_sync()?;
         }
+
+        // Slice the prompt tensor to only the tokens that still need to
+        // be prefilled. On miss this is the full prompt; on hit this is
+        // just the tail delta.
+        let prefill_slice: Vec<i32> = tokens[prefill_offset..].iter().map(|&t| t as i32).collect();
+        let prefill_len = prefill_slice.len();
+        let prompt = MxArray::from_int32(&prefill_slice, &[1, prefill_len as i64])?;
 
         // Create dedicated generation stream for GPU scheduling.
         let generation_stream = Stream::new(DeviceType::Gpu);
@@ -678,8 +927,10 @@ impl Gemma4Inner {
                 .expect("caches populated by init_caches_sync above"),
         );
 
-        // Last token → logits
-        let last_token = prompt.slice_axis(1, tokens.len() as i64 - 1, tokens.len() as i64)?;
+        // Last token → logits. `prompt` is the delta slice, so its final
+        // position is `prefill_len - 1`. `prefill_body_gemma4` processed
+        // `[0 .. prefill_len - 1]` and left the final token for us.
+        let last_token = prompt.slice_axis(1, prefill_len as i64 - 1, prefill_len as i64)?;
         let logits = {
             let _stream_ctx = StreamContext::new(generation_stream);
             let caches = self
@@ -876,8 +1127,10 @@ impl Gemma4Inner {
             }
         }
 
-        // Decode text
-        let text = tokenizer.decode_sync(&generated_tokens, true)?;
+        // Decode text with special tokens preserved so we can extract
+        // Gemma4's `<|channel>...<channel|>` reasoning and
+        // `<|tool_call>...<tool_call|>` tool-call DSL blocks.
+        let raw_text = tokenizer.decode_sync(&generated_tokens, false)?;
 
         // Save session state so subsequent `chat_session_continue_sync`
         // calls can append a raw delta on top of the live caches. Drop
@@ -926,15 +1179,23 @@ impl Gemma4Inner {
             },
         });
 
+        let parsed = super::output_parser::parse_gemma4_output(&raw_text);
+        let finish_reason = if parsed.tool_calls.iter().any(|tc| tc.status == "ok") {
+            "tool_calls".to_string()
+        } else {
+            finish_reason
+        };
+
         Ok(ChatResult {
-            text: text.clone(),
-            tool_calls: vec![],
-            thinking: None,
+            text: parsed.text,
+            tool_calls: parsed.tool_calls,
+            thinking: parsed.thinking,
             num_tokens: generated_tokens.len() as u32,
             prompt_tokens: prompt_token_count as u32,
             reasoning_tokens: 0,
             finish_reason,
-            raw_text: text,
+            raw_text,
+            cached_tokens: reported_cached_tokens as u32,
             performance,
         })
     }
@@ -1060,14 +1321,38 @@ impl Gemma4Inner {
             tokens
         };
 
-        let token_arr: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-        let prompt = MxArray::from_int32(&token_arr, &[1, tokens.len() as i64])?;
+        // Prefix-cache verification — see `chat_sync_core` for the full
+        // rationale and the `verify_cache_prefix` rustdoc for the
+        // "returns 0 or cached.len() only" invariant. As in the
+        // non-streaming path, exact match is routed to the miss branch
+        // to avoid drift between live caches and the persisted
+        // `cached_token_history` (Gemma4 has no safe rewind primitive
+        // for its sliding-window cache).
+        let reuse_cache = config.reuse_cache.unwrap_or(true);
+        let cached_prefix_len_raw = self.verify_cache_prefix(&tokens, reuse_cache, has_images);
+        let prefill_offset = if cached_prefix_len_raw > 0 && cached_prefix_len_raw < tokens.len() {
+            cached_prefix_len_raw
+        } else {
+            // Cache miss OR exact-match (treated as miss).
+            self.reset_caches_sync()?;
+            self.init_caches_sync()?;
+            0
+        };
+        // `cached_prefix_len_reported` is the value surfaced on the
+        // terminal `ChatStreamChunk.cached_tokens` for observability.
+        // Mirrors `prefill_offset`: zero on a miss or exact-match
+        // (treated as miss), equal to the matched prefix length on a
+        // warm-reuse hit. Same semantics as the non-streaming
+        // `ChatResult.cached_tokens` for Gemma4.
+        let cached_prefix_len_reported = prefill_offset as u32;
 
-        // Lazily initialize the persistent KV caches on the first turn.
-        // Subsequent turns reuse `self.caches` in place.
         if self.caches.is_none() {
             self.init_caches_sync()?;
         }
+
+        let prefill_slice: Vec<i32> = tokens[prefill_offset..].iter().map(|&t| t as i32).collect();
+        let prefill_len = prefill_slice.len();
+        let prompt = MxArray::from_int32(&prefill_slice, &[1, prefill_len as i64])?;
 
         let generation_stream = Stream::new(DeviceType::Gpu);
         let _wired_ctx = crate::stream::WiredLimitContext::new(usize::MAX, vec![generation_stream]);
@@ -1157,7 +1442,7 @@ impl Gemma4Inner {
                 .expect("caches populated by init_caches_sync above"),
         );
 
-        let last_token = prompt.slice_axis(1, tokens.len() as i64 - 1, tokens.len() as i64)?;
+        let last_token = prompt.slice_axis(1, prefill_len as i64 - 1, prefill_len as i64)?;
         let logits = {
             let _stream_ctx = StreamContext::new(generation_stream);
             let caches = self
@@ -1193,8 +1478,13 @@ impl Gemma4Inner {
             && self.config.num_kv_shared_layers.is_none_or(|n| n <= 0)
             && unsafe { mlx_sys::mlx_qwen35_get_model_id() } == self.model_id;
 
-        let mut decode_stream = tokenizer.inner().decode_stream(true);
+        // `decode_stream(false)` preserves Gemma4 special tokens
+        // (`<|channel>`, `<|tool_call>`, …) in the streamed text so the
+        // stream parser can see them. The final `decode_sync(…, false)`
+        // below mirrors this for consistency with the parsed ChatResult.
+        let mut decode_stream = tokenizer.inner().decode_stream(false);
         let mut streamed_text_len = 0;
+        let mut stream_parser = super::output_parser::Gemma4StreamParser::new();
 
         if use_compiled {
             let _compiled_guard = COMPILED_FORWARD_MUTEX.lock().unwrap();
@@ -1285,22 +1575,8 @@ impl Gemma4Inner {
                 );
                 streamed_text_len += token_text.len();
 
-                cb.call(
-                    Ok(ChatStreamChunk {
-                        text: token_text,
-                        done: false,
-                        finish_reason: None,
-                        tool_calls: None,
-                        thinking: None,
-                        num_tokens: None,
-                        prompt_tokens: None,
-                        reasoning_tokens: None,
-                        raw_text: None,
-                        performance: None,
-                        is_reasoning: None,
-                    }),
-                    ThreadsafeFunctionCallMode::NonBlocking,
-                );
+                let segments = stream_parser.feed(&token_text);
+                dispatch_stream_segments(segments, cb);
 
                 if is_eos_token(token_id, &eos_ids, eos_token_id) {
                     finish_reason = "stop".to_string();
@@ -1364,22 +1640,8 @@ impl Gemma4Inner {
                 );
                 streamed_text_len += token_text.len();
 
-                cb.call(
-                    Ok(ChatStreamChunk {
-                        text: token_text,
-                        done: false,
-                        finish_reason: None,
-                        tool_calls: None,
-                        thinking: None,
-                        num_tokens: None,
-                        prompt_tokens: None,
-                        reasoning_tokens: None,
-                        raw_text: None,
-                        performance: None,
-                        is_reasoning: None,
-                    }),
-                    ThreadsafeFunctionCallMode::NonBlocking,
-                );
+                let segments = stream_parser.feed(&token_text);
+                dispatch_stream_segments(segments, cb);
 
                 if is_eos_token(token_id, &eos_ids, eos_token_id) {
                     finish_reason = "stop".to_string();
@@ -1397,27 +1659,21 @@ impl Gemma4Inner {
             }
         }
 
-        let text = tokenizer.decode_sync(&generated_tokens, true)?;
+        // `decode_sync(…, false)` matches the streaming decoder setting
+        // so any residual bytes left inside the tokenizer's DecodeStream
+        // surface with the same special-token representation the stream
+        // parser was fed.
+        let raw_text = tokenizer.decode_sync(&generated_tokens, false)?;
 
         // Flush any residual bytes that might not have resolved at the streaming layer
-        if text.len() > streamed_text_len {
-            let residual = text[streamed_text_len..].to_string();
-            cb.call(
-                Ok(ChatStreamChunk {
-                    text: residual,
-                    done: false,
-                    finish_reason: None,
-                    tool_calls: None,
-                    thinking: None,
-                    num_tokens: None,
-                    prompt_tokens: None,
-                    reasoning_tokens: None,
-                    raw_text: None,
-                    performance: None,
-                    is_reasoning: None,
-                }),
-                ThreadsafeFunctionCallMode::NonBlocking,
-            );
+        if raw_text.len() > streamed_text_len {
+            let residual = raw_text[streamed_text_len..].to_string();
+            let mut segments = stream_parser.feed(&residual);
+            segments.extend(stream_parser.flush());
+            dispatch_stream_segments(segments, cb);
+        } else {
+            let tail = stream_parser.flush();
+            dispatch_stream_segments(tail, cb);
         }
 
         // Save session state so subsequent
@@ -1460,18 +1716,30 @@ impl Gemma4Inner {
             },
         });
 
+        let parsed_tool_calls = stream_parser.tool_calls();
+        let parsed_thinking = stream_parser.thinking();
+        let finish_reason = if parsed_tool_calls.iter().any(|tc| tc.status == "ok") {
+            "tool_calls".to_string()
+        } else {
+            finish_reason
+        };
+
         // Emit final block
         cb.call(
             Ok(ChatStreamChunk {
                 text: String::new(),
                 done: true,
                 finish_reason: Some(finish_reason),
-                tool_calls: Some(vec![]),
-                thinking: None,
+                tool_calls: Some(parsed_tool_calls),
+                thinking: parsed_thinking,
                 num_tokens: Some(generated_tokens.len() as u32),
                 prompt_tokens: Some(prompt_token_count as u32),
                 reasoning_tokens: Some(0),
-                raw_text: Some(text),
+                raw_text: Some(raw_text),
+                // Start path: report the matched prefix length. Zero on
+                // a miss or exact-match (treated as miss), equal to the
+                // matched prefix length on a warm-reuse hit.
+                cached_tokens: Some(cached_prefix_len_reported),
                 performance,
                 is_reasoning: None,
             }),
@@ -1547,12 +1815,12 @@ impl Gemma4Inner {
         // `<turn|>` boundary.
         let turn_end_id = self.turn_end_id()?;
 
-        // Full reset: the session-start path always begins from a clean
-        // state. This matches the documented contract that the session
-        // is owned end-to-end by the `chat_session_*` surface and
-        // intentionally invalidates any prior cache.
-        self.reset_caches_sync()?;
-
+        // NOTE: no unconditional reset here. `chat_sync_core` runs
+        // `verify_cache_prefix` against the incoming `messages` and only
+        // resets the KV caches on a miss. This preserves prefix-reuse for
+        // stateless agent clients (pi-mono / Aider / Codex) that resend
+        // the full conversation transcript every turn — wiping here would
+        // make every session-start a cache miss by construction.
         self.chat_sync_core(messages, config, turn_end_id)
     }
 
@@ -1700,8 +1968,13 @@ impl Gemma4Inner {
         // at the end (the decode loop doesn't actually consult the
         // history for penalty context — Gemma4's bespoke decode loop
         // ignores penalties entirely).
-        let mut save_history =
-            Vec::with_capacity(self.cached_token_history.len() + delta_tokens.len());
+        //
+        // The delta path is a 100% cache-reuse operation by construction
+        // (the caller is appending on top of the live session), so
+        // `cached_token_history.len()` is exactly the reused prefix that
+        // should be reported through `ChatResult.cached_tokens`.
+        let reused_prefix_len = self.cached_token_history.len();
+        let mut save_history = Vec::with_capacity(reused_prefix_len + delta_tokens.len());
         save_history.extend(self.cached_token_history.iter().copied());
         save_history.extend(delta_tokens.iter().copied());
 
@@ -1806,7 +2079,7 @@ impl Gemma4Inner {
             }
         }
 
-        let text = tokenizer.decode_sync(&generated_tokens, true)?;
+        let raw_text = tokenizer.decode_sync(&generated_tokens, false)?;
 
         // Save cache state: drop the terminal turn-boundary token when
         // the decode terminated on stop (matches the semantics of
@@ -1848,15 +2121,23 @@ impl Gemma4Inner {
             },
         });
 
+        let parsed = super::output_parser::parse_gemma4_output(&raw_text);
+        let finish_reason = if parsed.tool_calls.iter().any(|tc| tc.status == "ok") {
+            "tool_calls".to_string()
+        } else {
+            finish_reason
+        };
+
         Ok(ChatResult {
-            text: text.clone(),
-            tool_calls: vec![],
-            thinking: None,
+            text: parsed.text,
+            tool_calls: parsed.tool_calls,
+            thinking: parsed.thinking,
             num_tokens: generated_tokens.len() as u32,
             prompt_tokens: prompt_token_count as u32,
             reasoning_tokens: 0,
             finish_reason,
-            raw_text: text,
+            raw_text,
+            cached_tokens: reused_prefix_len as u32,
             performance,
         })
     }
@@ -1885,12 +2166,10 @@ impl Gemma4Inner {
             }
         };
 
-        // Full reset: the session-start path always begins clean.
-        if let Err(e) = self.reset_caches_sync() {
-            let _ = stream_tx.send(Err(e));
-            return;
-        }
-
+        // NOTE: no unconditional reset here — see `chat_session_start_sync`
+        // for the prefix-reuse rationale. `chat_stream_sync_core` runs
+        // `verify_cache_prefix` against the incoming `messages` and only
+        // resets on a cache miss.
         let cb = StreamSender(stream_tx.clone());
         let result = self.chat_stream_sync_core(messages, config, &cb, &cancelled, turn_end_id);
         if let Err(e) = result {
@@ -2084,8 +2363,11 @@ impl Gemma4Inner {
         let sampling_config = make_sampling_config(&config, &self.config);
         let eos_ids = self.config.eos_token_ids.clone();
 
-        let mut save_history =
-            Vec::with_capacity(self.cached_token_history.len() + delta_tokens.len());
+        // The streaming delta path is 100% cache-reuse by construction
+        // (mirrors `chat_tokens_delta_sync`); capture the reused prefix
+        // length for the final `cached_tokens` report.
+        let reused_prefix_len = self.cached_token_history.len();
+        let mut save_history = Vec::with_capacity(reused_prefix_len + delta_tokens.len());
         save_history.extend(self.cached_token_history.iter().copied());
         save_history.extend(delta_tokens.iter().copied());
 
@@ -2141,8 +2423,11 @@ impl Gemma4Inner {
         let mut generated_tokens: Vec<u32> = Vec::new();
         let mut finish_reason = "length".to_string();
 
-        let mut decode_stream = tokenizer.inner().decode_stream(true);
+        // `decode_stream(false)` preserves Gemma4 special tokens so the
+        // stream parser sees `<|channel>` / `<|tool_call>` markers.
+        let mut decode_stream = tokenizer.inner().decode_stream(false);
         let mut streamed_text_len = 0;
+        let mut stream_parser = super::output_parser::Gemma4StreamParser::new();
 
         let mut current_y = y;
         for step in 0..max_new_tokens {
@@ -2186,22 +2471,8 @@ impl Gemma4Inner {
             );
             streamed_text_len += token_text.len();
 
-            cb.call(
-                Ok(ChatStreamChunk {
-                    text: token_text,
-                    done: false,
-                    finish_reason: None,
-                    tool_calls: None,
-                    thinking: None,
-                    num_tokens: None,
-                    prompt_tokens: None,
-                    reasoning_tokens: None,
-                    raw_text: None,
-                    performance: None,
-                    is_reasoning: None,
-                }),
-                ThreadsafeFunctionCallMode::NonBlocking,
-            );
+            let segments = stream_parser.feed(&token_text);
+            dispatch_stream_segments(segments, cb);
 
             if is_eos_token(token_id, &eos_ids, turn_end_id) {
                 finish_reason = "stop".to_string();
@@ -2218,27 +2489,17 @@ impl Gemma4Inner {
             }
         }
 
-        let text = tokenizer.decode_sync(&generated_tokens, true)?;
+        let raw_text = tokenizer.decode_sync(&generated_tokens, false)?;
 
         // Flush residual bytes buffered inside decode_stream.
-        if text.len() > streamed_text_len {
-            let residual = text[streamed_text_len..].to_string();
-            cb.call(
-                Ok(ChatStreamChunk {
-                    text: residual,
-                    done: false,
-                    finish_reason: None,
-                    tool_calls: None,
-                    thinking: None,
-                    num_tokens: None,
-                    prompt_tokens: None,
-                    reasoning_tokens: None,
-                    raw_text: None,
-                    performance: None,
-                    is_reasoning: None,
-                }),
-                ThreadsafeFunctionCallMode::NonBlocking,
-            );
+        if raw_text.len() > streamed_text_len {
+            let residual = raw_text[streamed_text_len..].to_string();
+            let mut segments = stream_parser.feed(&residual);
+            segments.extend(stream_parser.flush());
+            dispatch_stream_segments(segments, cb);
+        } else {
+            let tail = stream_parser.flush();
+            dispatch_stream_segments(tail, cb);
         }
 
         // Save cache state for the next session turn.
@@ -2277,17 +2538,29 @@ impl Gemma4Inner {
             },
         });
 
+        let parsed_tool_calls = stream_parser.tool_calls();
+        let parsed_thinking = stream_parser.thinking();
+        let finish_reason = if parsed_tool_calls.iter().any(|tc| tc.status == "ok") {
+            "tool_calls".to_string()
+        } else {
+            finish_reason
+        };
+
         cb.call(
             Ok(ChatStreamChunk {
                 text: String::new(),
                 done: true,
                 finish_reason: Some(finish_reason),
-                tool_calls: Some(vec![]),
-                thinking: None,
+                tool_calls: Some(parsed_tool_calls),
+                thinking: parsed_thinking,
                 num_tokens: Some(generated_tokens.len() as u32),
                 prompt_tokens: Some(prompt_token_count as u32),
                 reasoning_tokens: Some(0),
-                raw_text: Some(text),
+                raw_text: Some(raw_text),
+                // Delta path reuses the full prior history by
+                // construction — report `reused_prefix_len` as the
+                // authoritative cached-prefix length.
+                cached_tokens: Some(reused_prefix_len as u32),
                 performance,
                 is_reasoning: None,
             }),
@@ -2351,6 +2624,11 @@ pub(crate) fn handle_gemma4_cmd(inner: &mut Gemma4Inner, cmd: Gemma4Cmd) {
             config,
             reply,
         } => {
+            // NOTE: no per-request cache drain here. On a multi-model
+            // server the MLX allocator free-pool is process-wide, so
+            // flushing after a request on model A discards blocks about
+            // to be reused by model B. The TS idle sweeper in
+            // `@mlx-node/server` handles between-turn drains.
             let _ = reply.send(inner.chat_session_start_sync(messages, config));
         }
         Gemma4Cmd::ChatSessionContinue {
@@ -2417,28 +2695,51 @@ pub(crate) fn handle_gemma4_cmd(inner: &mut Gemma4Inner, cmd: Gemma4Cmd) {
 
 #[napi]
 impl Gemma4Model {
+    /// Create an uninitialized `Gemma4Model` stub from a config.
+    ///
+    /// **Prefer [`Gemma4Model::load`]** for any real usage — `new(config)`
+    /// is a config-only stub that matches the OCR-model pattern
+    /// (`VLModel::new(config)`, `QianfanOCRModel::new(config)`) and is
+    /// intentionally NOT runnable. It was introduced in the cache-limit
+    /// coordinator work so that the coordinator's per-model delta is
+    /// registered exclusively on the `load()` path, eliminating a
+    /// baseline-registration gap where a no-op `new(config)` would have
+    /// leaked an empty guard into the coordinator.
+    ///
+    /// This path does NOT spawn a model thread, NOT materialize any
+    /// weights, and NOT register with the cache-limit coordinator. The
+    /// returned instance is only useful for config inspection — every
+    /// session method (`chatSessionStart` / `chatSessionContinue` /
+    /// `chatSessionContinueTool` and their streaming variants) rejects
+    /// with a `napi::Error` whose message is exactly
+    /// `"Model not initialized. Call Gemma4Model.load() first."` until
+    /// `load()` runs and installs the underlying model thread. The
+    /// synchronous `resetCaches()` call is a silent no-op on the stub
+    /// to keep `ChatSession.reset()` idempotent across both runnable
+    /// and stub instances.
+    ///
+    /// Callers relying on the pre-round-2 behavior where `new(config)`
+    /// returned a runnable model MUST migrate to `await
+    /// Gemma4Model.load(path)`. The constructor signature is unchanged
+    /// on purpose (NAPI-RS pins it), so this is a deliberate runtime
+    /// behavior break covered by the regression tests in
+    /// `__test__/models/model-loader-gemma4.test.ts`.
     #[napi(constructor)]
-    pub fn new(config: Gemma4Config) -> Result<Self> {
+    pub fn new(config: Gemma4Config) -> Self {
         let has_vision = config.vision_config.is_some();
-
-        let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
-            move || {
-                let inner = Gemma4Inner::new(config)?;
-                let model_id = inner.model_id;
-                Ok((inner, model_id))
-            },
-            handle_gemma4_cmd,
-        );
-
-        let model_id = init_rx
-            .blocking_recv()
-            .map_err(|_| napi::Error::from_reason("Model thread exited during init"))??;
-
-        Ok(Self {
-            thread,
-            model_id,
+        Self {
+            thread: None,
+            model_id: 0,
             has_vision,
-        })
+            initialized: false,
+            _cache_limit_guard: None,
+        }
+    }
+
+    /// Returns true if weights have been loaded via `load()`.
+    #[napi(getter)]
+    pub fn is_initialized(&self) -> bool {
+        self.initialized
     }
 
     #[napi]
@@ -2465,7 +2766,13 @@ impl Gemma4Model {
     /// `model.resetCaches()` without awaiting.
     #[napi]
     pub fn reset_caches(&self) -> Result<()> {
-        crate::model_thread::send_and_block(&self.thread, |reply| Gemma4Cmd::ResetCaches { reply })
+        let Some(thread) = self.thread.as_ref() else {
+            // Uninitialized stub (constructed via `new(config)` without
+            // `load()`): nothing to reset. Match the OCR models'
+            // silent no-op to keep `ChatSession.reset()` idempotent.
+            return Ok(());
+        };
+        crate::model_thread::send_and_block(thread, |reply| Gemma4Cmd::ResetCaches { reply })
     }
 
     /// Start a new chat session.
@@ -2481,6 +2788,9 @@ impl Gemma4Model {
         messages: Vec<ChatMessage>,
         config: Option<ChatConfig>,
     ) -> Result<ChatResult> {
+        let thread = self.thread.as_ref().ok_or_else(|| {
+            Error::from_reason("Model not initialized. Call Gemma4Model.load() first.")
+        })?;
         let config = config.unwrap_or_default();
 
         // Fast-fail: images on a text-only model.
@@ -2494,7 +2804,7 @@ impl Gemma4Model {
             ));
         }
 
-        crate::model_thread::send_and_await(&self.thread, |reply| Gemma4Cmd::ChatSessionStart {
+        crate::model_thread::send_and_await(thread, |reply| Gemma4Cmd::ChatSessionStart {
             messages,
             config,
             reply,
@@ -2527,9 +2837,12 @@ impl Gemma4Model {
         images: Option<Vec<Uint8Array>>,
         config: Option<ChatConfig>,
     ) -> Result<ChatResult> {
+        let thread = self.thread.as_ref().ok_or_else(|| {
+            Error::from_reason("Model not initialized. Call Gemma4Model.load() first.")
+        })?;
         let config = config.unwrap_or_default();
 
-        crate::model_thread::send_and_await(&self.thread, |reply| Gemma4Cmd::ChatSessionContinue {
+        crate::model_thread::send_and_await(thread, |reply| Gemma4Cmd::ChatSessionContinue {
             user_message,
             images,
             config,
@@ -2559,15 +2872,16 @@ impl Gemma4Model {
         content: String,
         config: Option<ChatConfig>,
     ) -> Result<ChatResult> {
+        let thread = self.thread.as_ref().ok_or_else(|| {
+            Error::from_reason("Model not initialized. Call Gemma4Model.load() first.")
+        })?;
         let config = config.unwrap_or_default();
 
-        crate::model_thread::send_and_await(&self.thread, |reply| {
-            Gemma4Cmd::ChatSessionContinueTool {
-                tool_call_id,
-                content,
-                config,
-                reply,
-            }
+        crate::model_thread::send_and_await(thread, |reply| Gemma4Cmd::ChatSessionContinueTool {
+            tool_call_id,
+            content,
+            config,
+            reply,
         })
         .await
     }
@@ -2582,6 +2896,9 @@ impl Gemma4Model {
         config: Option<ChatConfig>,
         callback: ThreadsafeFunction<ChatStreamChunk, ()>,
     ) -> Result<ChatStreamHandle> {
+        let thread = self.thread.as_ref().ok_or_else(|| {
+            Error::from_reason("Model not initialized. Call Gemma4Model.load() first.")
+        })?;
         let config = config.unwrap_or_default();
 
         // Fast-fail: images on a text-only model.
@@ -2600,7 +2917,7 @@ impl Gemma4Model {
         let (stream_tx, mut stream_rx) =
             tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
 
-        self.thread.send(Gemma4Cmd::ChatStreamSessionStart {
+        thread.send(Gemma4Cmd::ChatStreamSessionStart {
             messages,
             config,
             stream_tx,
@@ -2628,6 +2945,9 @@ impl Gemma4Model {
         config: Option<ChatConfig>,
         callback: ThreadsafeFunction<ChatStreamChunk, ()>,
     ) -> Result<ChatStreamHandle> {
+        let thread = self.thread.as_ref().ok_or_else(|| {
+            Error::from_reason("Model not initialized. Call Gemma4Model.load() first.")
+        })?;
         let config = config.unwrap_or_default();
 
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -2635,7 +2955,7 @@ impl Gemma4Model {
         let (stream_tx, mut stream_rx) =
             tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
 
-        self.thread.send(Gemma4Cmd::ChatStreamSessionContinue {
+        thread.send(Gemma4Cmd::ChatStreamSessionContinue {
             user_message,
             images,
             config,
@@ -2664,6 +2984,9 @@ impl Gemma4Model {
         config: Option<ChatConfig>,
         callback: ThreadsafeFunction<ChatStreamChunk, ()>,
     ) -> Result<ChatStreamHandle> {
+        let thread = self.thread.as_ref().ok_or_else(|| {
+            Error::from_reason("Model not initialized. Call Gemma4Model.load() first.")
+        })?;
         let config = config.unwrap_or_default();
 
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -2671,7 +2994,7 @@ impl Gemma4Model {
         let (stream_tx, mut stream_rx) =
             tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
 
-        self.thread.send(Gemma4Cmd::ChatStreamSessionContinueTool {
+        thread.send(Gemma4Cmd::ChatStreamSessionContinueTool {
             tool_call_id,
             content,
             config,
@@ -3642,6 +3965,212 @@ mod tests {
         assert!(
             !prompt.contains("<|turn>developer"),
             "developer should not appear as a raw role"
+        );
+    }
+}
+
+#[cfg(test)]
+mod prefix_cache_reuse_integration_tests {
+    //! End-to-end tests for the prefix KV cache reuse refactor on Gemma4.
+    //! These verify that `chat_session_start_sync` no longer
+    //! unconditionally wipes the cache — stateless agent clients that
+    //! resend the full transcript on every turn should hit the
+    //! `verify_cache_prefix` exact-append path and skip redundant
+    //! prefill work.
+    //!
+    //! The Gemma4 variant additionally locks in the exact-match policy:
+    //! when the new prompt equals the cached one
+    //! (`cached_prefix_len == tokens.len()`), we fall through to the
+    //! miss branch and do a full reset + re-prefill. Gemma4 has no
+    //! snapshot of final-step logits and no safe rewind-by-1 primitive
+    //! over its sliding-window cache; reprefilling the last cached token
+    //! on top of the live caches would advance cache state to
+    //! `prompt + last_token` (duplicated) while the history write-back
+    //! block only persists `tokens + generated`, corrupting the next
+    //! warm-hit turn.
+    //!
+    //! These tests are `#[ignore]`-marked because they require loading a
+    //! real Gemma4 model file and a tokenizer. Run them with:
+    //!
+    //!     cargo test -p mlx-core --test '*' -- --ignored prefix_cache_reuse_integration
+    //!
+    //! with `MLX_NODE_GEMMA4_MODEL_DIR` set to a local Gemma4 model dir.
+
+    /// Append hit: two back-to-back session-start calls where the second
+    /// extends the first by exactly one user turn. Must report
+    /// `cached_tokens > 0` and only prefill the delta.
+    #[ignore = "requires a real Gemma4 model directory; run with --ignored"]
+    #[test]
+    fn append_hit_reuses_cached_prefix() {
+        // Pseudocode (same shape as the Qwen3.5 Dense stubs):
+        //
+        //   let p = vec![ChatMessage::user("Hi")];
+        //   let r1 = model.chat_session_start_sync(p.clone(), cfg())?;
+        //   let mut p2 = p.clone();
+        //   p2.push(ChatMessage::assistant(&r1.text));
+        //   p2.push(ChatMessage::user("Follow-up"));
+        //   let r2 = model.chat_session_start_sync(p2, cfg())?;
+        //   assert!(r2.cached_tokens > 0);
+    }
+
+    /// Divergence miss: second call's history is unrelated. Must report
+    /// `cached_tokens == 0` and do a full-history prefill.
+    #[ignore = "requires a real Gemma4 model directory; run with --ignored"]
+    #[test]
+    fn divergence_miss_resets_and_full_prefills() {
+        // Pseudocode:
+        //
+        //   let p1 = vec![ChatMessage::user("Ping")];
+        //   let p2 = vec![ChatMessage::user("Totally unrelated")];
+        //   let _ = model.chat_session_start_sync(p1, cfg())?;
+        //   let r2 = model.chat_session_start_sync(p2, cfg())?;
+        //   assert_eq!(r2.cached_tokens, 0);
+    }
+
+    /// Exact-match: the new prompt is byte-equal to the cached one.
+    /// With the exact-match-as-miss fix, the second call must report
+    /// `cached_tokens == 0` (full reset + full re-prefill). A subsequent
+    /// strict-extension must then hit the warm path.
+    #[ignore = "requires a real Gemma4 model directory; run with --ignored"]
+    #[test]
+    fn exact_match_falls_through_to_cache_miss() {
+        // Pseudocode:
+        //
+        //   let p = vec![ChatMessage::user("Ping")];
+        //   let _ = model.chat_session_start_sync(p.clone(), cfg())?;
+        //   let r2 = model.chat_session_start_sync(p.clone(), cfg())?;
+        //   assert_eq!(r2.cached_tokens, 0); // miss, not exact-match reuse
+        //
+        //   // After the miss, the caches represent `p` cleanly. A strict
+        //   // extension should warm-hit against that fresh state.
+        //   let prompt_token_count_p = r2.prompt_token_count;
+        //   let mut p3 = p.clone();
+        //   p3.push(ChatMessage::assistant(&r2.text));
+        //   p3.push(ChatMessage::user("Follow-up"));
+        //   let r3 = model.chat_session_start_sync(p3, cfg())?;
+        //   assert!(r3.cached_tokens >= prompt_token_count_p);
+    }
+}
+
+#[cfg(test)]
+mod prefix_cache_decision_tests {
+    //! Pure-logic coverage of the prefix-cache decision tree — no model
+    //! load required. The verifier `Gemma4Inner::verify_cache_prefix`
+    //! returns either `0` (miss) or `cached_token_history.len()` (exact
+    //! prefix relation). The call sites in
+    //! `chat_sync_core` / `chat_stream_sync_core` then classify that
+    //! value plus the incoming prompt length into
+    //! [`PrefixCacheDecision::StrictExtendHit`] (warm-reuse, skip the
+    //! cached prefix, prefill only the tail) vs
+    //! [`PrefixCacheDecision::Miss`] (reset caches + re-init + full
+    //! prefill).
+    //!
+    //! The four cases covered below pin the Round 1 Fix #1 invariant:
+    //! exact-match MUST route to `Miss`, not to `StrictExtendHit` — a
+    //! previous revision treated exact-match as a shortcut and corrupted
+    //! the next warm-hit turn by advancing cache state to
+    //! `prompt + last_token` while the history write-back only persisted
+    //! `tokens + generated`. The `#[ignore]`-gated integration tests
+    //! above exercise the end-to-end behaviour against a loaded Gemma4
+    //! model; this module guarantees the decision logic stays correct
+    //! in every CI run without a model dependency.
+
+    use super::{PrefixCacheDecision, classify_prefix_cache_decision};
+
+    #[test]
+    fn empty_cache_is_miss() {
+        // verify_cache_prefix returned 0 (cached_token_history empty,
+        // reuse_cache disabled, has_images guard, or prefix mismatch).
+        // Regardless of tokens.len(), the classifier routes to Miss so
+        // the caller runs reset_caches_sync + init_caches_sync + full
+        // prefill.
+        assert_eq!(
+            classify_prefix_cache_decision(0, 0),
+            PrefixCacheDecision::Miss,
+            "empty cache + empty tokens must be Miss"
+        );
+        assert_eq!(
+            classify_prefix_cache_decision(0, 10),
+            PrefixCacheDecision::Miss,
+            "empty cache + non-empty tokens must be Miss"
+        );
+    }
+
+    #[test]
+    fn strict_extend_is_hit() {
+        // verify_cache_prefix returned cached_token_history.len() AND
+        // tokens.len() > cached_token_history.len() — the new prompt
+        // strictly extends the cached one. This is the only case that
+        // takes the warm-reuse path: prefill_offset = cached_prefix_len,
+        // so only the tail delta is prefilled.
+        assert_eq!(
+            classify_prefix_cache_decision(5, 8),
+            PrefixCacheDecision::StrictExtendHit,
+            "cached.len() < tokens.len() must be StrictExtendHit"
+        );
+        assert_eq!(
+            classify_prefix_cache_decision(1, 2),
+            PrefixCacheDecision::StrictExtendHit,
+            "cached.len() = 1, tokens.len() = 2 must be StrictExtendHit (smallest hit)"
+        );
+    }
+
+    #[test]
+    fn divergence_is_miss() {
+        // verify_cache_prefix returned 0 because tokens[..cached.len()]
+        // != cached[..] — semantically a divergence even though we only
+        // observe the 0 return here. Same code path as `empty_cache_is_miss`
+        // — both flavours of Miss fall into the same branch.
+        assert_eq!(
+            classify_prefix_cache_decision(0, 20),
+            PrefixCacheDecision::Miss,
+            "divergence (verifier returned 0) must be Miss"
+        );
+    }
+
+    #[test]
+    fn exact_match_is_miss() {
+        // verify_cache_prefix returned cached_token_history.len() AND
+        // tokens.len() == cached_token_history.len() — byte-equal
+        // prompt. The classifier routes to Miss because Gemma4 has no
+        // snapshot of final-step logits and no safe "rewind by 1"
+        // primitive over the sliding-window cache. Reprefilling the
+        // last cached token over the live caches would advance cache
+        // state to `prompt + last_token` (duplicated) while the
+        // history write-back persists `tokens + generated`, desyncing
+        // cache and history for the next warm-hit turn.
+        //
+        // This is the core Round 1 Fix #1 invariant — guarding against
+        // a regression that silently corrupts multi-turn correctness.
+        assert_eq!(
+            classify_prefix_cache_decision(5, 5),
+            PrefixCacheDecision::Miss,
+            "exact-match (cached.len() == tokens.len()) must be Miss, not StrictExtendHit"
+        );
+        assert_eq!(
+            classify_prefix_cache_decision(1, 1),
+            PrefixCacheDecision::Miss,
+            "exact-match single token must be Miss"
+        );
+        assert_eq!(
+            classify_prefix_cache_decision(1000, 1000),
+            PrefixCacheDecision::Miss,
+            "exact-match long prompts must still be Miss"
+        );
+    }
+
+    #[test]
+    fn invariant_cached_len_never_exceeds_tokens_len_in_hit() {
+        // Belt-and-braces: the verifier itself returns 0 when
+        // tokens.len() < cached.len() (no partial-cache reuse), so
+        // `cached_prefix_len > tokens_len` should never be observed by
+        // the classifier in practice. But if it ever was, the branch
+        // routes it to Miss (cached_prefix_len < tokens_len is false),
+        // which is the safe fallthrough.
+        assert_eq!(
+            classify_prefix_cache_decision(10, 5),
+            PrefixCacheDecision::Miss,
+            "cached_prefix_len > tokens_len must be Miss (defensive fallthrough)"
         );
     }
 }

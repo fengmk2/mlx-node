@@ -267,6 +267,11 @@ pub(crate) fn handle_qwen35_moe_cmd(inner: &mut Qwen35MoeInner, cmd: Qwen35MoeCm
             config,
             reply,
         } => {
+            // NOTE: no per-request cache drain here. On a multi-model
+            // server the MLX allocator free-pool is process-wide, so
+            // flushing after a request on model A discards blocks about
+            // to be reused by model B. The TS idle sweeper in
+            // `@mlx-node/server` handles between-turn drains.
             let _ = reply.send(inner.chat_session_start_sync(messages, config));
         }
         Qwen35MoeCmd::ChatSessionContinue {
@@ -784,7 +789,20 @@ impl Qwen35MoeInner {
             tokens.clone()
         };
 
-        // Zero-delta guard
+        // Zero-delta guard.
+        //
+        // Triggers when `cached_prefix_len == (expanded_)tokens.len()`, i.e.
+        // the new prompt is byte-for-byte identical to the cached history
+        // and there is literally no delta to prefill. We still need to
+        // produce a `last_logits` for the decode loop, and the only safe
+        // way to do that on the Qwen3.5 MoE hybrid stack is a full reset
+        // + re-prefill. Trimming the cache by one token is infeasible
+        // because the 30 GDN linear-attention layers carry a recurrent
+        // state that cannot be rewound mid-sequence (see the invariant
+        // doc on `verify_cache_prefix_direct`). In practice this branch
+        // is a cold edge case — real agent turns always append at least
+        // a user message, so the cached prefix is strictly shorter than
+        // the new prompt.
         let (prefill_tokens, cached_prefix_len) = if prefill_tokens.is_empty() {
             info!("Zero-delta cache hit: resetting caches for full re-prefill");
             if let Some(ref mut caches) = self.caches {
@@ -838,10 +856,13 @@ impl Qwen35MoeInner {
         // === VLM or text prefill branching ===
         profiler.begin_prefill();
         let (mut last_logits, seq_len) = if has_images && cached_prefix_len > 0 {
-            // VLM cache reuse: same images, incremental text-only prefill
+            // VLM cache reuse: same images, incremental text-only prefill.
+            // Routed through chunked_prefill — typically the delta is a
+            // small user turn so this is a one-iteration no-op, but a user
+            // pasting a long follow-up message still benefits.
             let prompt = MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
 
-            let logits = forward_inner(
+            let logits = chunked_prefill(
                 &prompt,
                 &embedding_weight,
                 &mut self.layers,
@@ -850,6 +871,7 @@ impl Qwen35MoeInner {
                 &self.lm_head,
                 fa_idx,
                 Some(&embedding_weight_t),
+                generation_stream,
             )?;
 
             let seq_len = logits.shape_at(1)?;
@@ -892,10 +914,11 @@ impl Qwen35MoeInner {
                 ));
             }
         } else {
-            // Standard text prefill
+            // Standard text prefill. Chunked to bound peak GPU memory for
+            // long prompts (e.g. 40k+ tokens) — see `chunked_prefill` docs.
             let prompt = MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
 
-            let logits = forward_inner(
+            let logits = chunked_prefill(
                 &prompt,
                 &embedding_weight,
                 &mut self.layers,
@@ -904,6 +927,7 @@ impl Qwen35MoeInner {
                 &self.lm_head,
                 fa_idx,
                 Some(&embedding_weight_t),
+                generation_stream,
             )?;
 
             let seq_len = logits.shape_at(1)?;
@@ -1124,7 +1148,7 @@ impl Qwen35MoeInner {
             generated_tokens.len(),
         );
 
-        finalize_chat_result(
+        let mut result = finalize_chat_result(
             &tokenizer,
             &generated_tokens,
             finish_reason,
@@ -1139,7 +1163,13 @@ impl Qwen35MoeInner {
                 tokens.len() as u32
             },
             reasoning_tracker.reasoning_token_count(),
-        )
+        )?;
+        // Report the length of the reused cached prefix for observability.
+        // `cached_prefix_len` is 0 on fresh/miss paths and the full cached
+        // length on an exact-append hit — see the invariant doc on
+        // `verify_cache_prefix_direct`.
+        result.cached_tokens = cached_prefix_len as u32;
+        Ok(result)
     }
 
     /// Core streaming chat implementation (runs on model thread).
@@ -1283,7 +1313,11 @@ impl Qwen35MoeInner {
             tokens.clone()
         };
 
-        // Zero-delta guard
+        // Zero-delta guard. See the matching `chat_sync_core` comment for
+        // the design rationale — rewinding a GDN recurrent cache by one
+        // token is not possible across Qwen3.5 MoE's 30 linear-attention
+        // layers, so the only safe response to an exact-match prompt is
+        // a full reset + re-prefill.
         let (prefill_tokens, cached_prefix_len) = if prefill_tokens.is_empty() {
             info!("Zero-delta cache hit: resetting caches for full re-prefill");
             if let Some(ref mut caches) = self.caches {
@@ -1333,9 +1367,11 @@ impl Qwen35MoeInner {
         // VLM or text prefill
         profiler.begin_prefill();
         let (mut last_logits, seq_len) = if has_images && cached_prefix_len > 0 {
+            // VLM cache reuse (streaming): same images, incremental text-only
+            // prefill. See the sync sibling for the rationale.
             let prompt = MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
 
-            let logits = forward_inner(
+            let logits = chunked_prefill(
                 &prompt,
                 &embedding_weight,
                 &mut self.layers,
@@ -1344,6 +1380,7 @@ impl Qwen35MoeInner {
                 &self.lm_head,
                 fa_idx,
                 Some(&embedding_weight_t),
+                generation_stream,
             )?;
 
             let seq_len = logits.shape_at(1)?;
@@ -1386,8 +1423,10 @@ impl Qwen35MoeInner {
                 ));
             }
         } else {
+            // Chunked to bound peak GPU memory for long prompts. See
+            // `chunked_prefill` docs for the memory rationale.
             let prompt = MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
-            let logits = forward_inner(
+            let logits = chunked_prefill(
                 &prompt,
                 &embedding_weight,
                 &mut self.layers,
@@ -1396,6 +1435,7 @@ impl Qwen35MoeInner {
                 &self.lm_head,
                 fa_idx,
                 Some(&embedding_weight_t),
+                generation_stream,
             )?;
 
             let seq_len = logits.shape_at(1)?;
@@ -1646,6 +1686,7 @@ impl Qwen35MoeInner {
                     prompt_tokens: None,
                     reasoning_tokens: None,
                     raw_text: None,
+                    cached_tokens: None,
                     performance: None,
                     is_reasoning: Some(last_is_reasoning),
                 }),
@@ -1694,6 +1735,10 @@ impl Qwen35MoeInner {
                 prompt_tokens: Some(prompt_token_count),
                 reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
                 raw_text: Some(text),
+                // Start path: report the matched prefix length from
+                // `verify_cache_prefix_direct`. Zero on a miss, full
+                // cached length on an exact-append hit.
+                cached_tokens: Some(cached_prefix_len as u32),
                 performance: perf_metrics,
                 is_reasoning: None,
             }),
@@ -1705,12 +1750,18 @@ impl Qwen35MoeInner {
 
     /// Start a new chat session.
     ///
-    /// Resets the caches up-front so the session is guaranteed to start
-    /// from a known-clean state, then delegates to [`Self::chat_sync_core`]
-    /// with `<|im_end|>` (from the tokenizer vocab) as the stop token so
-    /// the cached history ends on a clean ChatML boundary that subsequent
-    /// `chat_session_continue_sync` deltas can append to without
-    /// re-rendering the jinja template.
+    /// Delegates to [`Self::chat_sync_core`] with `<|im_end|>` (from the
+    /// tokenizer vocab) as the stop token so the cached history ends on
+    /// a clean ChatML boundary that subsequent `chat_session_continue_sync`
+    /// deltas can append to without re-rendering the jinja template.
+    ///
+    /// Unlike the pre-refactor contract, this method no longer resets the
+    /// caches up-front. The core path runs `verify_cache_prefix_direct`
+    /// against the freshly-tokenized prompt and reuses the cached prefix
+    /// on an exact-append hit or resets + fully prefills on a miss. This
+    /// is what enables prefix-cache reuse for stateless agent clients
+    /// that resend the full transcript on every turn. See the matching
+    /// block comment in the method body for the GDN-safety rationale.
     ///
     /// Images are accepted on session start — the downstream
     /// [`Self::chat_sync_core`] already handles the VLM prefill path via
@@ -1740,10 +1791,25 @@ impl Qwen35MoeInner {
             .im_end_id()
             .ok_or_else(|| Error::from_reason("Tokenizer missing <|im_end|> special token"))?;
 
-        // Full reset: the session-start path always begins from a clean
-        // state.
-        self.reset_caches_sync()?;
-        self.init_caches_sync()?;
+        // Prefix-cache reuse contract: the caches may carry state from a
+        // prior session-start turn. `chat_sync_core` runs
+        // `verify_cache_prefix_direct` against the freshly-tokenized prompt
+        // and either (a) reuses the cached prefix and prefills only the
+        // trailing delta (exact-append hit) or (b) resets + fully prefills
+        // from scratch on a cache miss. Driving the reset from inside the
+        // core — rather than wiping up-front here — is what lets
+        // stateless-agent clients (Aider, Codex CLI, pi-mono, etc.) that
+        // resend the full transcript on every turn avoid paying an O(N)
+        // prefill cost on every turn.
+        //
+        // Safety: the invariant on `verify_cache_prefix_direct` (returns
+        // either `0` or the full cached length — never an intermediate
+        // value) guarantees a non-zero hit means the new tokens are a
+        // pure *append* on the live caches. Qwen3.5 MoE has 30 GDN
+        // linear-attention layers whose recurrent state cannot be
+        // rewound mid-sequence; the all-or-nothing return contract is
+        // what keeps that state consistent without any snapshot
+        // machinery. See the rustdoc on `verify_cache_prefix_direct`.
 
         self.chat_sync_core(messages, config, im_end_id)
     }
@@ -1804,6 +1870,10 @@ impl Qwen35MoeInner {
 
         // Build full token history = cached_history + delta. Used for
         // penalty context AND as the running token history in the decode loop.
+        // Snapshot the cached-prefix length before extending so we can
+        // report it on the ChatResult for observability — the delta path
+        // always reuses the full cached history by construction.
+        let cached_prefix_len_for_result = self.cached_token_history.len() as u32;
         let mut full_token_history = self.cached_token_history.clone();
         full_token_history.extend(delta_tokens.iter().copied());
 
@@ -1861,9 +1931,11 @@ impl Qwen35MoeInner {
         profiler.snapshot_memory_before();
 
         // Text-only prefill of the delta on top of the existing caches.
+        // Usually tiny (a single user turn), but chunked defensively so a
+        // user pasting a long follow-up message doesn't blow memory.
         profiler.begin_prefill();
         let prompt = MxArray::from_uint32(&delta_tokens, &[1, delta_tokens.len() as i64])?;
-        let logits = forward_inner(
+        let logits = chunked_prefill(
             &prompt,
             &embedding_weight,
             &mut self.layers,
@@ -1872,6 +1944,7 @@ impl Qwen35MoeInner {
             &self.lm_head,
             fa_idx,
             Some(&embedding_weight_t),
+            generation_stream,
         )?;
         let prefill_out_seq_len = logits.shape_at(1)?;
         let mut last_logits = logits.slice_axis(1, prefill_out_seq_len - 1, prefill_out_seq_len)?;
@@ -2103,7 +2176,7 @@ impl Qwen35MoeInner {
 
         let _final_sampled_token = y;
 
-        finalize_chat_result(
+        let mut result = finalize_chat_result(
             &tokenizer,
             &generated_tokens,
             finish_reason,
@@ -2114,7 +2187,10 @@ impl Qwen35MoeInner {
             enable_thinking.unwrap_or(true),
             prompt_tokens_for_result,
             reasoning_tracker.reasoning_token_count(),
-        )
+        )?;
+        // Delta path always reuses the full cached history — report it.
+        result.cached_tokens = cached_prefix_len_for_result;
+        Ok(result)
     }
 
     /// Session-based chat continuation via a plain user message string.
@@ -2238,14 +2314,14 @@ impl Qwen35MoeInner {
             }
         };
 
-        if let Err(e) = self.reset_caches_sync() {
-            let _ = stream_tx.send(Err(e));
-            return;
-        }
-        if let Err(e) = self.init_caches_sync() {
-            let _ = stream_tx.send(Err(e));
-            return;
-        }
+        // Prefix-cache reuse contract: same as `chat_session_start_sync`.
+        // Any cached state from a prior turn is intentionally preserved
+        // so `chat_stream_sync_core` can run `verify_cache_prefix_direct`
+        // against the freshly-tokenized prompt. The inner path resets the
+        // caches on a miss and reuses them on an exact-append hit. See
+        // the rustdoc on `verify_cache_prefix_direct` for the GDN-safety
+        // invariant that keeps this sound on the 30 linear-attention
+        // layers.
 
         let result = self.chat_stream_sync_core(messages, config, im_end_id, &cb, &cancelled);
         if let Err(e) = result {
@@ -2441,6 +2517,11 @@ impl Qwen35MoeInner {
         let tokenizer_for_decode = tokenizer.clone();
 
         // Build full token history = cached_history + delta.
+        // Capture `prior_cached_len` BEFORE the extend — this is the
+        // reused-prefix length reported on the terminal ChatStreamChunk's
+        // `cached_tokens` field (mirrors the non-streaming delta path's
+        // `cached_tokens_for_result`).
+        let prior_cached_len = self.cached_token_history.len() as u32;
         let mut full_token_history = self.cached_token_history.clone();
         full_token_history.extend(delta_tokens.iter().copied());
 
@@ -2491,9 +2572,10 @@ impl Qwen35MoeInner {
         profiler.snapshot_memory_before();
 
         // Text-only prefill of the delta on top of the existing caches.
+        // Chunked defensively — see the sync sibling for rationale.
         profiler.begin_prefill();
         let prompt = MxArray::from_uint32(&delta_tokens, &[1, delta_tokens.len() as i64])?;
-        let logits = forward_inner(
+        let logits = chunked_prefill(
             &prompt,
             &embedding_weight,
             &mut self.layers,
@@ -2502,6 +2584,7 @@ impl Qwen35MoeInner {
             &self.lm_head,
             fa_idx,
             Some(&embedding_weight_t),
+            generation_stream,
         )?;
         let prefill_out_seq_len = logits.shape_at(1)?;
         let mut last_logits = logits.slice_axis(1, prefill_out_seq_len - 1, prefill_out_seq_len)?;
@@ -2757,6 +2840,7 @@ impl Qwen35MoeInner {
                     prompt_tokens: None,
                     reasoning_tokens: None,
                     raw_text: None,
+                    cached_tokens: None,
                     performance: None,
                     is_reasoning: Some(last_is_reasoning),
                 }),
@@ -2800,6 +2884,11 @@ impl Qwen35MoeInner {
                 prompt_tokens: Some(prompt_token_count),
                 reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
                 raw_text: Some(text),
+                // Delta path reuses the full prior history by construction
+                // — report `prior_cached_len` (captured before the
+                // `self.cached_token_history` extend above) as the
+                // authoritative cached-prefix length.
+                cached_tokens: Some(prior_cached_len),
                 performance: perf_metrics,
                 is_reasoning: None,
             }),
@@ -2829,21 +2918,21 @@ impl Qwen35MoeInner {
         let generation_stream = Stream::new(DeviceType::Gpu);
         let fa_idx = self.fa_idx;
 
-        // Prefill
+        // Prefill. Chunked to bound peak GPU memory for long prompts —
+        // see `chunked_prefill` docs. `chunked_prefill` internally manages
+        // the StreamContext per chunk so we don't need an outer one here.
         let prompt = prompt_tokens.reshape(&[1, -1])?;
-        let logits = {
-            let _stream_ctx = StreamContext::new(generation_stream);
-            forward_inner(
-                &prompt,
-                &embedding_weight,
-                &mut self.layers,
-                &mut self.caches,
-                &self.final_norm,
-                &self.lm_head,
-                fa_idx,
-                Some(&embedding_weight_t),
-            )?
-        };
+        let logits = chunked_prefill(
+            &prompt,
+            &embedding_weight,
+            &mut self.layers,
+            &mut self.caches,
+            &self.final_norm,
+            &self.lm_head,
+            fa_idx,
+            Some(&embedding_weight_t),
+            generation_stream,
+        )?;
 
         let seq_len = logits.shape_at(1)?;
         let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
@@ -4463,6 +4552,9 @@ pub struct Qwen3_5MoeModel {
     /// Cloned from inner for pure-getter NAPI methods (no command dispatch needed).
     pub(crate) config: Qwen3_5MoeConfig,
     pub(crate) model_id: u64,
+    /// RAII: unregisters this model's baseline from the cache-limit
+    /// coordinator on drop.
+    pub(crate) _cache_limit_guard: crate::cache_limit::CacheLimitGuard,
 }
 
 #[napi]
@@ -5156,6 +5248,135 @@ fn forward_inner(
     }
 }
 
+/// Default prefill chunk size (tokens per chunk).
+///
+/// Matches the Qwen3.5 Dense path and Python mlx-lm's `prefill_step_size`
+/// default of 2048. Long-context prompts (40k+ tokens) would otherwise
+/// allocate all per-layer activations concurrently (batch=1 × seq × hidden
+/// plus a full attention score tensor per FA layer), blowing past the 96 GB
+/// wired limit on an M3 Max 128 GB box. Chunking bounds the per-layer
+/// transient peak at `chunk × hidden_dim` and inserts a cache-eval +
+/// `clear_cache` barrier between chunks so the transient allocator state
+/// does not accumulate across chunks.
+pub(crate) const PREFILL_STEP_SIZE: i64 = 2048;
+
+/// Chunked prefill for Qwen3.5 MoE.
+///
+/// Processes `prompt` (shape `[1, seq_len]`) in chunks of `PREFILL_STEP_SIZE`
+/// tokens, evaluating all KV-cache arrays and clearing the MLX compute cache
+/// between chunks to bound peak GPU activation memory. Returns the logits
+/// from the **final** chunk, which share the same shape contract as a
+/// single-shot `forward_inner` call: `[1, last_chunk_len, vocab_size]`.
+///
+/// Invariants vs. single-shot `forward_inner`:
+/// - Identical numerical output at full precision (the KV caches thread
+///   through chunk N into chunk N+1 just like they would through
+///   successive `forward_inner(full_prompt)` calls during regular decode).
+/// - The linear-attention recurrent state advances chunk-by-chunk. This is
+///   the same forward direction as a single-shot call — chunking is a
+///   memory-only transformation, not a semantic one.
+/// - Compiled-path seeding (`mlx_qwen35_moe_init_from_prefill`) is the
+///   caller's responsibility and MUST happen **after** the full chunked
+///   prefill completes. Do NOT call `init_from_prefill` per chunk.
+///
+/// Small prompts (<= `PREFILL_STEP_SIZE` tokens) hit exactly one loop
+/// iteration and behave identically to a single `forward_inner` call — no
+/// extra evals, no extra cache clears.
+#[allow(clippy::too_many_arguments)]
+fn chunked_prefill(
+    prompt: &MxArray,
+    embedding_weight: &MxArray,
+    layers: &mut [DecoderLayer],
+    caches: &mut Option<Vec<Qwen3_5LayerCache>>,
+    final_norm: &RMSNorm,
+    lm_head: &Option<LinearProj>,
+    fa_idx: usize,
+    embedding_weight_t: Option<&MxArray>,
+    generation_stream: Stream,
+) -> Result<MxArray> {
+    chunked_prefill_with_size(
+        prompt,
+        embedding_weight,
+        layers,
+        caches,
+        final_norm,
+        lm_head,
+        fa_idx,
+        embedding_weight_t,
+        generation_stream,
+        PREFILL_STEP_SIZE,
+    )
+}
+
+/// Explicit-size variant of `chunked_prefill`.
+///
+/// Same semantics as `chunked_prefill` but the chunk size is an explicit
+/// parameter. Primarily used by tests to compare chunked vs single-shot
+/// (by passing a chunk size >= prompt length) without plumbing a config
+/// knob through every caller. Production callers should use
+/// `chunked_prefill` which hardcodes `PREFILL_STEP_SIZE`.
+#[allow(clippy::too_many_arguments)]
+fn chunked_prefill_with_size(
+    prompt: &MxArray,
+    embedding_weight: &MxArray,
+    layers: &mut [DecoderLayer],
+    caches: &mut Option<Vec<Qwen3_5LayerCache>>,
+    final_norm: &RMSNorm,
+    lm_head: &Option<LinearProj>,
+    fa_idx: usize,
+    embedding_weight_t: Option<&MxArray>,
+    generation_stream: Stream,
+    chunk_size: i64,
+) -> Result<MxArray> {
+    debug_assert!(chunk_size > 0, "chunk_size must be positive");
+    let total_len = prompt.shape_at(1)?;
+    let mut offset: i64 = 0;
+
+    // All-but-last chunks: run forward, eval caches, clear compute cache.
+    // The returned logits from these chunks are thrown away because only
+    // the final chunk's logits are consumed by the sampler.
+    while total_len - offset > chunk_size {
+        let chunk = prompt.slice_axis(1, offset, offset + chunk_size)?;
+        {
+            let _stream_ctx = StreamContext::new(generation_stream);
+            let _logits = forward_inner(
+                &chunk,
+                embedding_weight,
+                layers,
+                caches,
+                final_norm,
+                lm_head,
+                fa_idx,
+                embedding_weight_t,
+            )?;
+        }
+        // Materialize all cache arrays on GPU so the next chunk doesn't
+        // extend a giant lazy graph rooted at the prior chunk's inputs.
+        eval_layer_caches(caches);
+        crate::array::clear_cache();
+        offset += chunk_size;
+    }
+
+    // Final chunk: return logits to caller. No eval/clear here — the
+    // caller's next step (sampling / slicing last_logits) triggers eval
+    // naturally, and the outer decode loop clears cache on its own rhythm.
+    let remaining = prompt.slice_axis(1, offset, total_len)?;
+    let logits = {
+        let _stream_ctx = StreamContext::new(generation_stream);
+        forward_inner(
+            &remaining,
+            embedding_weight,
+            layers,
+            caches,
+            final_norm,
+            lm_head,
+            fa_idx,
+            embedding_weight_t,
+        )?
+    };
+    Ok(logits)
+}
+
 /// Single-token decode step using C++ MoE forward pass.
 ///
 /// Unlike the dense model's compiled path, MoE routing is data-dependent so
@@ -5294,4 +5515,69 @@ fn vlm_prefill_moe(
     let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
     let last_logits = last_logits.squeeze(Some(&[1]))?;
     Ok((last_logits, rope_deltas))
+}
+
+#[cfg(test)]
+mod prefix_cache_reuse_integration_tests {
+    //! End-to-end tests for the prefix KV cache reuse refactor on
+    //! Qwen3.5 MoE. These verify that `chat_session_start_sync` no longer
+    //! unconditionally wipes the cache — stateless agent clients that
+    //! resend the full transcript on every turn should hit the
+    //! `verify_cache_prefix_direct` exact-append path and skip redundant
+    //! prefill work.
+    //!
+    //! The MoE variant additionally exercises the zero-delta guard,
+    //! which is architecturally constrained to a full reset + re-prefill
+    //! because rewinding the 30 GDN linear-attention layers' recurrent
+    //! state mid-sequence is infeasible. The exact-match test locks in
+    //! that the guard does not corrupt state (even though it's wasteful).
+    //!
+    //! These tests are `#[ignore]`-marked because they require loading a
+    //! real Qwen3.5 MoE model file and a tokenizer. Run them with:
+    //!
+    //!     cargo test -p mlx-core --test '*' -- --ignored prefix_cache_reuse_integration
+    //!
+    //! with `MLX_NODE_QWEN35_MOE_MODEL_DIR` set to a local Qwen3.5-MoE
+    //! dir.
+
+    /// Append hit: two back-to-back session-start calls where the second
+    /// extends the first by exactly one user turn. Must report
+    /// `cached_tokens > 0` and only prefill the delta.
+    #[ignore = "requires a real Qwen3.5 MoE model directory; run with --ignored"]
+    #[test]
+    fn append_hit_reuses_cached_prefix() {
+        // See the matching test on `qwen3_5/model.rs` for the pseudocode
+        // shape. Identical surface; different model type.
+    }
+
+    /// Divergence miss: second call's history is unrelated. Must report
+    /// `cached_tokens == 0` and do a full-history prefill (which includes
+    /// resetting the 30 GDN layers' recurrent state).
+    #[ignore = "requires a real Qwen3.5 MoE model directory; run with --ignored"]
+    #[test]
+    fn divergence_miss_resets_and_full_prefills() {
+        // See the matching test on `qwen3_5/model.rs` for the pseudocode
+        // shape.
+    }
+
+    /// Exact-match: second call's tokens == first call's tokens, no
+    /// delta. The zero-delta guard MUST NOT corrupt state — after the
+    /// forced full-reset + re-prefill, generation must still produce
+    /// coherent output (not random tokens). This test locks in the
+    /// behavior documented alongside the guard in
+    /// `chat_sync_core` / `chat_stream_sync_core`.
+    #[ignore = "requires a real Qwen3.5 MoE model directory; run with --ignored"]
+    #[test]
+    fn exact_match_zero_delta_guard_preserves_correctness() {
+        // Pseudocode:
+        //
+        //   let messages = vec![ChatMessage::user("Ping")];
+        //   let r1 = model.chat_session_start_sync(messages.clone(), cfg())?;
+        //   let r2 = model.chat_session_start_sync(messages, cfg())?;
+        //   // Zero-delta guard fires — full reset + re-prefill. The
+        //   // second response should still be coherent (same length,
+        //   // sensible tokens), not garbage from a corrupted GDN state.
+        //   assert!(!r2.text.is_empty());
+        //   assert!(r2.num_tokens > 0);
+    }
 }

@@ -257,7 +257,7 @@ impl Qwen3Tokenizer {
                 eprintln!("Warning: {}", warning);
                 let _ = warning; // Suppress unused warning in release builds
             }
-            return Some(template.to_string());
+            return Some(Self::patch_preserve_thinking(template));
         }
 
         // Second: try standalone chat_template.jinja file (used by Gemma4 HF snapshots)
@@ -270,10 +270,44 @@ impl Qwen3Tokenizer {
                 eprintln!("Warning: {}", warning);
                 let _ = warning;
             }
-            return Some(template);
+            return Some(Self::patch_preserve_thinking(&template));
         }
 
         None
+    }
+
+    /// Rewrite the Qwen3.5 chat-template reasoning gate so our `preserve_thinking=true`
+    /// context variable takes effect.
+    ///
+    /// The stock Qwen3.5 template gates `<think>…</think>` rendering on prior assistant
+    /// turns with `{%- if loop.index0 > ns.last_query_index %}`. `ns.last_query_index`
+    /// jumps forward when a fresh top-level user message arrives, so the moment a user
+    /// appends a follow-up, every prior assistant turn flips into the else branch and
+    /// silently drops its `<think>` block on re-render. That breaks the token-level
+    /// prefix equality that `verify_cache_prefix_direct` needs for tier-2 warm-session
+    /// reuse — a 19-turn agent session observed a 151s / 180s cold re-prefill on each
+    /// such boundary (see `.logging/requests.ndjson`, turns 11 and 16).
+    ///
+    /// We already pass `preserve_thinking=true` into the Jinja context
+    /// (`render_chat_template_jinja2`), but the shipped template never reads the
+    /// variable. Rather than fork the template per model, patch the gate at load time
+    /// so `preserve_thinking` wins regardless of `last_query_index`:
+    ///
+    ///   `loop.index0 > ns.last_query_index`
+    ///     → `preserve_thinking or loop.index0 > ns.last_query_index`
+    ///
+    /// Idempotent: if the template already references `preserve_thinking` (future
+    /// upstream templates, or our own re-patched string) the replacement becomes a
+    /// no-op. For templates that don't contain the Qwen3.5 gate at all (e.g. Gemma4,
+    /// LFM2, legacy ChatML) this is a silent pass-through.
+    fn patch_preserve_thinking(template: &str) -> String {
+        if template.contains("preserve_thinking") {
+            return template.to_string();
+        }
+        template.replace(
+            "loop.index0 > ns.last_query_index",
+            "preserve_thinking or loop.index0 > ns.last_query_index",
+        )
     }
 
     /// Load tokenizer from file synchronously (for internal use)
@@ -813,64 +847,65 @@ impl Qwen3Tokenizer {
 
         // Add Python-compatible string methods that Qwen3's template uses
         // These are called as methods on strings: content.startswith('prefix')
+        //
+        // Also bridges Python-dict `.get(key[, default])` on mappings,
+        // which Gemma4's chat_template.jinja relies on
+        // (`message.get('reasoning_content')`, `message.get('tool_calls')`)
+        // — miniJinja only exposes bracket access `map[key]` out of the
+        // box, and a missing `.get` aborts template rendering with
+        // `unknown method: map has no method named get`.
         env.set_unknown_method_callback(|_state, value, method, args| {
-            // Only handle string methods
+            // String methods (Qwen3.5 / LFM2 / Gemma4 all use these)
             if let Some(s) = value.as_str() {
                 match method {
                     "startswith" => {
                         if let Some(prefix) = args.first().and_then(|v| v.as_str()) {
                             return Ok(minijinja::Value::from(s.starts_with(prefix)));
                         }
-                        Err(minijinja::Error::new(
+                        return Err(minijinja::Error::new(
                             minijinja::ErrorKind::InvalidOperation,
                             "startswith requires a string argument",
-                        ))
+                        ));
                     }
                     "endswith" => {
                         if let Some(suffix) = args.first().and_then(|v| v.as_str()) {
                             return Ok(minijinja::Value::from(s.ends_with(suffix)));
                         }
-                        Err(minijinja::Error::new(
+                        return Err(minijinja::Error::new(
                             minijinja::ErrorKind::InvalidOperation,
                             "endswith requires a string argument",
-                        ))
+                        ));
                     }
                     "strip" => {
-                        // Python's strip() with optional chars argument
                         if let Some(chars) = args.first().and_then(|v| v.as_str()) {
-                            Ok(minijinja::Value::from(
+                            return Ok(minijinja::Value::from(
                                 s.trim_matches(|c| chars.contains(c)),
-                            ))
-                        } else {
-                            Ok(minijinja::Value::from(s.trim()))
+                            ));
                         }
+                        return Ok(minijinja::Value::from(s.trim()));
                     }
                     "lstrip" => {
                         if let Some(chars) = args.first().and_then(|v| v.as_str()) {
-                            Ok(minijinja::Value::from(
+                            return Ok(minijinja::Value::from(
                                 s.trim_start_matches(|c| chars.contains(c)),
-                            ))
-                        } else {
-                            Ok(minijinja::Value::from(s.trim_start()))
+                            ));
                         }
+                        return Ok(minijinja::Value::from(s.trim_start()));
                     }
                     "rstrip" => {
                         if let Some(chars) = args.first().and_then(|v| v.as_str()) {
-                            Ok(minijinja::Value::from(
+                            return Ok(minijinja::Value::from(
                                 s.trim_end_matches(|c| chars.contains(c)),
-                            ))
-                        } else {
-                            Ok(minijinja::Value::from(s.trim_end()))
+                            ));
                         }
+                        return Ok(minijinja::Value::from(s.trim_end()));
                     }
                     "split" => {
-                        // Python's str.split(sep=None, maxsplit=-1)
                         let delim = args.first().and_then(|v| v.as_str());
                         let maxsplit = args
                             .get(1)
                             .and_then(|v| i64::try_from(v.clone()).ok())
                             .filter(|&n| n >= 0);
-
                         let parts: Vec<&str> = match (delim, maxsplit) {
                             (Some(d), Some(n)) => s.splitn(n as usize + 1, d).collect(),
                             (Some(d), None) => s.split(d).collect(),
@@ -879,16 +914,47 @@ impl Qwen3Tokenizer {
                             }
                             (None, None) => s.split_whitespace().collect(),
                         };
-                        Ok(minijinja::Value::from(
+                        return Ok(minijinja::Value::from(
                             parts
                                 .into_iter()
                                 .map(minijinja::Value::from)
                                 .collect::<Vec<_>>(),
-                        ))
+                        ));
+                    }
+                    _ => {
+                        return Err(minijinja::Error::new(
+                            minijinja::ErrorKind::UnknownMethod,
+                            format!("string has no method named {}", method),
+                        ));
+                    }
+                }
+            }
+
+            // Map/dict methods (Gemma4 uses `.get(key[, default])`)
+            if value.kind() == minijinja::value::ValueKind::Map {
+                match method {
+                    "get" => {
+                        let key = args.first().ok_or_else(|| {
+                            minijinja::Error::new(
+                                minijinja::ErrorKind::InvalidOperation,
+                                "get requires a key argument",
+                            )
+                        })?;
+                        let key_str = key.as_str().ok_or_else(|| {
+                            minijinja::Error::new(
+                                minijinja::ErrorKind::InvalidOperation,
+                                "get key must be a string",
+                            )
+                        })?;
+                        let default = args.get(1).cloned().unwrap_or(minijinja::Value::UNDEFINED);
+                        match value.get_attr(key_str) {
+                            Ok(v) if !v.is_undefined() => Ok(v),
+                            _ => Ok(default),
+                        }
                     }
                     _ => Err(minijinja::Error::new(
                         minijinja::ErrorKind::UnknownMethod,
-                        format!("string has no method named {}", method),
+                        format!("map has no method named {}", method),
                     )),
                 }
             } else {
@@ -966,11 +1032,29 @@ impl Qwen3Tokenizer {
         // Note: enable_thinking defaults to true to allow model to think naturally.
         // Setting to false adds empty <think></think> tags which DISABLES thinking.
         // bos_token/eos_token: used by Gemma4 and other templates ({{ bos_token }}).
+        //
+        // `preserve_thinking=true` keeps `reasoning_content` rendered on
+        // EVERY prior assistant turn, not just on the most recent one after
+        // the last user query. Qwen3.5/3.6's template gate is
+        //   `preserve_thinking or loop.index0 > ns.last_query_index`
+        // which means when a NEW user message arrives mid-session,
+        // `last_query_index` jumps forward and all earlier assistant turns
+        // silently drop their `<think>…</think>` blocks on re-render. That
+        // flips the token prefix at the first reasoning boundary, so the
+        // server's tier-2 KV cache misses entirely and the next turn cold-
+        // prefills the full conversation. Pinning `preserve_thinking=true`
+        // keeps the rendered prompt byte-stable turn over turn so
+        // `verify_cache_prefix_direct` can reuse the prior cached prefix.
+        //
+        // Templates that don't read `preserve_thinking` (e.g. Qwen3
+        // non-thinking, LFM2, Gemma4) ignore the extra key — minijinja
+        // treats unknown variables in `context!` as a no-op on access.
         let ctx = context! {
             messages => messages_value,
             tools => tools_value,
             add_generation_prompt => add_generation_prompt,
             enable_thinking => enable_thinking.unwrap_or(true),
+            preserve_thinking => true,
             bos_token => bos_token,
             eos_token => eos_token,
         };
@@ -1578,6 +1662,445 @@ mod tests {
         assert!(
             user_turn.contains("What is this?"),
             "user text missing from user turn after sanitize: {user_turn}",
+        );
+    }
+
+    /// Minimal slice of the stock Qwen3.5 chat template — just the
+    /// last-query-index scan and the assistant `<think>` gate. Used by
+    /// the preserve-thinking regression tests to verify the fix does what
+    /// we say it does on the exact expression we rewrite at load time,
+    /// without the noise of the full 7 KB template.
+    ///
+    /// Simplification vs. the shipped template: the tool-response check
+    /// `content.startswith('<tool_response>')` is dropped — miniJinja's
+    /// string-method bridge lives in `render_chat_template_jinja2` and we
+    /// want these tests self-contained. All test fixtures use plain
+    /// user text that never matches that branch anyway.
+    const QWEN35_GATE_SLICE: &str = "{%- set ns = namespace(last_query_index=-1) %}\n{%- for message in messages %}\n    {%- if message.role == \"user\" %}\n        {%- set ns.last_query_index = loop.index0 %}\n    {%- endif %}\n{%- endfor %}\n{%- for message in messages %}\n    {%- set content = message.content|trim %}\n    {%- if message.role == \"user\" %}\n        {{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>' + '\\n' }}\n    {%- elif message.role == \"assistant\" %}\n        {%- set reasoning_content = '' %}\n        {%- if message.reasoning_content is string %}\n            {%- set reasoning_content = message.reasoning_content %}\n        {%- endif %}\n        {%- set reasoning_content = reasoning_content|trim %}\n        {%- if loop.index0 > ns.last_query_index %}\n            {{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content + '\\n</think>\\n\\n' + content + '<|im_end|>\\n' }}\n        {%- else %}\n            {{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>\\n' }}\n        {%- endif %}\n    {%- endif %}\n{%- endfor %}";
+
+    /// Build the Jinja env the same way `render_chat_template_jinja2` does
+    /// (minus the string-method bridge, which this slice doesn't need).
+    /// Keeps the fix tests rendering through the SAME `tojson` filter
+    /// production uses, so any future filter drift trips these tests too.
+    fn jinja_env() -> Environment<'static> {
+        let mut env = Environment::new();
+        env.add_filter("tojson", |value: minijinja::Value| -> String {
+            serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string())
+        });
+        env
+    }
+
+    #[test]
+    fn patch_preserve_thinking_rewrites_qwen35_gate() {
+        let patched = Qwen3Tokenizer::patch_preserve_thinking(QWEN35_GATE_SLICE);
+        assert!(
+            patched.contains("preserve_thinking or loop.index0 > ns.last_query_index"),
+            "patched template missing preserve_thinking clause:\n{patched}",
+        );
+        // The stock gate (without the new disjunct) must be gone — any
+        // leftover copy would still drop <think> on old assistants.
+        let stock_occurrences = patched.matches("loop.index0 > ns.last_query_index").count();
+        let preserve_occurrences = patched.matches("preserve_thinking or").count();
+        assert_eq!(
+            stock_occurrences, preserve_occurrences,
+            "every `loop.index0 > ns.last_query_index` must be prefixed with `preserve_thinking or`",
+        );
+    }
+
+    #[test]
+    fn patch_preserve_thinking_is_idempotent() {
+        let once = Qwen3Tokenizer::patch_preserve_thinking(QWEN35_GATE_SLICE);
+        let twice = Qwen3Tokenizer::patch_preserve_thinking(&once);
+        assert_eq!(
+            once, twice,
+            "patching twice must be a no-op so `preserve_thinking` never gets nested",
+        );
+    }
+
+    #[test]
+    fn patch_preserve_thinking_passthrough_on_unrelated_templates() {
+        // Templates that don't carry the Qwen3.5 gate (Gemma4 / LFM2 /
+        // minimal ChatML) must survive verbatim — no `replace` call is
+        // allowed to silently corrupt their control flow.
+        let gemma4 = "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}";
+        assert_eq!(Qwen3Tokenizer::patch_preserve_thinking(gemma4), gemma4);
+    }
+
+    /// Reproduces the turn-15 → turn-16 divergence from
+    /// `.logging/requests.ndjson`: same assistant ChatMessage, rendered
+    /// once as the end-of-turn cache state (no new user yet) and once as
+    /// the next-turn echo (new user appended). The stock Qwen3.5 gate
+    /// drops the prior assistant's `<think>` on the second render,
+    /// breaking the byte-equal prefix `verify_cache_prefix_direct`
+    /// expects. The patch must restore parity.
+    #[test]
+    fn preserve_thinking_keeps_think_block_when_new_user_turn_appended() {
+        let env = jinja_env();
+
+        let patched = Qwen3Tokenizer::patch_preserve_thinking(QWEN35_GATE_SLICE);
+        let build = |messages: Vec<serde_json::Value>, preserve: bool| {
+            let mut env = env.clone();
+            env.add_template("chat", &patched).unwrap();
+            let tmpl = env.get_template("chat").unwrap();
+            tmpl.render(context! {
+                messages => messages,
+                preserve_thinking => preserve,
+            })
+            .unwrap()
+        };
+
+        let assistant = serde_json::json!({
+            "role": "assistant",
+            "content": "Done.",
+            "reasoning_content": "step-by-step reasoning",
+        });
+        let msgs_end_of_turn = vec![
+            serde_json::json!({ "role": "user", "content": "Hi" }),
+            assistant.clone(),
+        ];
+        let msgs_new_user_appended = vec![
+            serde_json::json!({ "role": "user", "content": "Hi" }),
+            assistant.clone(),
+            serde_json::json!({ "role": "user", "content": "Follow-up?" }),
+        ];
+
+        // Patched template + preserve_thinking=true: the assistant turn
+        // must render identically in both contexts, so the warm cache
+        // carries over to the follow-up turn byte-for-byte.
+        let r_before = build(msgs_end_of_turn.clone(), true);
+        let r_after = build(msgs_new_user_appended.clone(), true);
+
+        let extract_assistant = |rendered: &str| -> String {
+            let start = rendered.find("<|im_start|>assistant").unwrap();
+            let end_rel = rendered[start..].find("<|im_end|>").unwrap();
+            rendered[start..start + end_rel + "<|im_end|>\n".len()].to_string()
+        };
+
+        assert_eq!(
+            extract_assistant(&r_before),
+            extract_assistant(&r_after),
+            "with preserve_thinking=true the echoed assistant turn must match the end-of-turn render",
+        );
+        assert!(
+            extract_assistant(&r_after).contains("<think>\nstep-by-step reasoning\n</think>"),
+            "echoed assistant turn must keep the <think> block intact",
+        );
+
+        // Control: with preserve_thinking=false (the stock behavior we
+        // used to ship before the patch propagated) the `<think>` block
+        // gets dropped when a new user arrives — which is exactly the
+        // miss we observed on turn 16.
+        let r_after_stock = build(msgs_new_user_appended, false);
+        assert!(
+            !extract_assistant(&r_after_stock).contains("<think>"),
+            "stock gate (preserve_thinking=false) should drop <think> when a new user turn appends — sanity check on the control",
+        );
+    }
+
+    /// Cache-reuse regression: the same assistant ChatMessage shape that
+    /// turn 10 emitted (reasoning + content + two function_calls with
+    /// schema-declared arg order `[path, edits]`) must re-render
+    /// byte-for-byte across two consecutive tool-loop turns. Before we
+    /// enabled serde_json's `preserve_order`, the BTreeMap default
+    /// alphabetised `path`+`edits` into `edits`+`path`, swapping two
+    /// `<parameter=…>` blocks and zeroing the cache at turn 11.
+    /// End-to-end render of the stock Gemma4 chat_template.jinja
+    /// through the production `render_chat_template_jinja2` entry
+    /// point. `#[ignore]`-gated because the template lives in
+    /// `.cache/` and tests run without network; opt in locally with
+    /// `cargo test gemma4_full_template_renders -- --include-ignored`.
+    ///
+    /// This guards against future template features (Python idioms,
+    /// new filters) we haven't bridged — the Jinja engine aborts
+    /// rendering with `unknown method: … has no method named X` the
+    /// moment it meets one it doesn't know.
+    #[test]
+    #[ignore]
+    fn gemma4_full_template_renders_without_missing_methods() {
+        let path = "/Users/brooklyn/workspace/github/mlx-node/.cache/models/gemma-4-26b-a4b-it-UD-Q8_K_XL-mlx/chat_template.jinja";
+        let Ok(tmpl) = std::fs::read_to_string(path) else {
+            // Skip silently when the fixture isn't checked out locally.
+            return;
+        };
+        let msgs = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "hello".to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            images: None,
+        }];
+        let tools = vec![ToolDefinition {
+            r#type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "read".to_string(),
+                description: Some("Read a file".to_string()),
+                parameters: Some(FunctionParameters {
+                    r#type: "object".to_string(),
+                    properties: Some(
+                        r#"{"path":{"type":"string","description":"file path"}}"#.to_string(),
+                    ),
+                    required: Some(vec!["path".to_string()]),
+                }),
+            },
+        }];
+        let rendered = Qwen3Tokenizer::render_chat_template_jinja2(
+            &tmpl,
+            &msgs,
+            Some(&tools),
+            true,
+            Some(true),
+            "<bos>",
+            "<eos>",
+        )
+        .unwrap_or_else(|e| {
+            panic!("Gemma4 template render failed: {e}");
+        });
+        assert!(
+            rendered.contains("<|turn>user"),
+            "rendered prompt missing user turn marker:\n{rendered}",
+        );
+        assert!(
+            rendered.contains("<|tool>"),
+            "rendered prompt missing tool declaration block:\n{rendered}",
+        );
+    }
+
+    /// Gemma4's chat_template.jinja leans on Python's dict `.get()`
+    /// idiom (`message.get('reasoning_content')`,
+    /// `message.get('tool_calls')`, etc.) to avoid UndefinedError when
+    /// an optional key is absent. miniJinja only ships bracket access
+    /// out of the box, so we bridge `.get` ourselves in
+    /// `render_chat_template_jinja2`. If this test fails, any Gemma4
+    /// request aborts at template render time with
+    /// `unknown method: map has no method named get`.
+    #[test]
+    fn map_get_bridge_mirrors_python_dict_get() {
+        // Reuse the production Jinja setup — the bridge lives inside
+        // `render_chat_template_jinja2`, so driving a real ChatMessage
+        // through it exercises exactly the call site the shipped
+        // template hits.
+        let msg = ChatMessage {
+            role: "assistant".to_string(),
+            content: "hello".to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: Some("because".to_string()),
+            images: None,
+        };
+        // Minimal template that drives the fixture map through `.get()`
+        // three different ways — hit, miss (no default), miss (with
+        // default). Any drift in the bridge trips this test.
+        let template = "{% set m = messages[0] %}{{ m.get('role') }}|{{ m.get('missing') }}|{{ m.get('missing', 'fallback') }}|{{ m.get('reasoning_content') }}";
+        let rendered = Qwen3Tokenizer::render_chat_template_jinja2(
+            template,
+            std::slice::from_ref(&msg),
+            None,
+            false,
+            None,
+            "<bos>",
+            "<eos>",
+        )
+        .unwrap();
+        // Undefined keys render to the empty string by default —
+        // matching Python-Jinja behaviour for `dict.get(missing)`.
+        assert_eq!(rendered, "assistant||fallback|because");
+    }
+
+    #[test]
+    fn function_call_arg_order_survives_jinja_round_trip() {
+        let mut env = jinja_env();
+        let patched = Qwen3Tokenizer::patch_preserve_thinking(QWEN35_GATE_SLICE);
+        env.add_template("chat", &patched).unwrap();
+
+        // Args string exactly as pi-mono would echo it back — note
+        // `path` first, matching the tool schema's `required` order
+        // and whatever the model emitted on the prior turn.
+        let args = r#"{"path":"/a.json","edits":[{"oldText":"x","newText":"y"}]}"#;
+        let call = ToolCall {
+            id: Some("call_1".to_string()),
+            name: "edit".to_string(),
+            arguments: args.to_string(),
+        };
+        let msg = ChatMessage {
+            role: "assistant".to_string(),
+            content: "Making the edit.".to_string(),
+            tool_calls: Some(vec![call]),
+            tool_call_id: None,
+            reasoning_content: Some("think".to_string()),
+            images: None,
+        };
+        let v = serialize_message_for_jinja(&msg);
+
+        // The parsed arguments object, as the template sees it, must
+        // iterate in the echoed order. Without `preserve_order` this
+        // would come back alphabetised.
+        let parsed_args = &v["tool_calls"][0]["arguments"];
+        let keys: Vec<&str> = parsed_args
+            .as_object()
+            .expect("arguments parsed into an object")
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["path", "edits"],
+            "arg-key order must match echoed JSON (preserve_order feature must be on)",
+        );
+
+        // miniJinja's `|items` has to iterate in insertion order so
+        // the template's `<parameter=…>` blocks come out in echoed
+        // order. This is orthogonal from serde_json's `preserve_order`
+        // — miniJinja has its OWN `preserve_order` feature flag, and
+        // without it the `serde_json::Value → minijinja::Value`
+        // conversion still alphabetises. Both flags must be on.
+        let it_tmpl = "{%- for k, _v in args|items -%}{{ k }}|{%- endfor -%}";
+        let mut dbg_env = Environment::new();
+        dbg_env.add_template("d", it_tmpl).unwrap();
+        let dbg_out = dbg_env
+            .get_template("d")
+            .unwrap()
+            .render(context! { args => parsed_args.clone() })
+            .unwrap();
+        assert_eq!(
+            dbg_out, "path|edits|",
+            "miniJinja must iterate args in insertion order (requires the `preserve_order` feature on the `minijinja` dependency)",
+        );
+
+        // Round-trip through the minimal gate slice + tojson: the
+        // rendered prompt has to embed the args in that same order.
+        // We wrap serialize_message_for_jinja in a throwaway template
+        // that exercises the same `| tojson` that the real assistant
+        // block uses for array-typed parameter values.
+        let test_template = "{%- for msg in messages -%}\n{%- if msg.role == 'assistant' and msg.tool_calls -%}\n{%- for tc in msg.tool_calls -%}\n<function={{ tc.name }}>\n{%- for name, value in tc.arguments|items -%}\n<parameter={{ name }}>{% if value is mapping or (value is sequence and value is not string) %}{{ value | tojson }}{% else %}{{ value }}{% endif %}</parameter>\n{%- endfor -%}\n</function>\n{%- endfor -%}\n{%- endif -%}\n{%- endfor -%}";
+        let mut rt = Environment::new();
+        rt.add_filter("tojson", |value: minijinja::Value| -> String {
+            serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string())
+        });
+        rt.add_template("t", test_template).unwrap();
+        let messages_value = vec![v.clone()];
+        let rendered = rt
+            .get_template("t")
+            .unwrap()
+            .render(context! { messages => messages_value })
+            .unwrap();
+
+        let path_idx = rendered.find("<parameter=path>").expect("path rendered");
+        let edits_idx = rendered.find("<parameter=edits>").expect("edits rendered");
+        assert!(
+            path_idx < edits_idx,
+            "path must render before edits (got path={path_idx}, edits={edits_idx}):\n{rendered}",
+        );
+    }
+
+    /// Gemma4 template echoes `reasoning_content` inside a
+    /// `<|channel>thought\n{thinking_text}\n<channel|>` block (see
+    /// `.cache/models/gemma-4-*-mlx/chat_template.jinja` line 238). The
+    /// label `thought\n` is hardcoded by the template, which means
+    /// `reasoning_content` MUST carry only the body — NOT the label.
+    ///
+    /// Our Gemma4 output parser historically stored the full body incl.
+    /// the `thought\n` prefix inside `thinking`. When pi-mono echoed
+    /// that back verbatim as `reasoning_summary.text` → mapper
+    /// coalesced it into `reasoning_content`, the template re-emitted
+    /// `<|channel>thought\nthought\n{body}\n<channel|>` — a byte-level
+    /// divergence from the cached prefix, zeroing `verify_cache_prefix`
+    /// on every turn. Fix: strip the leading `thought\n` in the parser
+    /// before saving to `thinking`. Guard that invariant here.
+    ///
+    /// Regression test for Gemma4 cache-reuse (always `cached_tokens=0`
+    /// under pi-mono) — see `.logging-gemma/requests.ndjson` turns 2-7.
+    #[test]
+    fn gemma4_reasoning_echo_renders_byte_for_byte_with_model_generation() {
+        let path = "/Users/brooklyn/workspace/github/mlx-node/.cache/models/gemma-4-26b-a4b-it-UD-Q8_K_XL-mlx/chat_template.jinja";
+        let Ok(tmpl) = std::fs::read_to_string(path) else {
+            // Skip when the fixture isn't checked out locally.
+            return;
+        };
+
+        // What the MODEL originally emitted on turn 1 between the two
+        // channel markers. This is the slice that ends up inside the
+        // cache's KV state after the decode loop.
+        let model_channel_body = "The user wants me to run ls.";
+        let model_generated = format!(
+            "<|channel>thought\n{model_channel_body}\n<channel|><|tool_call>call:bash{{command:<|\"|>ls<|\"|>}}<tool_call|>"
+        );
+
+        // Turn 2 echoes the parsed output back through the Responses
+        // mapper. Simulate the coalesced ChatMessage shape it produces:
+        // reasoning_content is whatever the parser returned, which
+        // (after the fix) must be the body WITHOUT the `thought\n`
+        // label — so when the Gemma4 template re-renders, it emits
+        // exactly what the model originally generated.
+        //
+        // We test both directions: the bug shape (with `thought\n`
+        // preserved) must produce a divergent render, and the fixed
+        // shape (body only) must produce a byte-equal render.
+        let parsed_via_bug = format!("thought\n{model_channel_body}");
+        let parsed_via_fix = model_channel_body.to_string();
+
+        let build_messages = |reasoning: &str| {
+            vec![
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: "Run ls.".to_string(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                    images: None,
+                },
+                ChatMessage {
+                    role: "assistant".to_string(),
+                    content: String::new(),
+                    tool_calls: Some(vec![ToolCall {
+                        id: Some("call_1".to_string()),
+                        name: "bash".to_string(),
+                        arguments: r#"{"command":"ls"}"#.to_string(),
+                    }]),
+                    tool_call_id: None,
+                    reasoning_content: Some(reasoning.to_string()),
+                    images: None,
+                },
+            ]
+        };
+
+        let render = |reasoning: &str| {
+            Qwen3Tokenizer::render_chat_template_jinja2(
+                &tmpl,
+                &build_messages(reasoning),
+                None,
+                /*add_generation_prompt=*/ true,
+                /*enable_thinking=*/ Some(true),
+                "<bos>",
+                "<eos>",
+            )
+            .unwrap()
+        };
+
+        let rendered_bug = render(&parsed_via_bug);
+        let rendered_fix = render(&parsed_via_fix);
+
+        // Bug shape: the template re-emits `thought\n` before the
+        // echoed reasoning, producing DOUBLED `thought\n` in the
+        // rendered channel block — NOT what the model generated.
+        assert!(
+            rendered_bug.contains("<|channel>thought\nthought\nThe user wants"),
+            "bug shape should produce doubled `thought\\n` in rendered prompt:\n{rendered_bug}"
+        );
+
+        // Fixed shape: the template re-emits `thought\n` exactly once,
+        // matching what the model generated during turn 1 decode. This
+        // is the byte sequence that was saved to `cached_token_history`
+        // (post-tokenization) and the byte sequence turn 2 must
+        // re-produce in order for `verify_cache_prefix` to succeed.
+        assert!(
+            rendered_fix.contains(model_generated.as_str()),
+            "fixed shape must re-render the model-generated slice byte-for-byte; \
+             model generated:\n  {model_generated:?}\nrendered prompt was:\n{rendered_fix}"
+        );
+        assert!(
+            !rendered_fix.contains("thought\nthought\n"),
+            "fixed shape must NOT double `thought\\n`:\n{rendered_fix}"
         );
     }
 }
