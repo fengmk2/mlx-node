@@ -296,6 +296,205 @@ describe('handleCreateMessage', () => {
       expect(parsed.error.type).toBe('not_found_error');
       expect(parsed.error.message).toContain('nonexistent');
     });
+
+    it('does NOT call resolveModel when mapAnthropicRequest will reject the body as 400', async () => {
+      // Regression: previously `resolveModel` ran AFTER shallow validation but
+      // BEFORE `mapAnthropicRequest`, so a malformed-but-shallow-valid request
+      // (e.g. an unsupported content block type) triggered a multi-second
+      // model load — and possibly evicted the currently-resident model — just
+      // to return 400 a moment later.
+      //
+      // Fix: hoist the (pure-transform) `mapAnthropicRequest` above the
+      // resolveModel hook so mapping errors short-circuit before any load.
+      const registry = new ModelRegistry();
+      const resolveModel = vi.fn().mockResolvedValue(undefined);
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [
+            {
+              role: 'user',
+              content: [
+                // Unsupported block type — mapAnthropicRequest throws.
+                { type: 'mystery_block_type', text: 'oops' } as any,
+              ],
+            },
+          ],
+          max_tokens: 100,
+        },
+        registry,
+        undefined,
+        null,
+        resolveModel,
+      );
+
+      // The critical assertion: the lazy-load hook MUST NOT have fired for a
+      // request that was destined to 400 on mapping. Asserted first because
+      // it's the load-bearing claim of this regression test.
+      expect(resolveModel).not.toHaveBeenCalled();
+      expect(getStatus()).toBe(400);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.type).toBe('error');
+      expect(parsed.error.type).toBe('invalid_request_error');
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Idle sweeper bracketing of resolveModel
+  // -----------------------------------------------------------------------
+
+  describe('resolveModel idle-sweeper bracketing', () => {
+    it('wraps resolveModel in withSuspendedDrains BEFORE beginRequest fires', async () => {
+      // Regression: in `mlx launch claude` mode `resolveModel` may run a
+      // 30s `loadModel()` on first sight of an unknown name. The previous
+      // request's `endRequest()` arms a 30s drain timer that fires
+      // `clearCache()` on expiry. If we did NOT bracket the lazy-load
+      // call, the timer could fire MID-LOAD while weight materialization
+      // was still allocating through the Metal free pool — exactly the
+      // hot-load race that `withSuspendedDrains` exists to prevent.
+      //
+      // The fix wraps the `resolveModel(...)` invocation in
+      // `idleSweeper.withSuspendedDrains(...)` so the drain is suspended
+      // for the full duration of the load. The bracket MUST land BEFORE
+      // `beginRequest()` (which itself only cancels an already-armed
+      // timer; it does not protect against a timer that fires *during*
+      // the await on resolveModel before beginRequest runs).
+      const registry = new ModelRegistry();
+      const { res } = createMockRes();
+
+      // Side-effect: register the model so the post-resolveModel
+      // `registry.get(...)` lookup succeeds and the handler proceeds
+      // through dispatch. The mock model simply returns a canned
+      // `ChatResult`.
+      const mockModel = createMockModel();
+      const resolveOrder: string[] = [];
+      const resolveModel = vi.fn(async (_name: string) => {
+        resolveOrder.push('resolveModel:enter');
+        // Force at least one event-loop turn so the await is real.
+        await new Promise<void>((resolve) => setTimeout(resolve, 10));
+        registry.register('test-model', mockModel);
+        resolveOrder.push('resolveModel:exit');
+      });
+
+      // Fake idle sweeper. `withSuspendedDrains` simply runs the supplied
+      // function; the assertion is purely on call ordering.
+      const withSuspendedDrains = vi.fn(async <T>(fn: () => T | Promise<T>): Promise<T> => {
+        return await fn();
+      });
+      const beginRequest = vi.fn();
+      const endRequest = vi.fn();
+      const fakeSweeper = {
+        withSuspendedDrains,
+        beginRequest,
+        endRequest,
+        suspendDrains: vi.fn(() => () => {}),
+        close: vi.fn(),
+        isPending: false,
+        inFlight: 0,
+      };
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+        },
+        registry,
+        undefined,
+        fakeSweeper as any,
+        resolveModel,
+      );
+
+      // Load-bearing assertion #1: resolveModel was actually invoked.
+      expect(resolveModel).toHaveBeenCalledTimes(1);
+      expect(resolveModel).toHaveBeenCalledWith('test-model');
+
+      // Load-bearing assertion #2: the bracket wraps resolveModel.
+      expect(withSuspendedDrains).toHaveBeenCalledTimes(1);
+      expect(resolveOrder).toEqual(['resolveModel:enter', 'resolveModel:exit']);
+
+      // Load-bearing assertion #3: withSuspendedDrains runs BEFORE
+      // beginRequest. Without this ordering the previous request's
+      // armed timer could fire mid-load.
+      expect(beginRequest).toHaveBeenCalledTimes(1);
+      expect(withSuspendedDrains.mock.invocationCallOrder[0]).toBeLessThan(beginRequest.mock.invocationCallOrder[0]);
+
+      // Sanity: the matching endRequest fires.
+      expect(endRequest).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns 500 with an Anthropic-shape error envelope when resolveModel rejects', async () => {
+      // Regression: previously `resolveModel` ran outside any try/catch in
+      // this handler, so a rejection (bad model path, corrupt weights,
+      // native loader error in `mlx launch claude` mode) bubbled up to the
+      // outer `createHandler` catch which emits the OpenAI-shape
+      // `{ "error": { type, message } }` body via `sendInternalError`.
+      // This endpoint is `/v1/messages` (Anthropic) — clients parse the
+      // `{ "type": "error", "error": { "type": "api_error", "message": ... } }`
+      // envelope, so the OpenAI-shape body could not be parsed.
+      //
+      // Fix: wrap the `resolveModel(...)` call in a try/catch and route
+      // failures through `sendAnthropicInternalError`. Mirrors the
+      // `mapAnthropicRequest` try/catch a few lines above in the same handler.
+      const registry = new ModelRegistry();
+      const resolveModel = vi.fn().mockRejectedValue(new Error('bad model path'));
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+        },
+        registry,
+        undefined,
+        null,
+        resolveModel,
+      );
+
+      expect(resolveModel).toHaveBeenCalledTimes(1);
+      expect(getStatus()).toBe(500);
+      const parsed = JSON.parse(getBody());
+      // Anthropic-shape envelope: `{ type: 'error', error: { type, message } }`
+      // (see `sendAnthropicInternalError` in `packages/server/src/errors.ts`).
+      expect(parsed.type).toBe('error');
+      expect(parsed.error.type).toBe('api_error');
+      expect(parsed.error.message).toContain('bad model path');
+    });
+
+    it('falls back to a direct resolveModel call when no idle sweeper is provided', async () => {
+      // The bracket is conditional on `idleSweeper != null` so a host
+      // that opted out (or hasn't wired one) still gets the lazy-load
+      // hook fired. Asserts the fallback branch.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel();
+      const resolveModel = vi.fn(async (_name: string) => {
+        registry.register('test-model', mockModel);
+      });
+      const { res, getStatus } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+        },
+        registry,
+        undefined,
+        // No sweeper → direct call.
+        null,
+        resolveModel,
+      );
+
+      expect(resolveModel).toHaveBeenCalledTimes(1);
+      expect(getStatus()).toBe(200);
+    });
   });
 
   // -----------------------------------------------------------------------

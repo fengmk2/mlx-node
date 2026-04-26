@@ -459,6 +459,7 @@ export async function handleCreateMessage(
   registry: ModelRegistry,
   httpReq?: IncomingMessage,
   idleSweeper?: IdleSweeper | null,
+  resolveModel?: (name: string) => Promise<void>,
 ): Promise<void> {
   if (body == null || typeof body !== 'object') {
     sendAnthropicBadRequest(res, 'Request body must be a JSON object');
@@ -480,6 +481,60 @@ export async function handleCreateMessage(
   for (const msg of body.messages) {
     if (msg == null || typeof msg !== 'object') {
       sendAnthropicBadRequest(res, 'Each message must be a non-null object');
+      return;
+    }
+  }
+
+  // Run the Anthropic→internal mapping BEFORE the lazy-load hook.
+  //
+  // Background: in `mlx launch claude` mode `resolveModel` may load a
+  // 27GB model from disk (~30s) on first sight of an unknown name. If
+  // we then fail mapping (unsupported role, malformed tool block, etc.)
+  // we've burned a load — and possibly evicted the currently-resident
+  // model — just to return 400 a moment later. Mapping is a pure
+  // transform with no side effects, so it's safe to hoist above
+  // resolveModel and use as a cheap pre-flight gate.
+  let mappedMessages: ChatMessage[];
+  let mappedConfig: ChatConfig;
+  try {
+    ({ messages: mappedMessages, config: mappedConfig } = mapAnthropicRequest(body));
+  } catch (err) {
+    sendAnthropicBadRequest(res, err instanceof Error ? err.message : 'Invalid request');
+    return;
+  }
+
+  // Lazy-load hook: give the host a chance to register the requested
+  // model before we look it up. Errors bubble up to the handler's
+  // top-level catch which returns 500.
+  //
+  // The load is bracketed by `idleSweeper.withSuspendedDrains` so the
+  // post-request drain timer armed by the PREVIOUS request's
+  // `endRequest()` cannot fire mid-load. In `mlx launch claude` mode
+  // `resolveModel` may invoke a 30s `loadModel()` on first sight of an
+  // unknown name; if the prior request's matching `endRequest()`
+  // armed the default 30s drain immediately before this load began,
+  // the timer would otherwise call `clearCache()` while weight
+  // materialization was still allocating through the Metal free pool —
+  // exactly the hot-load race `withSuspendedDrains` exists to prevent.
+  // The wrapper handles try/finally itself and is a pass-through on
+  // the disabled sweeper, so the bracket is unconditional whenever
+  // a sweeper is supplied.
+  if (resolveModel) {
+    // A throw here (bad model path, corrupt weights, native loader failure)
+    // would otherwise bubble up to the outer `createHandler` catch which
+    // emits the OpenAI-shape `{ error: ... }` envelope via `sendInternalError`.
+    // This endpoint is Anthropic; clients parse the
+    // `{ type: 'error', error: { type, message } }` shape, so we must
+    // serialize the failure through `sendAnthropicInternalError` here. Mirrors
+    // the `mapAnthropicRequest` try/catch above.
+    try {
+      if (idleSweeper) {
+        await idleSweeper.withSuspendedDrains(() => resolveModel(body.model));
+      } else {
+        await resolveModel(body.model);
+      }
+    } catch (err) {
+      sendAnthropicInternalError(res, err instanceof Error ? err.message : 'Failed to resolve model');
       return;
     }
   }
@@ -549,14 +604,11 @@ export async function handleCreateMessage(
     // downstream to catch the race later.
     const preLockInstanceId: number = lease.instanceId;
 
-    let messages: ChatMessage[];
-    let config: ChatConfig;
-    try {
-      ({ messages, config } = mapAnthropicRequest(body));
-    } catch (err) {
-      sendAnthropicBadRequest(res, err instanceof Error ? err.message : 'Invalid request');
-      return;
-    }
+    // `mapAnthropicRequest` already ran (and succeeded) above as a cheap
+    // pre-flight gate before `resolveModel` so a malformed request can't
+    // trigger a multi-second model load just to 400 a moment later.
+    const messages: ChatMessage[] = mappedMessages;
+    const config: ChatConfig = mappedConfig;
 
     // Canonicalize every assistant fan-out's trailing tool block against its
     // declared sibling order. Several native session backends pair tool results
