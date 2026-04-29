@@ -37,12 +37,12 @@
     "oxc-parser": "^0.126.0",
     "prettier": "^3.8.3",
     "typescript": "^6.0.3",
-    "vite-plus": "^0.1.18",
+    "vite-plus": "0.1.20-alpha.4",
     "vitest": "^4.1.4"
   },
   "resolutions": {
-    "vite": "npm:@voidzero-dev/vite-plus-core@latest",
-    "vitest": "npm:@voidzero-dev/vite-plus-test@latest"
+    "vite": "npm:@voidzero-dev/vite-plus-core@0.1.20-alpha.4",
+    "vitest": "npm:@voidzero-dev/vite-plus-test@0.1.20-alpha.4"
   },
   "packageManager": "yarn@4.13.0"
 }
