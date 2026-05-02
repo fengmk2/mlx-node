@@ -379,6 +379,71 @@ for await (const event of session.sendStream('Hello!')) { ... }
 
 ---
 
+## Block-paged KV cache (vLLM-aligned, opt-in)
+
+A second KV-cache backend lives alongside the legacy flat `Vec<KVCache>` path: a vLLM-style block-paged adapter that lets multiple in-flight requests share refcounted KV blocks for any prompt prefix they have in common (system prompt, shared few-shot preamble, repeated tool-result frames, etc.). It is **off by default** behind the per-model `use_block_paged_cache` config flag (`Option<bool>`, defaults to `None` / treated as `false`) and only the full-attention layers of supported models route through it — sliding-window, conv, and recurrent (GDN) layers continue to use their existing dedicated cache types regardless of the flag.
+
+### Foundation types (`crates/mlx-paged-attn` + `crates/mlx-core/src/transformer`)
+
+- `BlockAllocator` (`crates/mlx-paged-attn/src/block_allocator.rs`) — owns the _logical_ lifecycle: per-block refcounts, LRU eviction, and the prefix-hash table that lets a new request find blocks left over from a prior request whose token prefix matches.
+- `LayerKVPool` (`crates/mlx-paged-attn/src/layer_kv_pool.rs`) — owns the _physical_ storage: per-layer Metal `Buffer` pairs (one for K, one for V) sized to the configured `paged_cache_memory_mb` budget. Independent from `BlockAllocator` so the legacy `CacheEngineManager` path is left untouched.
+- `PagedKVCacheAdapter` (`crates/mlx-core/src/transformer/paged_kv_cache_adapter.rs`) — the session-friendly wrapper the model forward path actually talks to. Holds `(Arc<Mutex<BlockAllocator>>, Arc<LayerKVPool>)` and exposes the per-request lifecycle: `reset_for_new_request` → `find_cached_prefix` → `allocate_suffix_blocks` → `record_tokens` (per token) → `register_full_blocks_for_reuse` → `release_request`.
+
+### Per-model support matrix
+
+| Model        | Config flag wired | Forward dispatch wired | Default | Notes                                                                                                                                                                                                     |
+| ------------ | :---------------: | :--------------------: | :-----: | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Qwen3**    |        Yes        |          Yes           |   **on**   | Default flipped 2026-04-28 after `qwen3_paged_vs_flat_parity` integration test verified greedy byte-equal + prefix-reuse byte-equal at BF16 against real Qwen3-0.6B weights. Opt out via `use_block_paged_cache: Some(false)`. |
+| **LFM2.5**   |        Yes        |          Yes           |   **on**   | Default flipped 2026-04-28 after `lfm2_paged_vs_flat_parity` integration test verified the same on real LFM2.5-1.2B weights. Hybrid arch: only `full_attention` layers use the adapter; conv layers stay on `Lfm2LayerCache::Conv`. Opt out via `use_block_paged_cache: Some(false)`.                                                               |
+| **Gemma4**   |        Yes        |          Yes           |   **on**   | Default flipped 2026-04-28 after `gemma4_paged_vs_flat_parity` integration test verified greedy byte-equal across 4 prompts × 32 tokens + two-turn prefix-reuse byte-equal at BF16 against real Gemma-4-E2B-IT weights. Forward dispatch: LFM2-style monolithic template + per-layer routing via `Gemma4LayerKind`. Sliding layers stay on flat `RotatingKVCache`; global layers route through the paged adapter; KV-shared layers consume the anchor's K/V via `SharedOnGlobal` (paged anchor) / `SharedOnSliding` (flat anchor stash). MoE/PLE/4-norm/layer-scalar reuse the existing `apply_ffn_ple_scalar` tail unchanged. **Final fix landed two pieces**: (1) `chat_tokens_delta_sync` and `chat_stream_tokens_delta_sync_inner` now early-return into `chat_sync_core_paged` / `chat_stream_sync_core_paged` when the adapter is configured (mirrors Qwen3's `chat_tokens_delta_sync` paged dispatch), reconstructing the full token history so `find_cached_prefix` rediscovers turn 1's registered prefix; previously the delta path always took the flat branch and forwarded through reset sliding caches with no global-layer K/V; (2) every decode loop (paged and all flat variants) calls `current_y.eval()` (or `y.eval()` for the paged loop, mirroring `qwen3/model.rs:2935`) before `item_at_int32(0)` because `read_scalar` (mlx_nn_ops.cpp) reads `arr.data<T>()` directly without forcing eval — async_eval'd sample tensors otherwise return raw uninitialized bits as the "token id" on iterations where no later forward consumes the previous tensor. Opt out via `use_block_paged_cache: Some(false)`. |
+| **Qwen3.5 Dense** |    Yes        |          Yes           |   off   | Forward dispatch wired via `Qwen3_5LayerKind` (`Linear` GDN / `FullAttentionPaged`). GDN linear-attention layers stay on flat `Qwen3_5LayerCache::Linear(ArraysCache)` and are reset+reprefilled every paged turn (no cross-request prefix reuse — vLLM `MambaManager` stance). Full-attention layers route through `Qwen3_5Attention::forward_paged`. **Compile lockout**: each chat-dispatch site (`chat_sync_core`, `chat_tokens_delta_sync`, `chat_stream_sync_inner`, `chat_stream_tokens_delta_sync_inner`) early-returns into `chat_sync_core_paged` / `chat_stream_sync_core_paged` BEFORE acquiring `DENSE_COMPILED_MUTEX`/`COMPILED_WEIGHTS_RWLOCK` and never calls `mlx_qwen35_compiled_init_from_prefill`, so flat-path turns and paged-path turns can interleave without corrupting compiled state. **VLM permitted (text-only)**: `set_vision_encoder` succeeds when `paged_adapter.is_some()`; chat-entry sites reject `has_images && paged_adapter` so image-bearing turns surface a clear runtime error while text-only turns proceed (text-only flat passes `position_ids = None` so `Qwen3_5Attention::forward` uses the same `self.rope` as `forward_paged`). Single-turn greedy parity verified byte-equal on Qwen3.5-0.8B BF16 (4 prompts × 32 tokens) on 2026-04-28 via `qwen3_5_paged_vs_flat_parity`. Default stays `Some(false)` until the perf trade-off versus the compiled C++ flat path (~6.4 tok/s on M3 Max) is profiled. |
+| **Qwen3.5 MoE**   |    Yes        |          Yes           |   off   | Same forward dispatch + compile-lockout as Qwen3.5 Dense; routes through MoE `DecoderLayer::forward_paged_or_flat` so the MoE/dense MLP variant stays unchanged. VLM checkpoints permitted under the same text-only contract as dense. Default stays `Some(false)` until `qwen3_5_moe_paged_vs_flat_parity` confirms parity on real weights (no MoE checkpoint locally available; gate compiles + skips cleanly without weights). |
+| Other models |         —         |           —            |    —    | OCR / document pipelines have no chat dispatch and no KV cache to retrofit.                                                                                                                               |
+
+The flag is **independent of `use_paged_attention`** — that knob drives the legacy `PagedKVCache` + `ContinuousBatchingScheduler` path, which is a different codepath. Both can be on or off independently.
+
+### Default flip + parity gate
+
+Qwen3, LFM2, and Gemma4 paged paths are byte-equal to the flat path under greedy decode, verified by:
+
+- `crates/mlx-core/tests/qwen3_paged_vs_flat_parity.rs` (gated on `MLX_TEST_MODEL_PATH=./.cache/models/qwen3-0.6b-mlx-bf16`)
+- `crates/mlx-core/tests/lfm2_paged_vs_flat_parity.rs` (gated on `MLX_TEST_MODEL_PATH=./.cache/models/lfm2.5-1.2b-thinking-mlx`)
+- `crates/mlx-core/tests/gemma4_paged_vs_flat_parity.rs` (gated on `MLX_TEST_MODEL_PATH=./.cache/models/gemma-4-e2b-it-mlx`)
+
+Run with `cargo test -p mlx-core --test qwen3_paged_vs_flat_parity -- --ignored --nocapture` (analogous for LFM2 / Gemma4). Without the env var, the tests skip cleanly. Pass criteria: byte-equal `tokens` and `raw_text` across 4 prompts × 32 tokens, plus byte-equal across a 2-turn dialog (validating `find_cached_prefix` + `finalize_turn_keep_live` cross-turn semantics).
+
+Qwen3.5 (Dense + MoE) stays default-off pending a perf decision (compiled C++ flat vs. pure-Rust paged). Qwen3.5 forward dispatch is wired; the parity-test scaffolds in `crates/mlx-core/tests/qwen3_5_paged_vs_flat_parity.rs` and `crates/mlx-core/tests/qwen3_5_moe_paged_vs_flat_parity.rs` are gated on `MLX_TEST_MODEL_PATH` and `#[ignore]`-marked so they compile + skip cleanly without weights. Dense parity is now byte-equal verified on Qwen3.5-0.8B BF16 (single-turn greedy, 4 prompts × 32 tokens, 2026-04-28); MoE parity is unverified pending a local MoE checkpoint.
+
+Server-side Phase 7 simplification (collapsing `SessionRegistry.getOrCreateWarmAny` from the `/v1/messages` warm-slot path, since the native block cache supersedes the JS-side warm slot for full-attention models) becomes safe to land for Qwen3/LFM2 traffic now that paged is on by default.
+
+### Parity gate (must pass before flipping the default)
+
+Before `use_block_paged_cache` can flip from `None` to `Some(true)`, the wired models must demonstrate byte-equal greedy-decode output between the flat path and the paged path on real weights. Three test surfaces gate the flip:
+
+- `crates/mlx-core/tests/qwen3_paged_vs_flat_parity.rs` — Qwen3 single-turn (4 prompts × 32 tokens) and two-turn (prefix-reuse) parity. Run with:
+  ```shell
+  MLX_TEST_MODEL_PATH=./.cache/models/qwen3-0.6b-mlx-bf16 \
+      cargo test -p mlx-core --test qwen3_paged_vs_flat_parity \
+      -- --ignored --nocapture
+  ```
+- `crates/mlx-core/tests/lfm2_paged_vs_flat_parity.rs` — LFM2 single-turn + two-turn parity (validates per-layer routing where conv layers bypass the adapter and only `full_attention` layers go through it). Run with:
+  ```shell
+  MLX_TEST_MODEL_PATH=./.cache/models/lfm2.5-1.2b-thinking-mlx \
+      cargo test -p mlx-core --test lfm2_paged_vs_flat_parity \
+      -- --ignored --nocapture
+  ```
+- `__test__/models/qwen3-paged-parity.test.ts` — Qwen3 end-to-end parity through the public NAPI surface. Loads two `Qwen3Model` instances from the same checkpoint (one with `use_block_paged_cache: true` patched into `config.json`) and asserts identical `text` and `numTokens` from `model.chatSessionStart(..., { temperature: 0 })`. (The TS test deliberately uses `chatSessionStart` rather than `generate`: `generate_sync` always uses fresh flat caches and never consults `paged_adapter`, so it would silently mask any paged-vs-flat divergence and falsely report parity.) The test is gated on `QWEN3_PAGED_PARITY_MODEL_PATH` (parallel to the Rust `MLX_TEST_MODEL_PATH` `#[ignore]` opt-in) and skips via `it.runIf` when the env var is unset, so the gate never blocks default CI:
+  ```shell
+  QWEN3_PAGED_PARITY_MODEL_PATH=./.cache/models/qwen3-0.6b-mlx-bf16 \
+      yarn vite run test __test__/models/qwen3-paged-parity.test.ts
+  ```
+
+**Pass criteria**: byte-equal `text` and `num_tokens` between flat and paged on every prompt; identical first-divergence-free token sequences. The standalone BF16 logit max-abs-diff variant from the original spec (tolerance `5e-2`) is intentionally not implemented because `forward_fused` / `forward_paged_adapter` are not exposed publicly enough to drive directly from an integration test, and the gate would require model-code changes that are explicitly out of scope. Greedy-token parity catches the same regressions any logit drift would surface as.
+
+CI gates the default flip on all three tests passing. The default-flip commit itself is a separate follow-up that can land only once these tests are green and stable on the supported checkpoints.
+
+---
+
 ## C++ FFI Files (crates/mlx-sys/src/)
 
 | File                   | Lines | Purpose                                                         |

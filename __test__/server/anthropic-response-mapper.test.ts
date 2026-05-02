@@ -148,6 +148,78 @@ describe('buildAnthropicResponse', () => {
     expect(response.usage.output_tokens).toBe(7);
   });
 
+  it('omits cache fields when cachedTokens === 0', () => {
+    // Anthropic spec leaves the cache fields OPTIONAL and other
+    // Anthropic-compatible servers omit them on misses — so a wire
+    // emitting `cache_read_input_tokens: 0` would diverge.
+    const result = makeChatResult({ promptTokens: 11, numTokens: 4, cachedTokens: 0 });
+    const response = buildAnthropicResponse(result, baseReq, 'msg_no_cache');
+
+    expect(response.usage.input_tokens).toBe(11);
+    expect(response.usage.output_tokens).toBe(4);
+    expect(response.usage).not.toHaveProperty('cache_read_input_tokens');
+    expect(response.usage).not.toHaveProperty('cache_creation_input_tokens');
+  });
+
+  it('emits cache_read_input_tokens with reduced input_tokens when cachedTokens > 0', () => {
+    // The spec says `input_tokens` is the count processed at full
+    // cost on the turn, so on a cache HIT it MUST be the unsuffixed
+    // remainder (`promptTokens - cachedTokens`) — billing UIs read
+    // these fields directly.
+    const result = makeChatResult({ promptTokens: 20, numTokens: 5, cachedTokens: 7 });
+    const response = buildAnthropicResponse(result, baseReq, 'msg_cache_hit');
+
+    expect(response.usage.cache_read_input_tokens).toBe(7);
+    expect(response.usage.input_tokens).toBe(13);
+    expect(response.usage.output_tokens).toBe(5);
+    // Implicit-prefix-cache server: never emits a non-zero
+    // `cache_creation_input_tokens` because it does not honour
+    // explicit `cache_control` breakpoints.
+    expect(response.usage).not.toHaveProperty('cache_creation_input_tokens');
+  });
+
+  it('emits server-extension perf fields when performance is supplied', () => {
+    // Non-Anthropic extension fields surfaced for the launcher's
+    // verbose log. Anthropic-compatible clients ignore unknown
+    // fields, so these stay wire-safe.
+    const result = makeChatResult();
+    const response = buildAnthropicResponse(result, baseReq, 'msg_perf', {
+      ttftMs: 1234,
+      prefillTokensPerSecond: 800,
+      decodeTokensPerSecond: 73.5,
+    });
+
+    expect(response.usage.time_to_first_token_ms).toBe(1234);
+    expect(response.usage.prefill_tokens_per_second).toBe(800);
+    expect(response.usage.decode_tokens_per_second).toBe(73.5);
+  });
+
+  it('elides perf fields when performance is undefined', () => {
+    const result = makeChatResult();
+    const response = buildAnthropicResponse(result, baseReq, 'msg_no_perf', undefined);
+
+    expect(response.usage).not.toHaveProperty('time_to_first_token_ms');
+    expect(response.usage).not.toHaveProperty('prefill_tokens_per_second');
+    expect(response.usage).not.toHaveProperty('decode_tokens_per_second');
+  });
+
+  it('elides invalid / zero perf metrics, keeps finite > 0 values', () => {
+    // Same gating pattern as `cache_read_input_tokens`: a
+    // partially-plumbed driver (or a bf16 NaN slipping through the
+    // native path) must NOT surface a zero / NaN as if it were a
+    // real measurement. Only the finite, positive value lands.
+    const result = makeChatResult();
+    const response = buildAnthropicResponse(result, baseReq, 'msg_partial_perf', {
+      ttftMs: Number.NaN,
+      prefillTokensPerSecond: 0,
+      decodeTokensPerSecond: 73.5,
+    });
+
+    expect(response.usage).not.toHaveProperty('time_to_first_token_ms');
+    expect(response.usage).not.toHaveProperty('prefill_tokens_per_second');
+    expect(response.usage.decode_tokens_per_second).toBe(73.5);
+  });
+
   it('empty text with tool calls produces no text block, only tool_use blocks', () => {
     const result = makeChatResult({
       text: '',
@@ -254,6 +326,89 @@ describe('buildMessageDelta', () => {
     expect(event.delta.stop_reason).toBe('end_turn');
     expect(event.delta.stop_sequence).toBeNull();
     expect(event.usage.output_tokens).toBe(42);
+  });
+
+  it('passes through input_tokens when supplied without cachedTokens', () => {
+    const event = buildMessageDelta('end_turn', 5, 11);
+
+    expect(event.usage.input_tokens).toBe(11);
+    expect(event.usage.output_tokens).toBe(5);
+    expect(event.usage).not.toHaveProperty('cache_read_input_tokens');
+    expect(event.usage).not.toHaveProperty('cache_creation_input_tokens');
+  });
+
+  it('omits cache fields when cachedTokens is 0', () => {
+    // Mirrors the response mapper's miss-shape — a streaming turn
+    // with no native reuse must look the same as a cold turn.
+    const event = buildMessageDelta('end_turn', 5, 11, 0);
+
+    expect(event.usage.input_tokens).toBe(11);
+    expect(event.usage).not.toHaveProperty('cache_read_input_tokens');
+    expect(event.usage).not.toHaveProperty('cache_creation_input_tokens');
+  });
+
+  it('emits cache_read_input_tokens with reduced input_tokens when cachedTokens > 0', () => {
+    // Streaming variant of the response mapper hit-shape: the
+    // `usage` block on `message_delta` carries the same body-level
+    // cache accounting as the non-streaming response.
+    const event = buildMessageDelta('end_turn', 5, 20, 7);
+
+    expect(event.usage.cache_read_input_tokens).toBe(7);
+    expect(event.usage.input_tokens).toBe(13);
+    expect(event.usage.output_tokens).toBe(5);
+    expect(event.usage).not.toHaveProperty('cache_creation_input_tokens');
+  });
+
+  it('emits cache_read_input_tokens without input_tokens when inputTokens is omitted', () => {
+    // Edge case: a driver that never plumbs `inputTokens` but does
+    // surface `cachedTokens > 0` still gets a useful streaming delta
+    // — `cache_read_input_tokens` lands on the wire and
+    // `input_tokens` simply stays absent (cannot be derived without
+    // the prompt count).
+    const event = buildMessageDelta('end_turn', 5, undefined, 7);
+
+    expect(event.usage.cache_read_input_tokens).toBe(7);
+    expect(event.usage).not.toHaveProperty('input_tokens');
+    expect(event.usage.output_tokens).toBe(5);
+  });
+
+  it('emits server-extension perf fields when performance is supplied', () => {
+    // Non-Anthropic extension fields surfaced for the launcher's
+    // verbose log (`requests.ndjson`). Mirrors the non-streaming
+    // `buildAnthropicResponse` perf path.
+    const event = buildMessageDelta('end_turn', 5, undefined, undefined, {
+      ttftMs: 1234,
+      prefillTokensPerSecond: 800,
+      decodeTokensPerSecond: 73.5,
+    });
+
+    expect(event.usage.time_to_first_token_ms).toBe(1234);
+    expect(event.usage.prefill_tokens_per_second).toBe(800);
+    expect(event.usage.decode_tokens_per_second).toBe(73.5);
+  });
+
+  it('elides perf fields when performance is undefined', () => {
+    const event = buildMessageDelta('end_turn', 5, 11, 0, undefined);
+
+    expect(event.usage).not.toHaveProperty('time_to_first_token_ms');
+    expect(event.usage).not.toHaveProperty('prefill_tokens_per_second');
+    expect(event.usage).not.toHaveProperty('decode_tokens_per_second');
+  });
+
+  it('elides invalid / zero perf metrics, keeps finite > 0 values', () => {
+    // Filtering: a partially-plumbed dispatch returning NaN / 0
+    // must NOT surface those as wire metrics — the launcher reads
+    // absence as "not plumbed", a literal zero would look like a
+    // real measurement.
+    const event = buildMessageDelta('end_turn', 5, undefined, undefined, {
+      ttftMs: Number.NaN,
+      prefillTokensPerSecond: 0,
+      decodeTokensPerSecond: 73.5,
+    });
+
+    expect(event.usage).not.toHaveProperty('time_to_first_token_ms');
+    expect(event.usage).not.toHaveProperty('prefill_tokens_per_second');
+    expect(event.usage.decode_tokens_per_second).toBe(73.5);
   });
 });
 

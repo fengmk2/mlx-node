@@ -794,7 +794,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                         config.max_position_embeddings,
                     )?;
 
-                    inner.set_vision_encoder(vision_encoder);
+                    inner.set_vision_encoder(vision_encoder)?;
                     inner.set_image_processor(Qwen35VLImageProcessor::new(None));
                     inner.set_spatial_merge_size(vision_config.spatial_merge_size);
 
@@ -829,6 +829,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
             let config_out = inner.config.clone();
             let image_processor = inner.image_processor.as_ref().map(Arc::clone);
             let tokenizer_out = inner.tokenizer.clone();
+            let paged_active = inner.paged_adapter.is_some();
 
             Ok((
                 inner,
@@ -838,13 +839,14 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                     image_processor,
                     tokenizer_out,
                     cache_limit_guard,
+                    paged_active,
                 ),
             ))
         },
         handle_qwen35_cmd,
     );
 
-    let (config, model_id, _image_processor, _tokenizer, cache_limit_guard) = init_rx
+    let (config, model_id, _image_processor, _tokenizer, cache_limit_guard, paged_active) = init_rx
         .await
         .map_err(|_| Error::from_reason("Model thread exited during load"))??;
 
@@ -852,6 +854,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
         thread,
         config,
         model_id,
+        paged_active,
         _cache_limit_guard: cache_limit_guard,
     })
 }
@@ -1028,6 +1031,15 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
         full_attention_interval: gi(&["full_attention_interval"], 4),
         partial_rotary_factor,
         rope_theta,
+        paged_cache_memory_mb: raw
+            .get("paged_cache_memory_mb")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32),
+        paged_block_size: raw
+            .get("paged_block_size")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32),
+        use_block_paged_cache: raw.get("use_block_paged_cache").and_then(|v| v.as_bool()),
     })
 }
 

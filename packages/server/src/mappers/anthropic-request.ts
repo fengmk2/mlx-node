@@ -17,6 +17,59 @@ export interface MappedAnthropicRequest {
 }
 
 /**
+ * Anthropic billing/attribution header prefix. Claude Code injects a leading
+ * system block of the shape `"x-anthropic-billing-header: cc_version=...; cch=<token>;"`
+ * where the `cch=` token rotates per request. Leaving this in the prompt
+ * defeats prefix caching at BOTH the warm-slot gate (`getOrCreateWarmAny`,
+ * which compares `requestedSystem` byte-equally) AND the native
+ * token-prefix verifier inside `chatSessionStart`. We mirror vLLM's strategy
+ * (`vllm/entrypoints/anthropic/serving.py`, commit 262b76a0, 2026-03-11):
+ * stateless, per-block, prefix-only — drop entirely BEFORE tokenization, so
+ * the model never sees the rotating token AND the byte-prefix is stable.
+ *
+ * Hardcoded (not configurable) and intentionally limited to this single
+ * prefix to mirror vLLM's exact behaviour. The string-system branch is left
+ * UNFILTERED to match upstream.
+ */
+const ANTHROPIC_BILLING_HEADER_PREFIX = 'x-anthropic-billing-header';
+
+/**
+ * Canonicalize the Anthropic `system` field into the same string the mapper
+ * bakes into the leading `system` ChatMessage. Used by both
+ * `mapAnthropicRequest` (so the model never sees the billing header) and the
+ * `/v1/messages` warm-slot gate cache-key derivation (so the gate matches
+ * across rotating billing tokens). The two views MUST stay in sync — a
+ * single source of truth prevents drift.
+ *
+ * Asymmetry vs. `mapAnthropicRequest`: the mapper THROWS on non-text blocks
+ * (it's a request-validation gate), but this helper silently skips them.
+ * Safe because `mapAnthropicRequest` runs first as a pre-flight gate, so by
+ * the time the cache-key is computed, the request shape has already been
+ * validated.
+ */
+export function canonicalizeSystemForCacheKey(system: AnthropicMessagesRequest['system']): string | null {
+  if (system == null) return null;
+  if (typeof system === 'string') return system;
+  const parts: string[] = [];
+  for (const b of system) {
+    if (b.type === 'text' && !b.text.startsWith(ANTHROPIC_BILLING_HEADER_PREFIX)) {
+      parts.push(b.text);
+    }
+  }
+  // An array whose every block is stripped (e.g. a request whose only system
+  // block is the rotating `x-anthropic-billing-header` line) is semantically
+  // equivalent to "no system" — collapse to `null` so it (a) does NOT push an
+  // empty `system` ChatMessage that the chat template wraps with two extra
+  // `<|im_start|>system\n<|im_end|>\n` tokens (perturbing the prefix vs. an
+  // absent-system request), and (b) compares byte-equal to `undefined` /
+  // missing on the warm-slot gate (`SessionRegistry.getOrCreateWarmAny`
+  // checks `entry.instructions !== requestedInstructions`, where `null !==
+  // ''` would otherwise miss the slot).
+  if (parts.length === 0) return null;
+  return parts.join('');
+}
+
+/**
  * Resolve the text content of a `tool_result` block. The internal `ChatMessage`
  * shape (NAPI-generated) has no `images` field on `role: 'tool'`, so nested
  * images are rejected outright — any hoist-to-trailing-user workaround loses
@@ -70,15 +123,33 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
     if (typeof req.system === 'string') {
       messages.push({ role: 'system', content: req.system });
     } else {
-      const systemParts: string[] = [];
+      // Validate first — throw early on unsupported block types so the
+      // request fails fast (this is the validation gate). Stripping of
+      // the rotating billing-header prefix happens inside
+      // `canonicalizeSystemForCacheKey`, the single source of truth
+      // shared with `endpoints/messages.ts`'s `requestedSystem` cache
+      // key. Routing both call sites through the same helper means
+      // any future change to the strip semantics (prefix list,
+      // normalization, etc.) lands in exactly one place — the mapped
+      // messages and the cache-key view cannot drift.
       for (const b of req.system as SystemBlock[]) {
-        if (b.type === 'text') {
-          systemParts.push(b.text);
-        } else {
+        if (b.type !== 'text') {
           throw new Error(`Unsupported system block type: "${(b as { type: string }).type}"`);
         }
       }
-      messages.push({ role: 'system', content: systemParts.join('') });
+      // Helper returns `null` when every block was stripped (e.g. a
+      // request whose only system block is the rotating
+      // `x-anthropic-billing-header` line). An all-stripped array is
+      // semantically equivalent to "no system", so skip the push
+      // entirely — emitting `{ role: 'system', content: '' }` would
+      // otherwise have the chat template wrap it with two extra
+      // `<|im_start|>system\n<|im_end|>\n` tokens, perturbing the
+      // prefix vs. an absent-system request and breaking prefix
+      // caching across the two semantically-equivalent shapes.
+      const content = canonicalizeSystemForCacheKey(req.system);
+      if (content !== null) {
+        messages.push({ role: 'system', content });
+      }
     }
   }
 
@@ -268,14 +339,41 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
     config.topK = req.top_k;
   }
 
+  // `stop_sequences` is parsed into the request type but `ChatConfig` has no
+  // matching field, so wiring it through to the native model would require a
+  // Rust change (out of scope here). Reject explicitly with a 400 — silently
+  // dropping the field would let a client believe its custom stop strings are
+  // honoured when the model continues generating right past them. An empty
+  // array is treated as "not present" since it carries no semantics. Future
+  // Rust work can add `stopSequences` to `ChatConfig` and remove this guard.
+  if (req.stop_sequences != null && req.stop_sequences.length > 0) {
+    throw new Error(
+      'stop_sequences is not supported by this server. Remove the field or wait for a future release that supports it natively.',
+    );
+  }
+
   if (req.tools && req.tools.length > 0) {
     const toolChoice = req.tool_choice;
-    if (toolChoice?.type === 'tool' && toolChoice.name) {
-      const matched = req.tools.filter((t) => t.name === toolChoice.name);
-      if (matched.length > 0) {
-        config.tools = matched.map(mapTool);
+    if (toolChoice?.type === 'tool') {
+      // `{type:'tool', name:'X'}` is a HARD constraint: the model MUST call X
+      // and only X. If the caller omitted the name, or named a tool that is
+      // not in `req.tools`, falling through to the all-tools path would
+      // silently violate that contract. Reject up front so the failure mode
+      // is loud and the client gets a clear 400.
+      if (!toolChoice.name) {
+        throw new Error('tool_choice.type is "tool" but no name was provided');
       }
+      const matched = req.tools.filter((t) => t.name === toolChoice.name);
+      if (matched.length === 0) {
+        throw new Error(
+          `tool_choice references tool "${toolChoice.name}" which is not present in the request's tools list`,
+        );
+      }
+      config.tools = matched.map(mapTool);
     } else {
+      // `tool_choice` is undefined, `{type:'auto'}`, or `{type:'any'}` — all
+      // three semantically mean "let the model pick from any tool", so we
+      // forward the full tools array.
       config.tools = req.tools.map(mapTool);
     }
   }

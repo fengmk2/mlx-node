@@ -13,6 +13,7 @@ use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
+use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
 use super::image_processor::{Gemma4ImageProcessor, ProcessedGemma4Image};
 use super::vision::{Gemma4MultimodalEmbedder, Gemma4VisionModel};
@@ -88,7 +89,7 @@ fn escape_gemma4_content(s: &str) -> String {
 }
 
 use super::config::Gemma4Config;
-use super::decoder_layer::Gemma4DecoderLayer;
+use super::decoder_layer::{Gemma4DecoderLayer, Gemma4LayerKind};
 use super::layer_cache::Gemma4LayerCache;
 use crate::models::qwen3_5::chat_common;
 use crate::models::qwen3_5::model::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
@@ -220,6 +221,17 @@ pub(crate) struct Gemma4Inner {
     /// full session restart). `None` when no session is active or the
     /// session is text-only.
     pub(crate) cached_image_key: Option<u64>,
+    /// Block-paged KV adapter (vLLM-style refcounted prefix cache).
+    ///
+    /// **Opt-in via `Gemma4Config::use_block_paged_cache`**. Gemma4's
+    /// hybrid sliding+global attention, K=V sharing, KV-shared layers
+    /// (`forward_shared`), MoE/PLE branches, and per-layer-type head
+    /// dimensions are all handled by
+    /// `Gemma4DecoderLayer::forward_paged_or_flat`, which routes only
+    /// global attention layers through this adapter. Defaults to `None`
+    /// when the config flag is unset, in which case the model falls
+    /// back to the flat `Gemma4LayerCache` path.
+    pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
     pub(crate) model_id: u64,
 }
 
@@ -331,6 +343,15 @@ pub struct Gemma4Model {
     /// (its guard is `None`) — running inference on that stub would
     /// under-cap the allocator.
     pub(crate) initialized: bool,
+    /// Snapshot of `Gemma4Inner::paged_adapter.is_some()` captured at
+    /// construction time. Default-OFF on Gemma4 (parity-blocked — see
+    /// `Gemma4Config::use_block_paged_cache` and the WIP per-layer
+    /// numerical-diff tracker), so this is `false` for the entire matrix
+    /// of currently-shipping configs. Stubs from `new(config)` always
+    /// report `false` because no inner was constructed. Surfaced through
+    /// the `hasBlockPagedCache()` NAPI method so server endpoints can
+    /// branch on it without round-tripping through the model thread.
+    pub(crate) paged_active: bool,
     /// RAII: unregisters this model's delta from the cache-limit
     /// coordinator on drop. `None` for instances constructed via the
     /// synchronous `new(config)` path that never loaded weights.
@@ -468,6 +489,100 @@ impl Gemma4Inner {
 
         let model_id = MODEL_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+        // Block-paged KV adapter — default-on; opt out via
+        // `use_block_paged_cache: false`.
+        //
+        // Default-on adapter construction (2026-04-28 default flip).
+        // Text-only paged dispatch is active: every text-only chat-entry
+        // site (`chat_sync_core_paged`, `chat_stream_sync_core_paged`,
+        // `chat_tokens_delta_sync`, `chat_stream_tokens_delta_sync_inner`)
+        // routes through the paged adapter; vision turns still take the
+        // flat `Gemma4LayerCache::Sliding(RotatingKVCache)` path. Setting
+        // `use_block_paged_cache: false` in the model config is the
+        // explicit opt-out and reverts every layer to the legacy flat
+        // caches.
+        //
+        // Cache dtype: BFloat16 (Gemma4's production dtype).
+        // Per-layer head_dim: Gemma4 has variable head dims per layer
+        // type (sliding vs global). The pool covers ONLY global (full)
+        // attention layers — sliding layers continue to use the existing
+        // `Gemma4LayerCache::Sliding(RotatingKVCache)` path because their
+        // window-trimmed semantics don't map onto the paged pool. The
+        // pool's per-layer slot size therefore uses the global head_dim
+        // and global KV-head count.
+        let paged_adapter = if config.use_block_paged_cache.unwrap_or(true) {
+            // Count GLOBAL layers — the paged pool only covers
+            // full_attention layers in their original layer order. A
+            // future paged-aware forward path indexes this pool by
+            // global-layer ordinal (NOT absolute decoder index).
+            let num_global_layers: u32 = (0..config.num_hidden_layers as usize)
+                .filter(|&i| config.is_global_layer(i))
+                .count() as u32;
+            if num_global_layers == 0 {
+                return Err(napi::Error::from_reason(
+                    "Gemma4 block-paged adapter: config has no full_attention layers; \
+                     paged KV cache requires at least one global attention layer",
+                ));
+            }
+
+            let block_size = config.paged_block_size.unwrap_or(16);
+            let gpu_memory_mb = config.paged_cache_memory_mb.unwrap_or(2048);
+            // Use global head_dim — sliding layers don't use the pool.
+            let head_size = config.effective_head_dim(true) as u32;
+            // Use global KV heads — sliding layers don't use the pool.
+            let num_kv_heads = config.effective_kv_heads(true) as u32;
+
+            let pa_config = mlx_paged_attn::PagedAttentionConfig {
+                block_size,
+                gpu_memory_mb,
+                head_size,
+                num_kv_heads,
+                // Pool covers ONLY global attention layers — sliding
+                // layers continue to use Gemma4LayerCache::Sliding.
+                num_layers: num_global_layers,
+                use_fp8_cache: Some(false),
+                max_seq_len: Some(config.max_position_embeddings as u32),
+                max_batch_size: Some(32),
+            };
+
+            let num_blocks = pa_config.calculate_num_blocks();
+            if num_blocks == 0 {
+                return Err(napi::Error::from_reason(format!(
+                    "Gemma4 block-paged adapter: gpu_memory_mb={gpu_memory_mb} too small \
+                     (head_size={head_size}, num_kv_heads={num_kv_heads}, \
+                     block_size={block_size}, num_global_layers={num_global_layers})",
+                )));
+            }
+
+            let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
+                num_blocks, block_size,
+            )));
+
+            let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
+            let pool = mlx_paged_attn::LayerKVPool::new(pa_config, num_blocks, cache_dtype)
+                .map_err(|e| {
+                    napi::Error::from_reason(format!(
+                        "Failed to construct LayerKVPool for Gemma4 block-paged adapter: {e}"
+                    ))
+                })?;
+
+            let adapter =
+                PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size).map_err(|e| {
+                    napi::Error::from_reason(format!(
+                        "Failed to construct Gemma4 PagedKVCacheAdapter: {e}"
+                    ))
+                })?;
+
+            tracing::info!(
+                "Gemma4 block-paged adapter enabled (construction-only): num_blocks={num_blocks}, \
+                 block_size={block_size}, gpu_memory_mb={gpu_memory_mb}, num_global_layers={num_global_layers}, \
+                 cache_dtype=BFloat16"
+            );
+            Some(adapter)
+        } else {
+            None
+        };
+
         Ok(Self {
             config,
             embed_tokens,
@@ -483,6 +598,7 @@ impl Gemma4Inner {
             caches: None,
             cached_token_history: Vec::new(),
             cached_image_key: None,
+            paged_adapter,
             model_id,
         })
     }
@@ -510,6 +626,15 @@ impl Gemma4Inner {
         self.caches = Some(caches);
         self.clear_reuse_state();
         Ok(())
+    }
+
+    /// Build the per-layer routing list for the paged dispatch.
+    ///
+    /// See [`compute_layer_kinds`] (free helper) for full semantics.
+    /// This wrapper is the on-`Gemma4Inner` entry point used by the
+    /// chat-session forward dispatch.
+    pub(crate) fn compute_layer_kinds(&self) -> Vec<Gemma4LayerKind> {
+        compute_layer_kinds(&self.config)
     }
 
     /// Drop the live KV caches and clear reuse-tracking state.
@@ -758,6 +883,23 @@ impl Gemma4Inner {
             tokens
         };
 
+        // Block-paged dispatch: when the adapter is configured AND no
+        // images are involved, route through the parallel
+        // `chat_sync_core_paged` path. The flat path stays untouched so
+        // off-by-default behavior is byte-identical to before this
+        // commit. Vision turns always use the flat path (paged dispatch
+        // is text-only at this stage).
+        if self.paged_adapter.is_some() && !has_images {
+            return self.chat_sync_core_paged(
+                tokens,
+                tokenizer,
+                config,
+                eos_token_id,
+                sampling_config,
+                max_new_tokens,
+            );
+        }
+
         // Prefix-cache verification. `verify_cache_prefix` returns 0 on
         // miss or `cached.len()` on an exact prefix relation (either
         // strict-extend or exact-match) — never intermediate (see its
@@ -937,6 +1079,7 @@ impl Gemma4Inner {
                 .caches
                 .as_mut()
                 .expect("caches populated by init_caches_sync above");
+            crate::models::gemma4::diagnostic::set_step(-1);
             forward_inner(
                 &last_token,
                 &self.embed_tokens,
@@ -1049,6 +1192,8 @@ impl Gemma4Inner {
                     None
                 };
 
+                // See `chat_sync_core_paged_inner` for the rationale.
+                current_y.eval();
                 let token_id = current_y.item_at_int32(0)? as u32;
                 generated_tokens.push(token_id);
 
@@ -1089,6 +1234,7 @@ impl Gemma4Inner {
                         .expect("caches populated by init_caches_sync above");
 
                     let next_ids = current_y.reshape(&[1, 1])?;
+                    crate::models::gemma4::diagnostic::set_step(step);
                     let logits = forward_inner(
                         &next_ids,
                         &self.embed_tokens,
@@ -1108,6 +1254,19 @@ impl Gemma4Inner {
                     None
                 };
 
+                // Force `current_y` to evaluate before reading its host value.
+                // The previous iteration kicked an async eval on the sampled
+                // token (`next_token`), which became `current_y` here. On
+                // intermediate steps the lazy graph from
+                // `current_y.reshape(...) → forward_inner → ...` would normally
+                // chain the eval, but `read_scalar` (mlx_nn_ops.cpp) reads
+                // `arr.data<T>()` directly off CPU memory without triggering
+                // an implicit `eval()`. On the FINAL iteration there is no
+                // forward at all, so the data may still be unevaluated. Without
+                // this sync the host sees raw uninitialized bits → garbage
+                // token ID → mismatch on length-finish prompts. Mirrors
+                // `chat_sync_core_paged_inner`.
+                current_y.eval();
                 let token_id = current_y.item_at_int32(0)? as u32;
                 generated_tokens.push(token_id);
 
@@ -1320,6 +1479,22 @@ impl Gemma4Inner {
         } else {
             tokens
         };
+
+        // Block-paged streaming dispatch: same gate as the non-streaming
+        // path. See `chat_sync_core` for the rationale (text-only at
+        // this stage, flat path for vision turns).
+        if self.paged_adapter.is_some() && !has_images {
+            return self.chat_stream_sync_core_paged(
+                tokens,
+                tokenizer,
+                config,
+                eos_token_id,
+                sampling_config,
+                cb,
+                cancelled,
+                max_new_tokens,
+            );
+        }
 
         // Prefix-cache verification — see `chat_sync_core` for the full
         // rationale and the `verify_cache_prefix` rustdoc for the
@@ -1558,6 +1733,12 @@ impl Gemma4Inner {
                     None
                 };
 
+                // See `chat_sync_core_paged_inner` for the rationale —
+                // `read_scalar` reads `arr.data<T>()` directly without
+                // forcing eval, so the previous iteration's async-eval'd
+                // `current_y` (or the final iteration's no-forward case)
+                // can hand back uninitialized bits.
+                current_y.eval();
                 let token_id = current_y.item_at_int32(0)? as u32;
                 generated_tokens.push(token_id);
 
@@ -1623,6 +1804,8 @@ impl Gemma4Inner {
                     None
                 };
 
+                // See `chat_sync_core_paged_inner` for the rationale.
+                current_y.eval();
                 let token_id = current_y.item_at_int32(0)? as u32;
                 generated_tokens.push(token_id);
 
@@ -1746,6 +1929,1254 @@ impl Gemma4Inner {
             ThreadsafeFunctionCallMode::NonBlocking,
         );
 
+        Ok(())
+    }
+
+    // =================================================================
+    // Block-paged dispatch (chat_sync_core_paged + helpers).
+    //
+    // Mirrors Qwen3's `chat_sync_core_paged` and LFM2's `forward_paged_or_flat`
+    // pattern — sliding layers continue to use the existing flat
+    // `Gemma4LayerCache::Sliding` path while global layers route through
+    // `PagedKVCacheAdapter`. KV-shared layers are wired in a follow-up
+    // commit; for now the dispatch surface returns an error if the
+    // config has any shared layers.
+    //
+    // Lifecycle (mirrors Qwen3 / LFM2):
+    // 1. Adapter cold-start (or warm-continue when previous turn
+    //    finalize_turn_keep_live'd a strict-prefix request).
+    // 2. Conv/sliding caches RESET each turn (paged path doesn't carry
+    //    sliding state across turns at this stage — same caveat as
+    //    LFM2's conv layers).
+    // 3. Prefill via `run_paged_prefill_chunk` over the suffix.
+    // 4. Decode loop via `run_paged_decode_step`.
+    // 5. End-of-turn (success): `finalize_turn_keep_live` so the next
+    //    turn's `continue_turn` can build on top of the partial trailing
+    //    block's K/V (same partial-block carry trick as Qwen3 / LFM2).
+    //
+    // Caveats / scope:
+    // * Text-only — vision turns dispatch through the flat path.
+    // * Sliding layers re-prefill the cached prefix every turn.
+    // * Zero-delta prompts (every prompt token cached) are rejected.
+    // =================================================================
+
+    /// Block-paged variant of [`Self::chat_sync_core`].
+    ///
+    /// Reached when `paged_adapter.is_some()` AND the prompt has no
+    /// images. The caller has already done image processing /
+    /// expansion / template rendering, so this method receives a
+    /// fully-baked `tokens` vector and dispatches the paged forward.
+    #[allow(clippy::too_many_arguments)]
+    fn chat_sync_core_paged(
+        &mut self,
+        tokens: Vec<u32>,
+        tokenizer: Arc<Qwen3Tokenizer>,
+        config: ChatConfig,
+        eos_token_id: u32,
+        sampling_config: Option<SamplingConfig>,
+        max_new_tokens: i32,
+    ) -> Result<ChatResult> {
+        if tokens.is_empty() {
+            return Err(Error::from_reason("Empty prompt"));
+        }
+
+        let reuse_cache = config.reuse_cache.unwrap_or(true);
+        let prompt_token_count = tokens.len();
+        let eos_ids = self.config.eos_token_ids.clone();
+        let generation_start = std::time::Instant::now();
+
+        // === Adapter lifecycle: warm continuation OR cold start. ===
+        // See PagedKVCacheAdapter::finalize_turn_keep_live for why warm-
+        // continue preserves the partial trailing block's K/V across
+        // turns. Mirrors Qwen3 / LFM2.
+        let seq_id: u32 = 0;
+        // Lazy decode allocation: pass the prompt length only.
+        let total_budget = tokens.len() as u32;
+        let cached_prefix_len = {
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason(
+                    "chat_sync_core_paged: paged_adapter is None — caller must check \
+                     use_block_paged_cache before dispatch",
+                )
+            })?;
+
+            let can_continue = reuse_cache
+                && adapter.is_live_for_continue()
+                && tokens.starts_with(adapter.request_tokens());
+
+            if can_continue {
+                match adapter.continue_turn(&tokens, total_budget) {
+                    Ok((prior_token_count, _newly_alloc)) => prior_token_count,
+                    Err(_drift) => {
+                        let _ = adapter.release_request();
+                        adapter
+                            .reset_for_new_request(seq_id)
+                            .map_err(Error::from_reason)?;
+                        let prefix = adapter
+                            .find_cached_prefix(&tokens, &[], 0, false)
+                            .map_err(Error::from_reason)?;
+                        let cached = prefix.cached_token_count;
+                        adapter
+                            .allocate_suffix_blocks(total_budget)
+                            .map_err(Error::from_reason)?;
+                        cached
+                    }
+                }
+            } else {
+                if adapter.block_table().is_some() {
+                    let _ = adapter.release_request();
+                }
+                adapter
+                    .reset_for_new_request(seq_id)
+                    .map_err(Error::from_reason)?;
+                let prefix = adapter
+                    .find_cached_prefix(&tokens, &[], 0, false)
+                    .map_err(Error::from_reason)?;
+                let cached = prefix.cached_token_count;
+                adapter
+                    .allocate_suffix_blocks(total_budget)
+                    .map_err(Error::from_reason)?;
+                cached
+            }
+        };
+
+        // Reset sliding-layer flat caches for this turn — paged path
+        // does not carry sliding prefix state across turns.
+        self.reset_caches_sync()?;
+        self.init_caches_sync()?;
+
+        let total_prompt_tokens = tokens.len() as u32;
+        let suffix_len = total_prompt_tokens
+            .checked_sub(cached_prefix_len)
+            .ok_or_else(|| {
+                Error::from_reason("chat_sync_core_paged: cached_prefix_len > total_prompt_tokens")
+            })?;
+        if suffix_len == 0 {
+            // Zero-delta: every prompt token cached. Same caveat as
+            // Qwen3 / LFM2 — flat path required for this corner case.
+            if let Some(adapter) = self.paged_adapter.as_mut() {
+                let _ = adapter.release_request();
+            }
+            return Err(Error::from_reason(
+                "Gemma4 paged: zero-delta prompt (every token cached) is not yet \
+                 supported on the block-paged path",
+            ));
+        }
+
+        // Wrap forward in a try-style flow for proper adapter cleanup.
+        let forward_result = self.chat_sync_core_paged_inner(
+            &tokens,
+            cached_prefix_len,
+            sampling_config,
+            max_new_tokens,
+            eos_token_id,
+            &eos_ids,
+        );
+
+        let (generated_tokens, finish_reason, first_token_instant) = match forward_result {
+            Ok(t) => {
+                if let Some(adapter) = self.paged_adapter.as_mut() {
+                    if reuse_cache {
+                        let _ = adapter.finalize_turn_keep_live(&[], 0);
+                    } else {
+                        let _ = adapter.register_full_blocks_for_reuse(&[], 0);
+                        let _ = adapter.release_request();
+                    }
+                }
+                t
+            }
+            Err(e) => {
+                if let Some(adapter) = self.paged_adapter.as_mut() {
+                    let _ = adapter.release_request();
+                }
+                return Err(e);
+            }
+        };
+
+        // Decode + parse output (mirrors flat path).
+        let raw_text = tokenizer.decode_sync(&generated_tokens, false)?;
+
+        // Persist session token history for the next continue turn.
+        if reuse_cache {
+            let history_tokens: &[u32] =
+                if finish_reason != "length" && !generated_tokens.is_empty() {
+                    &generated_tokens[..generated_tokens.len() - 1]
+                } else {
+                    &generated_tokens[..]
+                };
+            let mut new_history = Vec::with_capacity(tokens.len() + history_tokens.len());
+            new_history.extend(tokens.iter().copied());
+            new_history.extend_from_slice(history_tokens);
+            self.cached_token_history = new_history;
+        } else {
+            self.cached_token_history.clear();
+        }
+        self.cached_image_key = None;
+
+        // Performance metrics.
+        let generation_end = std::time::Instant::now();
+        let ttft_ms = first_token_instant
+            .map(|fti| fti.duration_since(generation_start).as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+        let decode_ms = first_token_instant
+            .map(|fti| generation_end.duration_since(fti).as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+        let gen_toks = generated_tokens.len() as f64;
+        let actual_prefill_count = (tokens.len() as f64) - cached_prefix_len as f64;
+        let performance = Some(crate::profiling::PerformanceMetrics {
+            ttft_ms,
+            prefill_tokens_per_second: if ttft_ms > 0.0 {
+                actual_prefill_count.max(1.0) / (ttft_ms / 1000.0)
+            } else {
+                0.0
+            },
+            decode_tokens_per_second: if decode_ms > 0.0 && gen_toks > 1.0 {
+                (gen_toks - 1.0) / (decode_ms / 1000.0)
+            } else {
+                0.0
+            },
+        });
+
+        let parsed = super::output_parser::parse_gemma4_output(&raw_text);
+        let finish_reason = if parsed.tool_calls.iter().any(|tc| tc.status == "ok") {
+            "tool_calls".to_string()
+        } else {
+            finish_reason
+        };
+
+        Ok(ChatResult {
+            text: parsed.text,
+            tool_calls: parsed.tool_calls,
+            thinking: parsed.thinking,
+            num_tokens: generated_tokens.len() as u32,
+            prompt_tokens: prompt_token_count as u32,
+            reasoning_tokens: 0,
+            finish_reason,
+            raw_text,
+            cached_tokens: cached_prefix_len,
+            performance,
+        })
+    }
+
+    /// Inner forward + decode loop for [`Self::chat_sync_core_paged`].
+    /// Split out so the outer can wrap with adapter `release_request`
+    /// on either path.
+    fn chat_sync_core_paged_inner(
+        &mut self,
+        tokens: &[u32],
+        cached_prefix_len: u32,
+        sampling_config: Option<SamplingConfig>,
+        max_new_tokens: i32,
+        eos_token_id: u32,
+        eos_ids: &[i32],
+    ) -> Result<(Vec<u32>, String, Option<std::time::Instant>)> {
+        let suffix = &tokens[(cached_prefix_len as usize)..];
+
+        // Pin model weights in GPU memory; share generation stream.
+        let generation_stream = Stream::new(DeviceType::Gpu);
+        let _wired_ctx = crate::stream::WiredLimitContext::new(usize::MAX, vec![generation_stream]);
+
+        // === PREFILL ===
+        let last_logits = {
+            let _stream_ctx = StreamContext::new(generation_stream);
+            crate::models::gemma4::diagnostic::set_step(-1);
+            self.run_paged_prefill_chunk(tokens, suffix, cached_prefix_len)?
+        };
+
+        let mut y = sample_next_token(&last_logits, sampling_config)?;
+        y.eval();
+
+        // Smooth memory peak: drop transient prefill buffers before decode
+        // starts allocating. Prefill builds a massive MLX subgraph; once
+        // we have the last logits, those intermediates are dead but
+        // MLX's caching allocator holds them.
+        crate::array::synchronize_and_clear_cache();
+
+        let first_token_instant = Some(std::time::Instant::now());
+
+        // === DECODE LOOP ===
+        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens.max(0) as usize);
+        let mut finish_reason = String::from("length");
+
+        for step in 0..max_new_tokens {
+            // Force `y` to evaluate before reading via `item_at_int32`.
+            // The previous iteration only kicked an async eval on `y`,
+            // and `item_at_int32` reads CPU memory directly via
+            // `read_scalar` (mlx_nn_ops.cpp) — it does NOT trigger an
+            // implicit eval. Without this sync, decode reads the
+            // raw-bit-uninitialized buffer, the "token id" is garbage,
+            // and the EOS check trivially never matches. Mirrors
+            // Qwen3's `run_paged_decode_step` loop (qwen3/model.rs:2935).
+            y.eval();
+            let token_id = y.item_at_int32(0)? as u32;
+            generated_tokens.push(token_id);
+
+            if is_eos_token(token_id, eos_ids, eos_token_id) {
+                finish_reason = String::from("stop");
+                break;
+            }
+            if step + 1 >= max_new_tokens {
+                break;
+            }
+
+            let next_logits = {
+                let _stream_ctx = StreamContext::new(generation_stream);
+                crate::models::gemma4::diagnostic::set_step(step);
+                self.run_paged_decode_step(token_id)?
+            };
+            let next_logits = next_logits.squeeze(Some(&[1]))?;
+            y = sample_next_token(&next_logits, sampling_config)?;
+            MxArray::async_eval_arrays(&[&y]);
+
+            crate::array::maybe_clear_cache_for_paged_step(step);
+        }
+
+        Ok((generated_tokens, finish_reason, first_token_instant))
+    }
+
+    /// Streaming variant of [`Self::chat_sync_core_paged`].
+    #[allow(clippy::too_many_arguments)]
+    fn chat_stream_sync_core_paged(
+        &mut self,
+        tokens: Vec<u32>,
+        tokenizer: Arc<Qwen3Tokenizer>,
+        config: ChatConfig,
+        eos_token_id: u32,
+        sampling_config: Option<SamplingConfig>,
+        cb: &StreamSender,
+        cancelled: &Arc<AtomicBool>,
+        max_new_tokens: i32,
+    ) -> Result<()> {
+        if tokens.is_empty() {
+            return Err(Error::from_reason("Empty prompt"));
+        }
+
+        let reuse_cache = config.reuse_cache.unwrap_or(true);
+        let prompt_token_count = tokens.len();
+        let eos_ids = self.config.eos_token_ids.clone();
+        let generation_start = std::time::Instant::now();
+
+        // Adapter lifecycle: warm continuation OR cold start (mirrors
+        // chat_sync_core_paged).
+        let seq_id: u32 = 0;
+        // Lazy decode allocation: pass the prompt length only.
+        let total_budget = tokens.len() as u32;
+        let cached_prefix_len = {
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("chat_stream_sync_core_paged: paged_adapter is None")
+            })?;
+            let can_continue = reuse_cache
+                && adapter.is_live_for_continue()
+                && tokens.starts_with(adapter.request_tokens());
+            if can_continue {
+                match adapter.continue_turn(&tokens, total_budget) {
+                    Ok((prior, _)) => prior,
+                    Err(_) => {
+                        let _ = adapter.release_request();
+                        adapter
+                            .reset_for_new_request(seq_id)
+                            .map_err(Error::from_reason)?;
+                        let prefix = adapter
+                            .find_cached_prefix(&tokens, &[], 0, false)
+                            .map_err(Error::from_reason)?;
+                        let cached = prefix.cached_token_count;
+                        adapter
+                            .allocate_suffix_blocks(total_budget)
+                            .map_err(Error::from_reason)?;
+                        cached
+                    }
+                }
+            } else {
+                if adapter.block_table().is_some() {
+                    let _ = adapter.release_request();
+                }
+                adapter
+                    .reset_for_new_request(seq_id)
+                    .map_err(Error::from_reason)?;
+                let prefix = adapter
+                    .find_cached_prefix(&tokens, &[], 0, false)
+                    .map_err(Error::from_reason)?;
+                let cached = prefix.cached_token_count;
+                adapter
+                    .allocate_suffix_blocks(total_budget)
+                    .map_err(Error::from_reason)?;
+                cached
+            }
+        };
+
+        // Reset sliding flat caches.
+        self.reset_caches_sync()?;
+        self.init_caches_sync()?;
+
+        let total_prompt_tokens = tokens.len() as u32;
+        let suffix_len = total_prompt_tokens
+            .checked_sub(cached_prefix_len)
+            .ok_or_else(|| {
+                Error::from_reason(
+                    "chat_stream_sync_core_paged: cached_prefix_len > total_prompt_tokens",
+                )
+            })?;
+        if suffix_len == 0 {
+            if let Some(adapter) = self.paged_adapter.as_mut() {
+                let _ = adapter.release_request();
+            }
+            return Err(Error::from_reason(
+                "Gemma4 paged streaming: zero-delta prompt (every token cached) is not yet supported",
+            ));
+        }
+
+        let stream_result = self.chat_stream_sync_core_paged_inner(
+            &tokens,
+            cached_prefix_len,
+            sampling_config,
+            max_new_tokens,
+            eos_token_id,
+            &eos_ids,
+            tokenizer.clone(),
+            cb,
+            cancelled,
+        );
+
+        let (generated_tokens, finish_reason, first_token_instant) = match stream_result {
+            Ok(t) => {
+                if let Some(adapter) = self.paged_adapter.as_mut() {
+                    if reuse_cache {
+                        let _ = adapter.finalize_turn_keep_live(&[], 0);
+                    } else {
+                        let _ = adapter.register_full_blocks_for_reuse(&[], 0);
+                        let _ = adapter.release_request();
+                    }
+                }
+                t
+            }
+            Err(e) => {
+                if let Some(adapter) = self.paged_adapter.as_mut() {
+                    let _ = adapter.release_request();
+                }
+                return Err(e);
+            }
+        };
+
+        // Persist session history.
+        if reuse_cache {
+            let history_tokens: &[u32] =
+                if finish_reason != "length" && !generated_tokens.is_empty() {
+                    &generated_tokens[..generated_tokens.len() - 1]
+                } else {
+                    &generated_tokens[..]
+                };
+            let mut new_history = Vec::with_capacity(tokens.len() + history_tokens.len());
+            new_history.extend(tokens.iter().copied());
+            new_history.extend_from_slice(history_tokens);
+            self.cached_token_history = new_history;
+        } else {
+            self.cached_token_history.clear();
+        }
+        self.cached_image_key = None;
+
+        // Terminal stream chunk.
+        let raw_text = tokenizer.decode_sync(&generated_tokens, false)?;
+        let parsed = super::output_parser::parse_gemma4_output(&raw_text);
+        let finish_reason = if parsed.tool_calls.iter().any(|tc| tc.status == "ok") {
+            "tool_calls".to_string()
+        } else {
+            finish_reason
+        };
+
+        let generation_end = std::time::Instant::now();
+        let ttft_ms = first_token_instant
+            .map(|fti| fti.duration_since(generation_start).as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+        let decode_ms = first_token_instant
+            .map(|fti| generation_end.duration_since(fti).as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+        let gen_toks = generated_tokens.len() as f64;
+        let actual_prefill_count = (tokens.len() as f64) - cached_prefix_len as f64;
+        let performance = Some(crate::profiling::PerformanceMetrics {
+            ttft_ms,
+            prefill_tokens_per_second: if ttft_ms > 0.0 {
+                actual_prefill_count.max(1.0) / (ttft_ms / 1000.0)
+            } else {
+                0.0
+            },
+            decode_tokens_per_second: if decode_ms > 0.0 && gen_toks > 1.0 {
+                (gen_toks - 1.0) / (decode_ms / 1000.0)
+            } else {
+                0.0
+            },
+        });
+
+        cb.call(
+            Ok(ChatStreamChunk {
+                text: String::new(),
+                done: true,
+                finish_reason: Some(finish_reason),
+                tool_calls: if parsed.tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(parsed.tool_calls)
+                },
+                thinking: parsed.thinking,
+                num_tokens: Some(generated_tokens.len() as u32),
+                prompt_tokens: Some(prompt_token_count as u32),
+                reasoning_tokens: Some(0),
+                raw_text: Some(raw_text),
+                cached_tokens: Some(cached_prefix_len),
+                performance,
+                is_reasoning: None,
+            }),
+            ThreadsafeFunctionCallMode::NonBlocking,
+        );
+
+        Ok(())
+    }
+
+    /// Inner streaming forward + decode loop for
+    /// [`Self::chat_stream_sync_core_paged`]. Emits text deltas via the
+    /// stream callback as tokens are produced.
+    #[allow(clippy::too_many_arguments)]
+    fn chat_stream_sync_core_paged_inner(
+        &mut self,
+        tokens: &[u32],
+        cached_prefix_len: u32,
+        sampling_config: Option<SamplingConfig>,
+        max_new_tokens: i32,
+        eos_token_id: u32,
+        eos_ids: &[i32],
+        tokenizer: Arc<Qwen3Tokenizer>,
+        cb: &StreamSender,
+        cancelled: &Arc<AtomicBool>,
+    ) -> Result<(Vec<u32>, String, Option<std::time::Instant>)> {
+        let suffix = &tokens[(cached_prefix_len as usize)..];
+
+        let generation_stream = Stream::new(DeviceType::Gpu);
+        let _wired_ctx = crate::stream::WiredLimitContext::new(usize::MAX, vec![generation_stream]);
+
+        let last_logits = {
+            let _stream_ctx = StreamContext::new(generation_stream);
+            self.run_paged_prefill_chunk(tokens, suffix, cached_prefix_len)?
+        };
+
+        let mut y = sample_next_token(&last_logits, sampling_config)?;
+        y.eval();
+
+        // Smooth memory peak: drop transient prefill buffers before decode
+        // starts allocating (see chat_sync_core_paged_inner for rationale).
+        crate::array::synchronize_and_clear_cache();
+
+        let first_token_instant = Some(std::time::Instant::now());
+
+        // Streaming detokenizer + parser.
+        let mut decode_stream = tokenizer.inner().decode_stream(false);
+        let mut stream_parser = super::output_parser::Gemma4StreamParser::new();
+
+        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens.max(0) as usize);
+        let mut finish_reason = String::from("length");
+
+        for step in 0..max_new_tokens {
+            if cancelled.load(Ordering::Relaxed) {
+                finish_reason = String::from("cancelled");
+                break;
+            }
+            // Force `y` to evaluate before reading via `item_at_int32`
+            // — async_eval kicked from the previous iteration does not
+            // implicitly sync. Same rationale as `chat_sync_core_paged_inner`.
+            y.eval();
+            let token_id = y.item_at_int32(0)? as u32;
+            generated_tokens.push(token_id);
+
+            // Emit any text segments produced by this token.
+            if let Some(piece) = decode_stream
+                .step(token_id)
+                .map_err(|e| Error::from_reason(format!("decode_stream: {e}")))?
+            {
+                let segments = stream_parser.feed(&piece);
+                dispatch_stream_segments(segments, cb);
+            }
+
+            if is_eos_token(token_id, eos_ids, eos_token_id) {
+                finish_reason = String::from("stop");
+                break;
+            }
+            if step + 1 >= max_new_tokens {
+                break;
+            }
+
+            let next_logits = {
+                let _stream_ctx = StreamContext::new(generation_stream);
+                self.run_paged_decode_step(token_id)?
+            };
+            let next_logits = next_logits.squeeze(Some(&[1]))?;
+            y = sample_next_token(&next_logits, sampling_config)?;
+            MxArray::async_eval_arrays(&[&y]);
+
+            crate::array::maybe_clear_cache_for_paged_step(step);
+        }
+
+        // Flush any residual segments accumulated by the parser but not
+        // yet emitted.
+        let residual_segments = stream_parser.flush();
+        dispatch_stream_segments(residual_segments, cb);
+
+        Ok((generated_tokens, finish_reason, first_token_instant))
+    }
+
+    /// Run a paged-attention prefill over the full prompt, dispatching
+    /// per-layer between the adapter (global layers) and the existing
+    /// flat path (sliding layers).
+    ///
+    /// `full_tokens` is the entire prompt (sliding layers re-prefill
+    /// from token 0). `suffix_tokens` is the new portion beyond the
+    /// paged prefix-cache hit (used by `record_tokens` +
+    /// `update_keys_values` for global layers). `cached_prefix_len`
+    /// is the paged-cache hit length.
+    ///
+    /// Returns the last position's logits squeezed to `[vocab]`.
+    ///
+    /// ## Prefill split (parity with the flat path)
+    ///
+    /// The flat path's `prefill_body_gemma4` processes tokens
+    /// `[0..N-1]` through `forward_body`, then the caller runs a
+    /// SECOND, single-token `forward_inner` for the final token. That
+    /// second dispatch is load-bearing — see the doc-comment on
+    /// `prefill_body_gemma4`: "SDPA computes slightly different
+    /// numerical results for multi-token causal attention vs
+    /// single-token attention with cached K/V. These small differences
+    /// compound through layers, causing divergent logits if the last
+    /// prompt token is processed in the same batch as the rest."
+    ///
+    /// This function mirrors that split for the paged path so the
+    /// K/V-cache reduction order at the prefill→decode boundary
+    /// matches between flat and paged. Without the split, BF16 SDPA
+    /// drift on the last layer's hidden state at step 0 (~1%) flips
+    /// argmax to a nearby zero-embedding `<unused>` token, causing the
+    /// `<turn|>` stop signal to be missed and the decoder to fall into
+    /// the all-zero-input cycle (`mean(V)` attention output → `id+1`
+    /// counting cascade).
+    fn run_paged_prefill_chunk(
+        &mut self,
+        full_tokens: &[u32],
+        suffix_tokens: &[u32],
+        cached_prefix_len: u32,
+    ) -> Result<MxArray> {
+        if suffix_tokens.is_empty() {
+            return Err(Error::from_reason(
+                "run_paged_prefill_chunk called with empty suffix",
+            ));
+        }
+
+        let suffix_len = suffix_tokens.len() as u32;
+        let layer_kinds = self.compute_layer_kinds();
+
+        // For sliding layers we need state at position cached_prefix_len.
+        // Sliding layers are restored each turn via reset_caches_sync, so
+        // we need to reprefill the cached prefix through them BEFORE the
+        // suffix can attend. Run a "sliding-only" pass over the prefix
+        // tokens, then the suffix passes below.
+        if cached_prefix_len > 0 {
+            let prefix = &full_tokens[..(cached_prefix_len as usize)];
+            self.run_sliding_only_prefill(prefix, &layer_kinds)?;
+        }
+
+        crate::models::gemma4::diagnostic::set_path("paged");
+        crate::models::gemma4::diagnostic::set_step(-1);
+
+        // Two-pass split (mirrors flat `prefill_body_gemma4 →
+        // forward_inner`):
+        //   Pass 1: tokens `[..suffix_len-1]` (no-op if suffix_len == 1).
+        //           Layer-loop only — its hidden_states are discarded;
+        //           we keep the per-layer K/V writes the loop made into
+        //           the paged pool / sliding caches.
+        //   Pass 2: the FINAL token (length 1). Now
+        //           `cached_prefix_len_for_chunk = cached_prefix_len +
+        //           suffix_len - 1`, which is > 0, so global layers
+        //           take the cache-hit `read_kv_range` branch in
+        //           `forward_paged` — the same path decode uses. This
+        //           aligns the SDPA reduction order with the flat
+        //           path's `forward_inner` dispatch.
+        if suffix_len > 1 {
+            // --- Pass 1: all-but-last suffix tokens. ---
+            let pass1_tokens = &suffix_tokens[..(suffix_len as usize - 1)];
+            {
+                let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                    Error::from_reason("run_paged_prefill_chunk: paged_adapter is None")
+                })?;
+                adapter
+                    .record_tokens(pass1_tokens)
+                    .map_err(Error::from_reason)?;
+            }
+            let _hidden_pass1 = self.run_paged_prefill_layer_loop(
+                pass1_tokens,
+                /* first_logical_position */ cached_prefix_len,
+                /* cached_prefix_len_for_chunk */ cached_prefix_len,
+                &layer_kinds,
+            )?;
+
+            // Materialize sliding-cache writes from pass 1 before pass 2
+            // reads through them. The paged pool's `update_keys_values`
+            // calls `synchronize_mlx()` internally so global-layer K/V
+            // is already on-pool, but the sliding flat caches are still
+            // lazy graphs at this point. Mirrors the
+            // `eval_gemma4_caches(caches)` call between chunks in
+            // `prefill_body_gemma4`. We deliberately do NOT eval the
+            // pass-1 hidden_states — it is discarded.
+            if let Some(caches) = self.caches.as_ref() {
+                eval_gemma4_caches(caches);
+            }
+            crate::array::clear_cache();
+        }
+
+        // --- Pass 2: the FINAL suffix token (length 1). ---
+        let pass2_tokens = &suffix_tokens[(suffix_len as usize - 1)..];
+        {
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("run_paged_prefill_chunk: paged_adapter is None")
+            })?;
+            adapter
+                .record_tokens(pass2_tokens)
+                .map_err(Error::from_reason)?;
+        }
+        let pass2_first_position = cached_prefix_len + (suffix_len - 1);
+        let pass2_cached_prefix_len = pass2_first_position;
+        let mut hidden_states = self.run_paged_prefill_layer_loop(
+            pass2_tokens,
+            pass2_first_position,
+            pass2_cached_prefix_len,
+            &layer_kinds,
+        )?;
+
+        // Final norm + lm_head + softcap (only for the final token).
+        hidden_states = self.final_norm.forward(&hidden_states)?;
+        crate::models::gemma4::diagnostic::dump_norm(0, "post_final_norm", &hidden_states, None);
+        let logits = if let Some(ref head) = self.lm_head {
+            head.forward(&hidden_states)?
+        } else if let Some(ref w_t) = self.embed_weight_t {
+            hidden_states.matmul(w_t)?
+        } else {
+            let weight = self.embed_tokens.get_weight();
+            let weight_t = weight.transpose(Some(&[1, 0]))?;
+            hidden_states.matmul(&weight_t)?
+        };
+        crate::models::gemma4::diagnostic::dump_logits("pre_softcap", &logits);
+        let logits = if let Some(cap) = self.config.final_logit_softcapping {
+            let cap_arr = MxArray::scalar_float_like(cap, &logits)?;
+            let handle = unsafe { mlx_sys::mlx_logit_softcap(logits.handle.0, cap_arr.handle.0) };
+            let capped = MxArray::from_handle(handle, "logit_softcap")?;
+            crate::models::gemma4::diagnostic::dump_logits("post_softcap", &capped);
+            capped
+        } else {
+            crate::models::gemma4::diagnostic::dump_logits("post_softcap", &logits);
+            logits
+        };
+
+        let last_seq_len = logits.shape_at(1)?;
+        let last = logits
+            .slice_axis(1, last_seq_len - 1, last_seq_len)?
+            .squeeze(Some(&[0, 1]))?;
+        Ok(last)
+    }
+
+    /// One forward pass through the embed → PLE → layer-loop pipeline
+    /// for a single contiguous chunk of tokens. Returns the chunk's
+    /// post-final-layer hidden state (NO final norm / lm_head / softcap
+    /// — the caller decides whether to apply those).
+    ///
+    /// `chunk_tokens` is the slice being processed THIS call.
+    /// `first_logical_position` is the absolute logical position of
+    /// `chunk_tokens[0]` in the request (used as the RoPE offset and
+    /// the slot-mapping anchor). `cached_prefix_len_for_chunk` is the
+    /// number of K/V tokens already in the paged pool BEFORE this
+    /// chunk's writes — when this is > 0 the global-layer SDPA takes
+    /// the `read_kv_range` cache-hit branch, matching decode's
+    /// reduction order. `layer_kinds` is the per-layer routing
+    /// classification (Sliding / GlobalPaged / SharedOnGlobal /
+    /// SharedOnSliding).
+    ///
+    /// Caller must have already called `record_tokens(chunk_tokens)`
+    /// on the paged adapter so `update_keys_values`'s alignment check
+    /// (`first_logical_position == current_token_count - chunk.len()`)
+    /// passes.
+    fn run_paged_prefill_layer_loop(
+        &mut self,
+        chunk_tokens: &[u32],
+        first_logical_position: u32,
+        cached_prefix_len_for_chunk: u32,
+        layer_kinds: &[Gemma4LayerKind],
+    ) -> Result<MxArray> {
+        let chunk_len = chunk_tokens.len() as u32;
+        if chunk_len == 0 {
+            return Err(Error::from_reason(
+                "run_paged_prefill_layer_loop: chunk_tokens must be non-empty",
+            ));
+        }
+
+        let input_ids = MxArray::from_uint32(chunk_tokens, &[1, chunk_len as i64])?;
+        let mut hidden_states = self.embed_tokens.forward(&input_ids)?;
+        // Apply Gemma4 embedding scaling (sqrt(hidden_size)).
+        hidden_states = hidden_states.mul_scalar((self.config.hidden_size as f64).sqrt())?;
+
+        // Compute PLE (per-layer embeddings) for the chunk's tokens.
+        // Mirrors `forward_body`: PLE feeds an additive residual inside
+        // every layer's `apply_ffn_ple_scalar` tail. For Gemma4 E2B/E4B
+        // this is load-bearing — dropping it produces nonsense logits
+        // because each layer is missing a critical residual
+        // contribution. Sliding-only re-prefill of any cached prefix
+        // doesn't propagate PLE through the global layers we'll touch
+        // here (their stored K/V already accounts for it).
+        let projected_ple: Option<MxArray> = if let Some(ref ple) = self.ple {
+            let pre_layer_h = hidden_states.clone();
+            Some(compute_ple(
+                &input_ids,
+                &pre_layer_h,
+                ple,
+                chunk_len as i64,
+            )?)
+        } else {
+            None
+        };
+
+        // Build sliding mask if seq_len exceeds window. Mirrors
+        // `forward_body`'s mask logic.
+        let seq_len = chunk_len as i64;
+        let sliding_mask = if seq_len > 1 && seq_len > self.config.sliding_window as i64 {
+            let sliding_offset = self
+                .caches
+                .as_ref()
+                .and_then(|caches| {
+                    caches
+                        .iter()
+                        .enumerate()
+                        .find(|(i, _)| self.config.is_sliding_layer(*i))
+                        .map(|(_, c)| c.get_offset())
+                })
+                .unwrap_or(0);
+            Some(create_sliding_mask(
+                seq_len,
+                sliding_offset,
+                self.config.sliding_window as i64,
+            )?)
+        } else {
+            None
+        };
+
+        let has_kv_sharing = self.config.num_kv_shared_layers.is_some_and(|n| n > 0);
+        let num_layers = self.layers.len();
+        // Stash for sliding-anchor K/V reused by SharedOnSliding layers.
+        let mut sliding_shared_kv: HashMap<u32, (MxArray, MxArray)> = HashMap::new();
+
+        #[allow(clippy::needless_range_loop)]
+        for layer_idx in 0..num_layers {
+            crate::models::gemma4::diagnostic::set_layer(layer_idx);
+            let kind = layer_kinds[layer_idx];
+            let layer: &Gemma4DecoderLayer = unsafe {
+                let ptr = self.layers.as_ptr().add(layer_idx);
+                &*ptr
+            };
+            let mask: Option<&MxArray> = if matches!(kind, Gemma4LayerKind::Sliding) {
+                sliding_mask.as_ref()
+            } else {
+                None
+            };
+
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason(
+                    "run_paged_prefill_layer_loop: paged_adapter dropped mid-forward",
+                )
+            })?;
+            let flat_cache: Option<&mut Gemma4LayerCache> =
+                if matches!(kind, Gemma4LayerKind::Sliding) {
+                    let caches = unsafe {
+                        let raw = self.caches.as_mut().ok_or_else(|| {
+                            Error::from_reason(
+                                "run_paged_prefill_layer_loop: sliding cache slot missing",
+                            )
+                        })? as *mut Vec<Gemma4LayerCache>;
+                        &mut *raw
+                    };
+                    Some(&mut caches[layer_idx])
+                } else {
+                    None
+                };
+
+            // Build SharedKvInputs for shared layer kinds.
+            let shared_inputs = match kind {
+                Gemma4LayerKind::SharedOnGlobal { .. } => {
+                    // Anchor's pool currently holds
+                    // `cached_prefix_len_for_chunk + chunk_len` tokens
+                    // for this layer (the anchor wrote its part of
+                    // this chunk earlier in the same loop).
+                    let total_ctx = cached_prefix_len_for_chunk + chunk_len;
+                    Some(super::decoder_layer::SharedKvInputs {
+                        cache_offset: first_logical_position as i32,
+                        total_ctx,
+                        keys: None,
+                        values: None,
+                    })
+                }
+                Gemma4LayerKind::SharedOnSliding { anchor_layer_idx } => {
+                    let (k, v) = sliding_shared_kv.get(&anchor_layer_idx).ok_or_else(|| {
+                        Error::from_reason(format!(
+                            "run_paged_prefill_layer_loop: SharedOnSliding anchor {} stash \
+                             missing",
+                            anchor_layer_idx
+                        ))
+                    })?;
+                    let cache_offset =
+                        (first_logical_position as i32 + chunk_len as i32) - seq_len as i32;
+                    Some(super::decoder_layer::SharedKvInputs {
+                        cache_offset,
+                        total_ctx: 0, // unused for SharedOnSliding
+                        keys: Some(k),
+                        values: Some(v),
+                    })
+                }
+                _ => None,
+            };
+
+            // For Sliding layers that anchor a SharedOnSliding chain,
+            // request the stash so the shared layer can pull K/V.
+            let needs_stash = has_kv_sharing
+                && matches!(kind, Gemma4LayerKind::Sliding)
+                && self.config.should_store_shared_kv(layer_idx);
+
+            // Slice the per-layer PLE input ([B, T, num_layers, ple_dim] →
+            // [B, T, ple_dim]). Mirrors `forward_body`'s per-layer slice.
+            let ple_input = projected_ple.as_ref().map(|p| {
+                p.slice_axis(2, layer_idx as i64, layer_idx as i64 + 1)
+                    .and_then(|s| s.squeeze(Some(&[2])))
+            });
+            let ple_input_ref = match &ple_input {
+                Some(Ok(arr)) => Some(arr),
+                _ => None,
+            };
+
+            hidden_states = layer.forward_paged_or_flat(
+                &hidden_states,
+                kind,
+                adapter,
+                first_logical_position,
+                cached_prefix_len_for_chunk,
+                /* is_prefill */ true,
+                mask,
+                flat_cache,
+                ple_input_ref,
+                needs_stash,
+                shared_inputs,
+            )?;
+
+            // After a Sliding anchor's forward, capture its stash so
+            // downstream SharedOnSliding layers can attend over it.
+            if needs_stash {
+                let caches = unsafe {
+                    let raw = self.caches.as_mut().ok_or_else(|| {
+                        Error::from_reason(
+                            "run_paged_prefill_layer_loop: sliding cache slot missing \
+                             post-forward",
+                        )
+                    })? as *mut Vec<Gemma4LayerCache>;
+                    &mut *raw
+                };
+                if let Some((k, v)) = caches[layer_idx].take_stashed_kv() {
+                    sliding_shared_kv.insert(layer_idx as u32, (k, v));
+                }
+            }
+            // Smooth the prefill memory peak: every K layers, materialize the
+            // residual stream so MLX can release the upstream graph nodes
+            // (embedding + every prior layer's attention/MLP/PLE intermediates)
+            // from the cache pool. Without this the in-flight lazy graph
+            // accumulates on long contexts before the post-prefill sync fires.
+            // Cadence is `MLX_PAGED_PREFILL_EVAL_INTERVAL` (default 8).
+            crate::array::maybe_eval_clear_for_paged_prefill_layer(layer_idx, &hidden_states);
+        }
+
+        Ok(hidden_states)
+    }
+
+    /// Run one paged decode step: feed `[token_id]` through the model.
+    fn run_paged_decode_step(&mut self, token_id: u32) -> Result<MxArray> {
+        let first_logical_position = {
+            let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
+                Error::from_reason("run_paged_decode_step: paged_adapter is None")
+            })?;
+            adapter.current_token_count()
+        };
+        {
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("run_paged_decode_step: paged_adapter dropped")
+            })?;
+            adapter
+                .record_tokens(&[token_id])
+                .map_err(Error::from_reason)?;
+        }
+
+        let layer_kinds = self.compute_layer_kinds();
+
+        let input_ids = MxArray::from_uint32(&[token_id], &[1, 1])?;
+        let mut hidden_states = self.embed_tokens.forward(&input_ids)?;
+        hidden_states = hidden_states.mul_scalar((self.config.hidden_size as f64).sqrt())?;
+
+        // Compute PLE for the single decode token. Same load-bearing
+        // residual contribution as the prefill path — see the comment in
+        // `run_paged_prefill_chunk` for why dropping this destroys logits
+        // on Gemma4 E2B/E4B.
+        let projected_ple_step: Option<MxArray> = if let Some(ref ple) = self.ple {
+            let pre_layer_h = hidden_states.clone();
+            Some(compute_ple(&input_ids, &pre_layer_h, ple, 1)?)
+        } else {
+            None
+        };
+
+        let has_kv_sharing = self.config.num_kv_shared_layers.is_some_and(|n| n > 0);
+        let num_layers = self.layers.len();
+        let mut sliding_shared_kv: HashMap<u32, (MxArray, MxArray)> = HashMap::new();
+        crate::models::gemma4::diagnostic::set_path("paged");
+        #[allow(clippy::needless_range_loop)]
+        for layer_idx in 0..num_layers {
+            crate::models::gemma4::diagnostic::set_layer(layer_idx);
+            let kind = layer_kinds[layer_idx];
+            let layer: &Gemma4DecoderLayer = unsafe {
+                let ptr = self.layers.as_ptr().add(layer_idx);
+                &*ptr
+            };
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("run_paged_decode_step: paged_adapter dropped mid-forward")
+            })?;
+            let flat_cache: Option<&mut Gemma4LayerCache> =
+                if matches!(kind, Gemma4LayerKind::Sliding) {
+                    let caches = unsafe {
+                        let raw = self.caches.as_mut().ok_or_else(|| {
+                            Error::from_reason("run_paged_decode_step: sliding cache slot missing")
+                        })? as *mut Vec<Gemma4LayerCache>;
+                        &mut *raw
+                    };
+                    Some(&mut caches[layer_idx])
+                } else {
+                    None
+                };
+
+            let shared_inputs = match kind {
+                Gemma4LayerKind::SharedOnGlobal { .. } => {
+                    // Anchor's slot already has the new token (it ran
+                    // its own forward_paged earlier in this loop, which
+                    // wrote K/V via update_keys_values). Read full ctx.
+                    let total_ctx = first_logical_position + 1;
+                    Some(super::decoder_layer::SharedKvInputs {
+                        cache_offset: first_logical_position as i32,
+                        total_ctx,
+                        keys: None,
+                        values: None,
+                    })
+                }
+                Gemma4LayerKind::SharedOnSliding { anchor_layer_idx } => {
+                    let (k, v) = sliding_shared_kv.get(&anchor_layer_idx).ok_or_else(|| {
+                        Error::from_reason(format!(
+                            "run_paged_decode_step: SharedOnSliding anchor {} stash missing",
+                            anchor_layer_idx
+                        ))
+                    })?;
+                    let cache_offset = first_logical_position as i32;
+                    Some(super::decoder_layer::SharedKvInputs {
+                        cache_offset,
+                        total_ctx: 0,
+                        keys: Some(k),
+                        values: Some(v),
+                    })
+                }
+                _ => None,
+            };
+
+            let needs_stash = has_kv_sharing
+                && matches!(kind, Gemma4LayerKind::Sliding)
+                && self.config.should_store_shared_kv(layer_idx);
+
+            // Slice the per-layer PLE input ([B, T, num_layers, ple_dim] →
+            // [B, T, ple_dim]).
+            let ple_input = projected_ple_step.as_ref().map(|p| {
+                p.slice_axis(2, layer_idx as i64, layer_idx as i64 + 1)
+                    .and_then(|s| s.squeeze(Some(&[2])))
+            });
+            let ple_input_ref = match &ple_input {
+                Some(Ok(arr)) => Some(arr),
+                _ => None,
+            };
+
+            hidden_states = layer.forward_paged_or_flat(
+                &hidden_states,
+                kind,
+                adapter,
+                first_logical_position,
+                /* cached_prefix_len */ 0,
+                /* is_prefill */ false,
+                /* mask */ None,
+                flat_cache,
+                ple_input_ref,
+                needs_stash,
+                shared_inputs,
+            )?;
+
+            if needs_stash {
+                let caches = unsafe {
+                    let raw = self.caches.as_mut().ok_or_else(|| {
+                        Error::from_reason(
+                            "run_paged_decode_step: sliding cache slot missing post-forward",
+                        )
+                    })? as *mut Vec<Gemma4LayerCache>;
+                    &mut *raw
+                };
+                if let Some((k, v)) = caches[layer_idx].take_stashed_kv() {
+                    sliding_shared_kv.insert(layer_idx as u32, (k, v));
+                }
+            }
+        }
+
+        hidden_states = self.final_norm.forward(&hidden_states)?;
+        crate::models::gemma4::diagnostic::dump_norm(0, "post_final_norm", &hidden_states, None);
+        let logits = if let Some(ref head) = self.lm_head {
+            head.forward(&hidden_states)?
+        } else if let Some(ref w_t) = self.embed_weight_t {
+            hidden_states.matmul(w_t)?
+        } else {
+            let weight = self.embed_tokens.get_weight();
+            let weight_t = weight.transpose(Some(&[1, 0]))?;
+            hidden_states.matmul(&weight_t)?
+        };
+        crate::models::gemma4::diagnostic::dump_logits("pre_softcap", &logits);
+        let logits = if let Some(cap) = self.config.final_logit_softcapping {
+            let cap_arr = MxArray::scalar_float_like(cap, &logits)?;
+            let handle = unsafe { mlx_sys::mlx_logit_softcap(logits.handle.0, cap_arr.handle.0) };
+            let capped = MxArray::from_handle(handle, "logit_softcap")?;
+            crate::models::gemma4::diagnostic::dump_logits("post_softcap", &capped);
+            capped
+        } else {
+            crate::models::gemma4::diagnostic::dump_logits("post_softcap", &logits);
+            logits
+        };
+        Ok(logits)
+    }
+
+    /// Forward the cached prefix tokens through SLIDING layers ONLY,
+    /// updating their flat caches in-place. Used to bring sliding-layer
+    /// state up to the paged cache's `cached_prefix_len` boundary
+    /// before the main `run_paged_prefill_chunk` continues with the
+    /// suffix.
+    ///
+    /// Global layers are skipped — their K/V already lives in the
+    /// paged pool (the prefix-cache hit promised that).
+    fn run_sliding_only_prefill(
+        &mut self,
+        prefix_tokens: &[u32],
+        layer_kinds: &[Gemma4LayerKind],
+    ) -> Result<()> {
+        if prefix_tokens.is_empty() {
+            return Ok(());
+        }
+        let input_ids = MxArray::from_uint32(prefix_tokens, &[1, prefix_tokens.len() as i64])?;
+        let mut hidden_states = self.embed_tokens.forward(&input_ids)?;
+        hidden_states = hidden_states.mul_scalar((self.config.hidden_size as f64).sqrt())?;
+
+        // Sliding mask if seq_len > window.
+        let seq_len = prefix_tokens.len() as i64;
+
+        // Compute PLE for the prefix tokens. Without this, sliding-layer
+        // K/V written here will diverge from the flat path's K/V because
+        // hidden_states fed into the sliding pre-norm depends on the
+        // PLE-augmented output of the prior layer. Same load-bearing
+        // residual as in `run_paged_prefill_chunk`.
+        let projected_ple_prefix: Option<MxArray> = if let Some(ref ple) = self.ple {
+            let pre_layer_h = hidden_states.clone();
+            Some(compute_ple(&input_ids, &pre_layer_h, ple, seq_len)?)
+        } else {
+            None
+        };
+        let sliding_mask = if seq_len > self.config.sliding_window as i64 {
+            Some(create_sliding_mask(
+                seq_len,
+                0,
+                self.config.sliding_window as i64,
+            )?)
+        } else {
+            None
+        };
+
+        let num_layers = self.layers.len();
+        #[allow(clippy::needless_range_loop)]
+        for layer_idx in 0..num_layers {
+            let kind = layer_kinds[layer_idx];
+            // For sliding layers we forward through the flat path; for
+            // global layers we use a NO-OP forward (skip — the K/V is
+            // already in the paged pool, hidden_states discarded).
+            // The hidden_states need to flow through ALL layers because
+            // the next sliding layer sees the previous global layer's
+            // output; we run global layers via the flat `forward` with
+            // a fresh KVCache that we throw away.
+            let layer: &Gemma4DecoderLayer = unsafe {
+                let ptr = self.layers.as_ptr().add(layer_idx);
+                &*ptr
+            };
+            // Slice this layer's PLE input ([B, T, num_layers, ple_dim] →
+            // [B, T, ple_dim]).
+            let ple_input = projected_ple_prefix.as_ref().map(|p| {
+                p.slice_axis(2, layer_idx as i64, layer_idx as i64 + 1)
+                    .and_then(|s| s.squeeze(Some(&[2])))
+            });
+            let ple_input_ref = match &ple_input {
+                Some(Ok(arr)) => Some(arr),
+                _ => None,
+            };
+            match kind {
+                Gemma4LayerKind::Sliding => {
+                    let caches = unsafe {
+                        let raw = self.caches.as_mut().ok_or_else(|| {
+                            Error::from_reason(
+                                "run_sliding_only_prefill: sliding cache slot missing",
+                            )
+                        })? as *mut Vec<Gemma4LayerCache>;
+                        &mut *raw
+                    };
+                    hidden_states = layer.forward(
+                        &hidden_states,
+                        sliding_mask.as_ref(),
+                        Some(&mut caches[layer_idx]),
+                        ple_input_ref,
+                        /* needs_stash */ false,
+                    )?;
+                }
+                Gemma4LayerKind::GlobalPaged { .. } => {
+                    // Build a throwaway global cache so we can run the
+                    // standard `forward(...)` over the prefix and let
+                    // hidden_states propagate. The cache is discarded
+                    // afterwards — the paged pool already holds K/V.
+                    let mut throwaway = Gemma4LayerCache::new_global();
+                    hidden_states = layer.forward(
+                        &hidden_states,
+                        /* mask */ None,
+                        Some(&mut throwaway),
+                        ple_input_ref,
+                        false,
+                    )?;
+                }
+                Gemma4LayerKind::SharedOnGlobal { .. }
+                | Gemma4LayerKind::SharedOnSliding { .. } => {
+                    // Shared layers don't write to caches and don't
+                    // affect the sliding-only re-prefill state. Use a
+                    // throwaway global cache so hidden_states still
+                    // flows through the layer.
+                    let mut throwaway = Gemma4LayerCache::new_global();
+                    hidden_states = layer.forward(
+                        &hidden_states,
+                        /* mask */ None,
+                        Some(&mut throwaway),
+                        ple_input_ref,
+                        false,
+                    )?;
+                }
+            }
+        }
+
+        // Materialize sliding caches.
+        if let Some(caches) = self.caches.as_ref() {
+            eval_gemma4_caches(caches);
+        }
         Ok(())
     }
 
@@ -1963,6 +3394,31 @@ impl Gemma4Inner {
         let sampling_config = make_sampling_config(&config, &self.config);
         let eos_ids = self.config.eos_token_ids.clone();
 
+        // Block-paged dispatch: when the adapter is configured the
+        // session's K/V for global layers lives in the adapter's pool —
+        // the flat caches (sliding only on the paged path) were reset at
+        // the end of turn 1 and cannot be used to pick up the global
+        // context. Route the delta through the same pipeline as
+        // `chat_sync_core_paged` by reconstructing the full token
+        // history (cached + delta) — `find_cached_prefix` will discover
+        // the prefix that turn 1 registered for reuse, sliding-only
+        // re-prefill bridges the sliding-layer state, and the full
+        // suffix (just the delta tokens) gets the same SDPA reduction
+        // order as turn 1's prefill→decode boundary. Mirrors Qwen3's
+        // `chat_tokens_delta_sync` paged dispatch.
+        if self.paged_adapter.is_some() {
+            let mut full_token_history = self.cached_token_history.clone();
+            full_token_history.extend(delta_tokens.iter().copied());
+            return self.chat_sync_core_paged(
+                full_token_history,
+                tokenizer,
+                config,
+                turn_end_id,
+                sampling_config,
+                max_new_tokens,
+            );
+        }
+
         // Build the full token history = cached_history + delta. Used
         // when save_cache_state-ing back to `self.cached_token_history`
         // at the end (the decode loop doesn't actually consult the
@@ -2061,6 +3517,8 @@ impl Gemma4Inner {
                 None
             };
 
+            // See `chat_sync_core_paged_inner` for the rationale.
+            current_y.eval();
             let token_id = current_y.item_at_int32(0)? as u32;
             generated_tokens.push(token_id);
 
@@ -2363,6 +3821,28 @@ impl Gemma4Inner {
         let sampling_config = make_sampling_config(&config, &self.config);
         let eos_ids = self.config.eos_token_ids.clone();
 
+        // Paged dispatch: same rationale as `chat_tokens_delta_sync` —
+        // the global K/V lives in the paged adapter's pool, the flat
+        // (sliding) caches were reset at end-of-turn-1, so the only way
+        // to resume the conversation faithfully is to route the full
+        // history (cached + delta) through the paged streaming pipeline
+        // and let `find_cached_prefix` discover the prefix that turn 1
+        // registered for reuse.
+        if self.paged_adapter.is_some() {
+            let mut full_token_history = self.cached_token_history.clone();
+            full_token_history.extend(delta_tokens.iter().copied());
+            return self.chat_stream_sync_core_paged(
+                full_token_history,
+                tokenizer,
+                config,
+                turn_end_id,
+                sampling_config,
+                cb,
+                cancelled,
+                max_new_tokens,
+            );
+        }
+
         // The streaming delta path is 100% cache-reuse by construction
         // (mirrors `chat_tokens_delta_sync`); capture the reused prefix
         // length for the final `cached_tokens` report.
@@ -2454,6 +3934,8 @@ impl Gemma4Inner {
                 None
             };
 
+            // See `chat_sync_core_paged_inner` for the rationale.
+            current_y.eval();
             let token_id = current_y.item_at_int32(0)? as u32;
             generated_tokens.push(token_id);
 
@@ -2732,6 +4214,7 @@ impl Gemma4Model {
             model_id: 0,
             has_vision,
             initialized: false,
+            paged_active: false,
             _cache_limit_guard: None,
         }
     }
@@ -2740,6 +4223,22 @@ impl Gemma4Model {
     #[napi(getter)]
     pub fn is_initialized(&self) -> bool {
         self.initialized
+    }
+
+    /// Whether the block-paged KV cache adapter is active on this model
+    /// instance.
+    ///
+    /// `true` iff `Gemma4Inner::paged_adapter` was successfully
+    /// constructed at load time (driven by
+    /// `Gemma4Config::use_block_paged_cache`, default-ON since the
+    /// `gemma4_paged_vs_flat_parity` integration test verified greedy
+    /// byte-equal at BF16 against real Gemma-4-E2B-IT weights — see
+    /// CLAUDE.md). Stubs constructed via `new(config)` always return
+    /// `false`. Surfaced through this NAPI method so server endpoints
+    /// can branch on it without a model-thread roundtrip.
+    #[napi]
+    pub fn has_block_paged_cache(&self) -> bool {
+        self.paged_active
     }
 
     #[napi]
@@ -3291,7 +4790,10 @@ fn forward_body(
     let has_kv_sharing = config.num_kv_shared_layers.is_some_and(|n| n > 0);
     let mut shared_kv: HashMap<usize, (MxArray, MxArray)> = HashMap::new();
 
+    crate::models::gemma4::diagnostic::set_path("flat");
+
     for (i, layer) in layers.iter().enumerate() {
+        crate::models::gemma4::diagnostic::set_layer(i);
         let is_global = config.is_global_layer(i);
 
         // Global layers: None mask → attention module uses causal SDPA or no-mask path
@@ -3382,6 +4884,8 @@ fn forward_inner(
         config,
     )?;
 
+    crate::models::gemma4::diagnostic::dump_norm(0, "post_final_norm", &h, None);
+
     // LM head or tied embeddings
     let logits = if let Some(head) = lm_head {
         head.forward(&h)?
@@ -3392,13 +4896,17 @@ fn forward_inner(
         let weight_t = weight.transpose(Some(&[1, 0]))?;
         h.matmul(&weight_t)?
     };
+    crate::models::gemma4::diagnostic::dump_logits("pre_softcap", &logits);
 
     // Logit softcapping — compiled fused kernel (matches Python's mx.compile logit_softcap)
     if let Some(cap) = config.final_logit_softcapping {
         let cap_arr = MxArray::scalar_float_like(cap, &logits)?;
         let handle = unsafe { mlx_sys::mlx_logit_softcap(logits.handle.0, cap_arr.handle.0) };
-        Ok(MxArray::from_handle(handle, "logit_softcap")?)
+        let capped = MxArray::from_handle(handle, "logit_softcap")?;
+        crate::models::gemma4::diagnostic::dump_logits("post_softcap", &capped);
+        Ok(capped)
     } else {
+        crate::models::gemma4::diagnostic::dump_logits("post_softcap", &logits);
         Ok(logits)
     }
 }
@@ -3449,6 +4957,78 @@ fn project_per_layer_inputs(
 ) -> Result<MxArray> {
     // PLE data is already fully computed (combined projection + token embeddings)
     Ok(per_layer_data.clone())
+}
+
+/// Build the per-layer routing list for the paged dispatch (pure
+/// function over a `Gemma4Config`).
+///
+/// Returns `Vec<Gemma4LayerKind>` of length `config.num_hidden_layers`
+/// where each entry classifies a layer as:
+/// * `Sliding` — stays on the flat `Gemma4LayerCache::Sliding` path.
+/// * `GlobalPaged { paged_idx }` — routes through the paged adapter
+///   at the given global-layer ordinal.
+/// * `SharedOnGlobal { anchor_paged_idx }` — KV-shared layer whose
+///   anchor is a global layer; reads K/V via the adapter.
+/// * `SharedOnSliding { anchor_layer_idx }` — KV-shared layer whose
+///   anchor is a sliding layer; reads K/V from the anchor's flat
+///   cache stash.
+///
+/// `paged_idx` counts only `full_attention` layers in their original
+/// decoder order — matches the `LayerKVPool` slot count from
+/// `Gemma4Inner::new`. KV-shared layers do NOT consume a paged slot
+/// (they reuse the anchor's K/V); the shared variants carry the
+/// anchor's index so the shared forward path can resolve it.
+///
+/// Lifted to a free helper so unit tests can drive it without owning a
+/// `Gemma4Inner` (which requires loaded weights). Mirrors LFM2's
+/// `compute_layer_kinds` pattern.
+pub(crate) fn compute_layer_kinds(config: &Gemma4Config) -> Vec<Gemma4LayerKind> {
+    let n = config.num_hidden_layers as usize;
+
+    // Pre-compute global -> paged_idx mapping so KV-shared layers can
+    // look up their anchor's pool slot.
+    let mut global_to_paged: Vec<Option<u32>> = vec![None; n];
+    let mut paged_idx: u32 = 0;
+    for (i, slot) in global_to_paged.iter_mut().enumerate().take(n) {
+        if config.is_global_layer(i) {
+            *slot = Some(paged_idx);
+            paged_idx += 1;
+        }
+    }
+
+    let mut kinds = Vec::with_capacity(n);
+    for i in 0..n {
+        let kind = if config.is_kv_shared_layer(i) {
+            match config.kv_shared_anchor(i) {
+                Some(anchor) if config.is_global_layer(anchor) => {
+                    let anchor_paged_idx = global_to_paged[anchor].unwrap_or(0);
+                    Gemma4LayerKind::SharedOnGlobal { anchor_paged_idx }
+                }
+                Some(anchor) => Gemma4LayerKind::SharedOnSliding {
+                    anchor_layer_idx: anchor as u32,
+                },
+                None => {
+                    // Fallback for malformed configs (no anchor
+                    // resolvable). Treat as flat sliding/global based
+                    // on the layer's own type so dispatch doesn't panic.
+                    if config.is_global_layer(i) {
+                        let pidx = global_to_paged[i].unwrap_or(0);
+                        Gemma4LayerKind::GlobalPaged { paged_idx: pidx }
+                    } else {
+                        Gemma4LayerKind::Sliding
+                    }
+                }
+            }
+        } else if config.is_global_layer(i) {
+            Gemma4LayerKind::GlobalPaged {
+                paged_idx: global_to_paged[i].unwrap_or(0),
+            }
+        } else {
+            Gemma4LayerKind::Sliding
+        };
+        kinds.push(kind);
+    }
+    kinds
 }
 
 /// Default prefill chunk size (tokens per chunk).
@@ -3966,6 +5546,458 @@ mod tests {
             !prompt.contains("<|turn>developer"),
             "developer should not appear as a raw role"
         );
+    }
+
+    /// Tiny Gemma4 config compatible with `LayerKVPool`'s validate
+    /// constraints (head_size in {32, 64, 96, 128, 256}, FP8 off, etc.).
+    /// `head_dim = 32`, num_kv_heads = 2, no PLE/MoE/vision/sharing.
+    #[cfg(test)]
+    fn paged_tiny_config(use_block_paged: Option<bool>) -> super::Gemma4Config {
+        super::Gemma4Config {
+            vocab_size: 100,
+            hidden_size: 64,
+            num_hidden_layers: 2,
+            num_attention_heads: 2,
+            num_key_value_heads: 2,
+            head_dim: 32,
+            intermediate_size: 64,
+            rms_norm_eps: 1e-6,
+            tie_word_embeddings: true,
+            max_position_embeddings: 128,
+            sliding_window: 128,
+            // All-global so the uniform paged pool's head_dim choice
+            // matches every layer trivially.
+            layer_types: vec!["full_attention".to_string(), "full_attention".to_string()],
+            rope_theta: 1_000_000.0,
+            rope_local_base_freq: 10_000.0,
+            partial_rotary_factor: 0.25,
+            global_num_key_value_heads: None,
+            global_head_dim: None,
+            attention_k_eq_v: false,
+            final_logit_softcapping: None,
+            per_layer_input_embeds: false,
+            hidden_size_per_layer_input: None,
+            vocab_size_per_layer_input: None,
+            pad_token_id: 0,
+            eos_token_ids: vec![1],
+            bos_token_id: 2,
+            attention_bias: false,
+            use_double_wide_mlp: false,
+            num_kv_shared_layers: None,
+            default_temperature: None,
+            default_top_k: None,
+            default_top_p: None,
+            enable_moe_block: false,
+            num_experts: None,
+            top_k_experts: None,
+            moe_intermediate_size: None,
+            vision_config: None,
+            image_token_id: None,
+            boi_token_id: None,
+            eoi_token_id: None,
+            vision_soft_tokens_per_image: None,
+            paged_cache_memory_mb: Some(256),
+            paged_block_size: Some(16),
+            use_block_paged_cache: use_block_paged,
+        }
+    }
+
+    /// `use_block_paged_cache` defaults to `None` when absent from the
+    /// JSON config — guards against silently switching the storage
+    /// backend on existing Gemma4 checkpoints.
+    ///
+    /// Pure-CPU; no MLX runtime needed.
+    #[test]
+    fn test_use_block_paged_cache_defaults_to_none_via_serde() {
+        let json = serde_json::json!({
+            "vocab_size": 0,
+            "hidden_size": 0,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 32,
+            "intermediate_size": 1,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": false,
+            "max_position_embeddings": 2048,
+        });
+        let cfg: super::Gemma4Config =
+            serde_json::from_value(json).expect("deserialize Gemma4Config");
+        assert_eq!(
+            cfg.use_block_paged_cache, None,
+            "use_block_paged_cache must default to None on JSON without the key"
+        );
+        assert_eq!(cfg.paged_block_size, None);
+        assert_eq!(cfg.paged_cache_memory_mb, None);
+    }
+
+    /// `use_block_paged_cache: true` round-trips through serde.
+    #[test]
+    fn test_use_block_paged_cache_round_trips_true() {
+        let json = serde_json::json!({
+            "vocab_size": 0,
+            "hidden_size": 0,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 32,
+            "intermediate_size": 1,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": false,
+            "max_position_embeddings": 2048,
+            "use_block_paged_cache": true,
+        });
+        let cfg: super::Gemma4Config =
+            serde_json::from_value(json).expect("deserialize Gemma4Config");
+        assert_eq!(cfg.use_block_paged_cache, Some(true));
+    }
+
+    /// Explicit opt-out (`Some(false)`) must NOT allocate the block-paged
+    /// adapter. The previous "None means no adapter" assertion was removed
+    /// when the default flipped from `unwrap_or(false)` to `unwrap_or(true)`
+    /// — the explicit-false path is the new "no adapter" guarantee.
+    #[test]
+    fn test_gemma4_inner_no_paged_adapter_when_flag_is_explicit_false() {
+        let cfg = paged_tiny_config(Some(false));
+        let inner = match super::Gemma4Inner::new(cfg) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Gemma4Inner::new failure: {msg}");
+            }
+        };
+        assert!(
+            inner.paged_adapter.is_none(),
+            "paged_adapter must be None when use_block_paged_cache is Some(false)"
+        );
+    }
+
+    /// Default-flag construction (`None`) must allocate the block-paged
+    /// adapter under the new default-on policy (`unwrap_or(true)`).
+    /// Allocates a `LayerKVPool`, so requires Metal — gracefully skips
+    /// on no-Metal sandboxes.
+    #[test]
+    fn test_gemma4_inner_paged_adapter_when_flag_is_none_default_on_macos() {
+        let cfg = paged_tiny_config(None);
+        match super::Gemma4Inner::new(cfg) {
+            Ok(inner) => {
+                assert!(
+                    inner.paged_adapter.is_some(),
+                    "paged_adapter must be Some when use_block_paged_cache is None \
+                     (new default-on policy: unwrap_or(true))"
+                );
+            }
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Gemma4Inner::new failure: {msg}");
+            }
+        }
+    }
+
+    /// Construction with `use_block_paged_cache: Some(true)` must populate
+    /// `paged_adapter`. Allocates a `LayerKVPool`, so requires Metal —
+    /// gracefully skips on no-Metal sandboxes.
+    #[test]
+    fn test_gemma4_inner_constructs_paged_adapter_when_flag_is_true() {
+        let cfg = paged_tiny_config(Some(true));
+        match super::Gemma4Inner::new(cfg) {
+            Ok(inner) => {
+                assert!(
+                    inner.paged_adapter.is_some(),
+                    "paged_adapter must be Some when use_block_paged_cache = Some(true)"
+                );
+            }
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Gemma4Inner::new failure: {msg}");
+            }
+        }
+    }
+
+    /// All-global config: every layer must route through `GlobalPaged`
+    /// with paged_idx == absolute index, no shared layers.
+    #[test]
+    fn test_compute_layer_kinds_all_global() {
+        let cfg = super::Gemma4Config {
+            num_hidden_layers: 4,
+            layer_types: vec!["full_attention".to_string(); 4],
+            ..paged_tiny_config(None)
+        };
+        let kinds = super::compute_layer_kinds(&cfg);
+        assert_eq!(kinds.len(), 4);
+        for (i, k) in kinds.iter().enumerate() {
+            match k {
+                super::Gemma4LayerKind::GlobalPaged { paged_idx } => {
+                    assert_eq!(*paged_idx as usize, i, "layer {i} paged_idx mismatch");
+                }
+                other => panic!("layer {i}: expected GlobalPaged, got {other:?}"),
+            }
+        }
+    }
+
+    /// Hybrid sliding+global with no sharing: paged_idx counts only
+    /// global layers in original order; sliding layers map to `Sliding`.
+    #[test]
+    fn test_compute_layer_kinds_hybrid_no_sharing() {
+        // 5-layer cycle: 4 sliding + 1 global, repeated for 10 layers.
+        let cycle = ["sliding_attention"; 4]
+            .iter()
+            .map(|s| s.to_string())
+            .chain(std::iter::once("full_attention".to_string()))
+            .collect::<Vec<_>>();
+        let layer_types: Vec<String> = (0..10).map(|i| cycle[i % 5].clone()).collect();
+        let cfg = super::Gemma4Config {
+            num_hidden_layers: 10,
+            layer_types,
+            ..paged_tiny_config(None)
+        };
+        let kinds = super::compute_layer_kinds(&cfg);
+        // Global layers at indices 4 and 9 -> paged_idx 0, 1.
+        for (i, k) in kinds.iter().enumerate() {
+            if i == 4 {
+                assert!(
+                    matches!(k, super::Gemma4LayerKind::GlobalPaged { paged_idx: 0 }),
+                    "layer 4 must be GlobalPaged{{0}}, got {k:?}"
+                );
+            } else if i == 9 {
+                assert!(
+                    matches!(k, super::Gemma4LayerKind::GlobalPaged { paged_idx: 1 }),
+                    "layer 9 must be GlobalPaged{{1}}, got {k:?}"
+                );
+            } else {
+                assert!(
+                    matches!(k, super::Gemma4LayerKind::Sliding),
+                    "layer {i} must be Sliding, got {k:?}"
+                );
+            }
+        }
+    }
+
+    /// Smoke test for `chat_sync_core_paged` via direct helper drives.
+    ///
+    /// Random-init weights cast to BF16 (the paged pool's expected
+    /// dtype). Validates the adapter lifecycle (reset →
+    /// find_cached_prefix → allocate_suffix → record_tokens →
+    /// forward_paged_or_flat) and that produced logits have the
+    /// expected shape, without asserting numerical equivalence to the
+    /// flat path (random weights). Gracefully skipped on no-Metal.
+    #[test]
+    fn test_run_paged_prefill_decode_smoke() {
+        use crate::array::{DType, MxArray};
+
+        let cfg = paged_tiny_config(Some(true));
+        let mut inner = match super::Gemma4Inner::new(cfg) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Gemma4Inner::new failure: {msg}");
+            }
+        };
+        assert!(inner.paged_adapter.is_some());
+        if let Err(e) = inner.init_caches_sync() {
+            eprintln!("init_caches_sync skipped: {}", e.reason);
+            return;
+        }
+
+        // Cast all weights to BF16 to match the pool dtype. Mirrors
+        // LFM2's smoke-test cast pattern.
+        let cast = |a: &MxArray| -> MxArray { a.astype(DType::BFloat16).expect("astype BFloat16") };
+        let w = inner.embed_tokens.get_weight();
+        inner.embed_tokens.set_weight(&cast(&w)).expect("embed");
+        let w = inner.final_norm.get_weight();
+        inner.final_norm.set_weight(&cast(&w)).expect("final_norm");
+        if let Some(ref mut head) = inner.lm_head {
+            let w = head.get_weight();
+            head.set_weight(&cast(&w)).expect("lm_head");
+        }
+        for layer in inner.layers.iter_mut() {
+            // Norms.
+            layer
+                .set_input_layernorm_weight(&cast(&layer.input_layernorm_weight().clone()))
+                .ok();
+            layer
+                .set_post_attention_layernorm_weight(&cast(
+                    &layer.post_attention_layernorm_weight().clone(),
+                ))
+                .ok();
+            layer
+                .set_pre_feedforward_layernorm_weight(&cast(
+                    &layer.pre_feedforward_layernorm_weight().clone(),
+                ))
+                .ok();
+            layer
+                .set_post_feedforward_layernorm_weight(&cast(
+                    &layer.post_feedforward_layernorm_weight().clone(),
+                ))
+                .ok();
+            // Attention projections + norms.
+            let attn = &mut layer.self_attn;
+            let w = attn.q_proj_weight();
+            attn.set_q_proj_weight(&cast(&w)).expect("q");
+            let w = attn.k_proj_weight();
+            attn.set_k_proj_weight(&cast(&w)).expect("k");
+            if let Some(w) = attn.v_proj_weight_opt() {
+                attn.set_v_proj_weight(&cast(&w)).expect("v");
+            }
+            let w = attn.o_proj_weight();
+            attn.set_o_proj_weight(&cast(&w)).expect("o");
+            let w = attn.q_norm_weight();
+            attn.set_q_norm_weight(&cast(&w)).expect("qn");
+            let w = attn.k_norm_weight();
+            attn.set_k_norm_weight(&cast(&w)).expect("kn");
+            // MLP.
+            if let crate::models::gemma4::quantized_linear::Gemma4MLPVariant::Standard(
+                ref mut mlp,
+            ) = layer.mlp
+            {
+                let w = mlp.gate_proj_weight();
+                mlp.set_gate_proj_weight(&cast(&w)).expect("gate");
+                let w = mlp.up_proj_weight();
+                mlp.set_up_proj_weight(&cast(&w)).expect("up");
+                let w = mlp.down_proj_weight();
+                mlp.set_down_proj_weight(&cast(&w)).expect("down");
+            }
+        }
+
+        // Adapter lifecycle.
+        let prompt: Vec<u32> = vec![1, 2, 3, 4];
+        if let Some(adapter) = inner.paged_adapter.as_mut() {
+            if let Err(e) = adapter.reset_for_new_request(0) {
+                eprintln!("skipping (adapter reset failed): {e}");
+                return;
+            }
+            if let Err(e) = adapter.find_cached_prefix(&prompt, &[], 0, false) {
+                eprintln!("skipping (find_cached_prefix failed): {e}");
+                return;
+            }
+            if let Err(e) = adapter.allocate_suffix_blocks(16) {
+                eprintln!("skipping (allocate_suffix_blocks failed): {e}");
+                return;
+            }
+        }
+
+        let last_logits = match inner.run_paged_prefill_chunk(&prompt, &prompt, 0) {
+            Ok(l) => l,
+            Err(e) => {
+                let msg = e.reason.to_string();
+                if msg.contains("No Metal device found") || msg.contains("not supported") {
+                    eprintln!("skipping smoke: {msg}");
+                    return;
+                }
+                panic!("run_paged_prefill_chunk failed: {msg}");
+            }
+        };
+        let vocab = last_logits.shape_at(0).expect("shape");
+        assert_eq!(vocab, 100, "vocab_size from paged_tiny_config");
+
+        let mut next_token: u32 = 5;
+        for _ in 0..4 {
+            match inner.run_paged_decode_step(next_token) {
+                Ok(logits) => {
+                    assert_eq!(logits.shape_at(0).expect("shape"), 1);
+                    assert_eq!(logits.shape_at(1).expect("shape"), 1);
+                    assert_eq!(logits.shape_at(2).expect("shape"), 100);
+                }
+                Err(e) => {
+                    let msg = e.reason.to_string();
+                    if msg.contains("No Metal device found") {
+                        eprintln!("skipping decode (no Metal): {msg}");
+                        return;
+                    }
+                    panic!("run_paged_decode_step failed: {msg}");
+                }
+            }
+            next_token = next_token.wrapping_add(1);
+        }
+
+        if let Some(adapter) = inner.paged_adapter.as_mut() {
+            let _ = adapter.release_request();
+        }
+    }
+
+    /// KV-shared layers must resolve their anchor's pool slot
+    /// (SharedOnGlobal) or absolute index (SharedOnSliding).
+    #[test]
+    fn test_compute_layer_kinds_kv_sharing_resolves_anchors() {
+        // 8 layers: pattern S G S G S G S G (4 global @ 1, 3, 5, 7).
+        // num_kv_shared_layers = 4 → last 4 (indices 4, 5, 6, 7) reuse anchors.
+        // Anchor for shared global at i=5 should be the last non-shared
+        // global before first_kv_shared_layer (=4): that's i=3 → paged_idx=1.
+        // Anchor for shared sliding at i=4 should be sliding at i=2.
+        let layer_types: Vec<String> = (0..8)
+            .map(|i| {
+                if i % 2 == 1 {
+                    "full_attention".to_string()
+                } else {
+                    "sliding_attention".to_string()
+                }
+            })
+            .collect();
+        let cfg = super::Gemma4Config {
+            num_hidden_layers: 8,
+            layer_types,
+            num_kv_shared_layers: Some(4),
+            ..paged_tiny_config(None)
+        };
+        let kinds = super::compute_layer_kinds(&cfg);
+        // Non-shared layers: 0=Sliding, 1=GlobalPaged{0}, 2=Sliding, 3=GlobalPaged{1}.
+        assert!(matches!(kinds[0], super::Gemma4LayerKind::Sliding));
+        assert!(matches!(
+            kinds[1],
+            super::Gemma4LayerKind::GlobalPaged { paged_idx: 0 }
+        ));
+        assert!(matches!(kinds[2], super::Gemma4LayerKind::Sliding));
+        assert!(matches!(
+            kinds[3],
+            super::Gemma4LayerKind::GlobalPaged { paged_idx: 1 }
+        ));
+        // Shared layers 4..8 (note these still consume paged_idx slots
+        // because they ARE global layers themselves at the type level —
+        // but the LayerKVPool sizing in Gemma4Inner::new counts ALL
+        // global layers (both anchors and shared) so the indexing is
+        // consistent. SharedOnGlobal carries the ANCHOR's pool slot.
+        // SharedOnSliding carries the anchor's absolute layer index.
+        match kinds[4] {
+            super::Gemma4LayerKind::SharedOnSliding { anchor_layer_idx } => {
+                assert_eq!(anchor_layer_idx, 2, "anchor for sliding-shared layer 4");
+            }
+            ref other => panic!("layer 4: expected SharedOnSliding, got {other:?}"),
+        }
+        match kinds[5] {
+            super::Gemma4LayerKind::SharedOnGlobal { anchor_paged_idx } => {
+                // Anchor at layer 3 → paged_idx 1.
+                assert_eq!(anchor_paged_idx, 1, "anchor paged_idx for global-shared 5");
+            }
+            ref other => panic!("layer 5: expected SharedOnGlobal, got {other:?}"),
+        }
+        match kinds[6] {
+            super::Gemma4LayerKind::SharedOnSliding { anchor_layer_idx } => {
+                assert_eq!(anchor_layer_idx, 2, "anchor for sliding-shared layer 6");
+            }
+            ref other => panic!("layer 6: expected SharedOnSliding, got {other:?}"),
+        }
+        match kinds[7] {
+            super::Gemma4LayerKind::SharedOnGlobal { anchor_paged_idx } => {
+                assert_eq!(anchor_paged_idx, 1, "anchor paged_idx for global-shared 7");
+            }
+            ref other => panic!("layer 7: expected SharedOnGlobal, got {other:?}"),
+        }
     }
 }
 

@@ -103,6 +103,41 @@ pub struct Gemma4Config {
     pub boi_token_id: Option<i32>,                 // 255999
     pub eoi_token_id: Option<i32>,                 // 258882
     pub vision_soft_tokens_per_image: Option<i32>, // 280
+
+    // Paged attention options (opt-in)
+    /// GPU memory budget for paged KV cache in megabytes.
+    /// Only used when `use_block_paged_cache` is true.
+    /// Default: 2048 (2GB).
+    #[serde(default)]
+    #[napi(ts_type = "number | undefined")]
+    pub paged_cache_memory_mb: Option<u32>,
+
+    /// Block size for paged attention (tokens per block).
+    /// Only used when `use_block_paged_cache` is true.
+    /// Default: 16.
+    #[serde(default)]
+    #[napi(ts_type = "number | undefined")]
+    pub paged_block_size: Option<u32>,
+
+    /// Use the new block-paged KV cache adapter (`PagedKVCacheAdapter`).
+    ///
+    /// When `Some(true)` or unset (the default), `Gemma4Inner` allocates
+    /// a `BlockAllocator` + `LayerKVPool` pair and constructs a
+    /// `PagedKVCacheAdapter`. Sliding-window layers stay on the existing
+    /// flat `RotatingKVCache` path (window-trimmed semantics don't map
+    /// onto the paged pool), while full_attention (global) layers route
+    /// through the adapter — including `KV-shared` layers whose anchor
+    /// is global (read via `read_kv_range`) and KV-shared layers whose
+    /// anchor is sliding (pull from the flat anchor's stash).
+    ///
+    /// Default: `true` (paged adapter on; opt-out via
+    /// `use_block_paged_cache: false` in `config.json` to fall back to
+    /// the legacy all-flat `Gemma4LayerCache` path). Parity is verified
+    /// by `crates/mlx-core/tests/gemma4_paged_vs_flat_parity.rs` against
+    /// real Gemma-4-E2B weights.
+    #[serde(default)]
+    #[napi(ts_type = "boolean | undefined")]
+    pub use_block_paged_cache: Option<bool>,
 }
 
 fn default_sliding_window() -> i32 {

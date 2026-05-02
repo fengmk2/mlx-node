@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vite-plus/test';
 
-import { mapAnthropicRequest } from '../../packages/server/src/mappers/anthropic-request.js';
+import {
+  canonicalizeSystemForCacheKey,
+  mapAnthropicRequest,
+} from '../../packages/server/src/mappers/anthropic-request.js';
 
 describe('mapAnthropicRequest', () => {
   it('maps a simple string user message to a single user ChatMessage', () => {
@@ -43,6 +46,147 @@ describe('mapAnthropicRequest', () => {
       { role: 'system', content: 'You are helpful. Be concise.' },
       { role: 'user', content: 'Hi' },
     ]);
+  });
+
+  it('drops Anthropic x-anthropic-billing-header system blocks before they reach the model', () => {
+    // Claude Code injects a leading system block of the shape
+    // `"x-anthropic-billing-header: cc_version=...; cch=<rotating-token>;"`
+    // where the cch= token rotates per request. Leaving it in the prompt
+    // defeats prefix caching at both the warm-slot gate and the native
+    // token-prefix verifier. Mirrors vLLM's exact strip logic
+    // (`vllm/entrypoints/anthropic/serving.py`, commit 262b76a0): drop any
+    // text block whose content starts with the prefix.
+    const { messages } = mapAnthropicRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1024,
+      system: [
+        { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.119.806; cc_entrypoint=cli; cch=4a8a9;' },
+        { type: 'text', text: 'You are Claude Code.' },
+        { type: 'text', text: ' Be helpful.' },
+      ],
+      messages: [{ role: 'user', content: 'Hi' }],
+    });
+
+    expect(messages).toEqual([
+      { role: 'system', content: 'You are Claude Code. Be helpful.' },
+      { role: 'user', content: 'Hi' },
+    ]);
+  });
+
+  it('does NOT strip a string-typed system field even when it starts with the billing header', () => {
+    // String-system path is unfiltered (mirrors vLLM, which only strips at
+    // the block level). Real Claude Code traffic always sends the header in
+    // an array block, so a string-system caller copying the prefix is on
+    // their own — but the contract is to leave string `system` alone.
+    const { messages } = mapAnthropicRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1024,
+      system: 'x-anthropic-billing-header: cch=AAAA; You are Claude.',
+      messages: [{ role: 'user', content: 'Hi' }],
+    });
+
+    expect(messages).toEqual([
+      { role: 'system', content: 'x-anthropic-billing-header: cch=AAAA; You are Claude.' },
+      { role: 'user', content: 'Hi' },
+    ]);
+  });
+
+  describe('canonicalizeSystemForCacheKey', () => {
+    it('returns null for a missing system field', () => {
+      expect(canonicalizeSystemForCacheKey(undefined)).toBeNull();
+    });
+
+    it('passes through a string-typed system field unchanged', () => {
+      // String path mirrors the mapper's string branch — no filtering.
+      expect(canonicalizeSystemForCacheKey('You are helpful.')).toBe('You are helpful.');
+    });
+
+    it('produces the same joined text the mapper bakes into the system message (billing header dropped)', () => {
+      // Cross-check: the cache-key view MUST equal the mapper's mapped
+      // system content for the same input, otherwise the warm-slot gate
+      // misses on requests the model would otherwise treat as identical.
+      const system = [
+        { type: 'text' as const, text: 'x-anthropic-billing-header: cc_version=...; cch=ROT1;' },
+        { type: 'text' as const, text: 'You are Claude.' },
+        { type: 'text' as const, text: ' Be concise.' },
+      ];
+      const cacheKey = canonicalizeSystemForCacheKey(system);
+      const { messages } = mapAnthropicRequest({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 1024,
+        system,
+        messages: [{ role: 'user', content: 'Hi' }],
+      });
+      expect(cacheKey).toBe('You are Claude. Be concise.');
+      expect(messages[0]).toEqual({ role: 'system', content: cacheKey });
+    });
+
+    it('matches across rotating cch= tokens (key-stability witness)', () => {
+      // The whole point: the cache key MUST be byte-identical across two
+      // turns whose only difference is the rotating cch= token in the
+      // first block. A regression that leaves the header in would yield
+      // distinct cache keys here.
+      const t1 = canonicalizeSystemForCacheKey([
+        { type: 'text', text: 'x-anthropic-billing-header: cch=AAAA;' },
+        { type: 'text', text: 'You are Claude.' },
+      ]);
+      const t2 = canonicalizeSystemForCacheKey([
+        { type: 'text', text: 'x-anthropic-billing-header: cch=BBBB;' },
+        { type: 'text', text: 'You are Claude.' },
+      ]);
+      expect(t1).toBe('You are Claude.');
+      expect(t1).toBe(t2);
+    });
+
+    it('returns null when array system contains only billing header blocks', () => {
+      // A request whose only system block is the rotating Anthropic
+      // billing-header line is semantically equivalent to "no system" —
+      // collapse to `null` rather than the empty string so (a) the
+      // chat template does not emit two extra wrapper tokens for an
+      // empty `system` message, and (b) the warm-slot cache key compares
+      // byte-equal to an absent-system request (`null === null`, where
+      // `'' !== null` would otherwise miss the slot).
+      expect(
+        canonicalizeSystemForCacheKey([
+          { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.119.806;' },
+        ]),
+      ).toBeNull();
+    });
+
+    it('all-stripped array is equivalent to absent system for cache-key purposes', () => {
+      // Cache-key invariant: a request whose system field is absent
+      // and a request whose only system block is the rotating
+      // billing-header line MUST produce the same cache key (both
+      // `null`). Any divergence here re-introduces the warm-slot drift
+      // this fix targets.
+      expect(canonicalizeSystemForCacheKey(undefined)).toBe(
+        canonicalizeSystemForCacheKey([
+          { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.119.806; cch=ROT1;' },
+        ]),
+      );
+    });
+  });
+
+  it('mapAnthropicRequest emits no system message when all blocks are stripped', () => {
+    // When every system block is stripped (here the only block is the
+    // rotating `x-anthropic-billing-header` line), the mapper MUST NOT
+    // push a `{ role: 'system', content: '' }` placeholder. The chat
+    // template wraps every pushed message with `<|im_start|>{role}\n
+    // {content}<|im_end|>\n`, so an empty system content emits two extra
+    // wrapper tokens that an absent-system request would not — perturbing
+    // the prefix and breaking prefix caching across two semantically
+    // equivalent requests.
+    const { messages } = mapAnthropicRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1024,
+      system: [
+        { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.119.806; cch=4a8a9;' },
+      ],
+      messages: [{ role: 'user', content: 'Hi' }],
+    });
+
+    expect(messages.some((m) => m.role === 'system')).toBe(false);
+    expect(messages).toEqual([{ role: 'user', content: 'Hi' }]);
   });
 
   it('maps multi-turn conversation (user → assistant → user)', () => {
@@ -695,6 +839,104 @@ describe('mapAnthropicRequest', () => {
     });
 
     expect(config.tools).toHaveLength(2);
+  });
+
+  it('rejects tool_choice that names a tool not present in tools[] (silent contract violation)', () => {
+    // Anthropic semantics: `{type:'tool', name:'X'}` is a HARD constraint —
+    // the model MUST call X and only X. Previously, an unmatched name fell
+    // through to the all-tools branch and the model silently received every
+    // tool. That violates the caller's contract; reject with a 400 instead.
+    expect(() =>
+      mapAnthropicRequest({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 1024,
+        messages: [{ role: 'user', content: 'Hello' }],
+        tool_choice: { type: 'tool', name: 'C' },
+        tools: [
+          { name: 'A', input_schema: {} },
+          { name: 'B', input_schema: {} },
+        ],
+      }),
+    ).toThrow(/"C".*tools list/i);
+  });
+
+  it('rejects tool_choice with type=tool but no name', () => {
+    // Malformed shape — without a name we cannot select a tool, and falling
+    // through to the all-tools path would silently accept the request.
+    expect(() =>
+      mapAnthropicRequest({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 1024,
+        messages: [{ role: 'user', content: 'Hello' }],
+        tool_choice: { type: 'tool' },
+        tools: [
+          { name: 'A', input_schema: {} },
+          { name: 'B', input_schema: {} },
+        ],
+      }),
+    ).toThrow(/no name was provided/i);
+  });
+
+  it('regression: tool_choice tool with matching name selects only that tool', () => {
+    // Pin the happy path against the rejection logic added above.
+    const { config } = mapAnthropicRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1024,
+      messages: [{ role: 'user', content: 'Hello' }],
+      tool_choice: { type: 'tool', name: 'B' },
+      tools: [
+        { name: 'A', input_schema: {} },
+        { name: 'B', input_schema: {} },
+        { name: 'C', input_schema: {} },
+      ],
+    });
+
+    expect(config.tools).toHaveLength(1);
+    expect(config.tools![0].function.name).toBe('B');
+  });
+
+  it('regression: tool_choice type=auto sends all tools', () => {
+    // Pin the auto branch — the rejection logic for `type=tool` MUST NOT
+    // affect `type=auto`, which should continue to forward every tool.
+    const { config } = mapAnthropicRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1024,
+      messages: [{ role: 'user', content: 'Hello' }],
+      tool_choice: { type: 'auto' },
+      tools: [
+        { name: 'A', input_schema: {} },
+        { name: 'B', input_schema: {} },
+      ],
+    });
+
+    expect(config.tools).toHaveLength(2);
+  });
+
+  it('rejects non-empty stop_sequences (no native ChatConfig.stopSequences yet)', () => {
+    // `stop_sequences` is parsed into the type but `ChatConfig` has no
+    // matching field. Silently dropping the field would let a client believe
+    // its stop strings are honoured. Reject explicitly until native support
+    // lands.
+    expect(() =>
+      mapAnthropicRequest({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 1024,
+        messages: [{ role: 'user', content: 'Hello' }],
+        stop_sequences: ['STOP'],
+      }),
+    ).toThrow(/stop_sequences.*not supported/i);
+  });
+
+  it('accepts empty stop_sequences array (treated as absent)', () => {
+    // Empty array carries no semantics — accept silently rather than 400 on
+    // a no-op field.
+    const { messages } = mapAnthropicRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1024,
+      messages: [{ role: 'user', content: 'Hello' }],
+      stop_sequences: [],
+    });
+    expect(messages).toEqual([{ role: 'user', content: 'Hello' }]);
   });
 
   it('maps max_tokens to maxNewTokens in config', () => {

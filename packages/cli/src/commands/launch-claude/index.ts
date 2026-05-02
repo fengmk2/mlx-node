@@ -14,6 +14,7 @@ import { createServer } from '@mlx-node/server';
 import { resolveMlxNodeHome, resolveModelsDir } from '../../config.js';
 import { discoverModels } from './discover.js';
 import { attachLogger, resolveLogDir, type Logger } from './logger.js';
+import { cleanupPagedOverrides, resolvePagedAwareModelPath } from './paged-config-override.js';
 import { makeSwapController } from './swap.js';
 
 function printHelp(): void {
@@ -43,6 +44,13 @@ Options:
 
   --                 Everything after this separator is forwarded to the
                      spawned \`claude\` binary verbatim.
+
+Environment variables:
+  MLX_PAGED_PREFILL_CHUNK_SIZE  Tokens per paged-prefill chunk. Defaults to
+                                4096 under \`mlx launch claude\` to bound
+                                cold-prefill memory peaks; set to 0 to
+                                disable chunking, or to a smaller value
+                                (e.g. 1024 / 512) if 4096 still peaks.
 
 Examples:
   mlx launch claude
@@ -110,6 +118,21 @@ export async function run(argv: string[]): Promise<void> {
     return;
   }
 
+  // Bound paged-prefill memory peak by chunking the prompt: default of
+  // 4096 tokens/chunk caps per-chunk SDPA + MoE intermediates to
+  // chunk-sized tiles instead of full-prompt tiles. Empirically 4096
+  // keeps Qwen3.6-35b-a3b 28-43K-token cold prefills at ~50 GB wired
+  // memory with zero swap (vs. the unchunked 117 GB / 39 GB swap), and
+  // halves the per-chunk synchronize_and_clear_cache + host-roundtrip
+  // K/V replay overhead vs. 1024. Respect any user-provided value (set
+  // in shell) so power users can tune down (e.g. 1024 / 512) if a
+  // larger context still peaks. The MLX env var is read via OnceLock on
+  // first paged-prefill call, so setting `process.env` here — before any
+  // model loads — is sufficient to apply the default.
+  if (process.env.MLX_PAGED_PREFILL_CHUNK_SIZE == null) {
+    process.env.MLX_PAGED_PREFILL_CHUNK_SIZE = '4096';
+  }
+
   const modelsDir = resolveModelsDir(args['models-dir']);
   const discovered = await discoverModels(modelsDir);
   if (discovered.length === 0) {
@@ -155,7 +178,13 @@ export async function run(argv: string[]): Promise<void> {
     resolveModel: (name) => ctrlRef.current!.resolveModel(name),
     listModels: () => ctrlRef.current!.listModels(),
   });
-  ctrlRef.current = makeSwapController(discovered, server.registry, loadModel, boundModel.name);
+  // Wrap loadModel so Qwen3.5 dense / MoE checkpoints get
+  // `use_block_paged_cache: true` injected via a temp-dir clone with
+  // patched config.json (see ./paged-config-override.ts for why this
+  // command turns paged ON despite the upstream Qwen3.5 default being
+  // OFF). Other model types pass through unmodified.
+  const loadModelPagedAware = async (path: string) => loadModel(await resolvePagedAwareModelPath(path));
+  ctrlRef.current = makeSwapController(discovered, server.registry, loadModelPagedAware, boundModel.name);
 
   // Verbose logging: attach AFTER `createServer` so we wrap every
   // incoming request (including `GET /v1/models` which claude fires
@@ -169,6 +198,35 @@ export async function run(argv: string[]): Promise<void> {
 
   console.log(
     `[mlx] models dir: ${modelsDir} | listening on http://${host}:${port} | discovered ${discovered.length} model(s) | default: ${boundModel.name}`,
+  );
+  // Mirror the Rust-side parser in crates/mlx-core/src/array/memory.rs::
+  // paged_prefill_chunk_size: trim whitespace, parse i32, reject negative
+  // and unparseable; fall back to 0 (disabled). Logging the EFFECTIVE value
+  // — not the raw env string — prevents misleading "abc tokens" output when
+  // the user typo'd a non-numeric value (which the parser silently maps to
+  // 0/disabled).
+  const rawChunkSize = process.env.MLX_PAGED_PREFILL_CHUNK_SIZE;
+  let effectiveChunkSize = 0;
+  if (rawChunkSize != null) {
+    const trimmed = rawChunkSize.trim();
+    // Mirror Rust's `s.trim().parse::<i32>()`: integer-only, signed,
+    // i32 range [-2^31, 2^31). The TS parser must reject anything Rust
+    // would, otherwise the log shows "N tokens" while chunking is
+    // actually disabled.
+    const I32_MAX = 0x7fff_ffff;
+    // Rust's parse::<i32>() accepts an optional leading '+' or '-'.
+    const parsed = /^[+-]?\d+$/.test(trimmed) ? Number.parseInt(trimmed, 10) : Number.NaN;
+    if (Number.isSafeInteger(parsed) && parsed >= 0 && parsed <= I32_MAX) {
+      effectiveChunkSize = parsed;
+    } else {
+      console.warn(
+        `[mlx] warning: MLX_PAGED_PREFILL_CHUNK_SIZE=${JSON.stringify(rawChunkSize)} is not a non-negative i32 integer; treating as 0 (disabled)`,
+      );
+    }
+  }
+  const chunkLabel = effectiveChunkSize === 0 ? '0 (disabled)' : String(effectiveChunkSize);
+  console.log(
+    `[mlx] paged-prefill chunk size: ${chunkLabel} tokens (set MLX_PAGED_PREFILL_CHUNK_SIZE=N to override; 0 disables)`,
   );
   if (logger) {
     console.log(`[mlx] verbose logging → ${logger.logDir}`);
@@ -205,6 +263,11 @@ export async function run(argv: string[]): Promise<void> {
     }
     try {
       await server.close();
+    } catch {
+      /* ignore */
+    }
+    try {
+      await cleanupPagedOverrides();
     } catch {
       /* ignore */
     }

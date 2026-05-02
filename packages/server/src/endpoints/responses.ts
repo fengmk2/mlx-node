@@ -29,6 +29,7 @@ import { getPendingWritesFor } from '../pending-writes.js';
 import type { ModelRegistry } from '../registry.js';
 import { maybeWarnPromptCacheKeyIneligible, QueueFullError, type SessionRegistry } from '../session-registry.js';
 import { beginSSE, endSSE, writeSSEEvent } from '../streaming.js';
+import { longestSuffixPrefixOverlap } from '../text-recovery.js';
 import { ToolCallTagBuffer } from '../tool-call-buffer.js';
 import {
   createVisibility,
@@ -494,10 +495,40 @@ async function handleStreamingNative(
             content_index: 0,
             delta: finalText,
           });
-        } else if (tagBuffer.suppressed && !hasToolCalls && finalText && hasEmittedMessage) {
-          // Recovery: text was already being streamed but got cut off by a false-alarm
-          // <tool_call> tag. Emit the unsent portion as a delta.
-          const unsent = finalText.slice(messageText.length);
+        } else if (
+          tagBuffer.suppressed &&
+          !hasToolCalls &&
+          finalText &&
+          hasEmittedMessage &&
+          !messageText.includes(finalText)
+        ) {
+          // Recovery: streaming text was cut off by a false-alarm `<tool_call>` tag.
+          //
+          // The previous `finalText.slice(messageText.length)` is wrong: when the
+          // streamed text contains post-</think> whitespace (or any prefix the
+          // native side trimmed via `split_at_think_end` / `parse_tool_calls`),
+          // `messageText.length` indexes into the streamed buffer while
+          // `finalText` starts at the post-trim cleaned position — the two
+          // prefixes diverge (e.g. messageText=`"\n\n"`, finalText=`"<tool_call>..."`)
+          // and a length-based slice chops `<t` off `<tool_call>`, emitting
+          // `"ool_call>\n<function=..."` as visible text.
+          //
+          // Find the longest streamed-suffix == finalText-prefix overlap and emit
+          // whatever finalText has BEYOND that overlap.
+          //
+          // The `!messageText.includes(finalText)` guard distinguishes:
+          //   (a) duplicate-trim case: streamed "Let me check. " + closed
+          //       non-ok tool_call → finalText="Let me check." (trimmed). The
+          //       trimmed text IS a substring of the streamed text → skip
+          //       (otherwise we'd duplicate "Let me check.").
+          //   (b) unclosed-tool case: streamed `\n\n` + unclosed
+          //       `<tool_call>...` → finalText=`<tool_call>...`. The malformed
+          //       tag is NOT a substring of the streamed whitespace → emit
+          //       (this is the original `<t`-strip bug we're fixing).
+          // Length-based guards (`finalText.length > messageText.length`)
+          // misclassify case (b) when the streamed whitespace is long.
+          const overlap = longestSuffixPrefixOverlap(messageText, finalText);
+          const unsent = finalText.slice(overlap);
           if (unsent) {
             messageText += unsent;
             writeSSEEvent(res, 'response.output_text.delta', {
@@ -509,16 +540,29 @@ async function handleStreamingNative(
           }
         }
 
-        // Emit any unsent suffix when final text is longer than what was streamed
-        if (hasEmittedMessage && finalText && finalText.length > messageText.length && !tagBuffer.suppressed) {
-          const unsent = finalText.slice(messageText.length);
-          messageText += unsent;
-          writeSSEEvent(res, 'response.output_text.delta', {
-            item_id: messageItemId,
-            output_index: outputItems.findIndex((i) => i.id === messageItemId),
-            content_index: 0,
-            delta: unsent,
-          });
+        // Emit any unsent suffix when final text extends past what was
+        // streamed. Same divergence concern as above (post-</think> trim
+        // can leave `messageText` longer than the matching prefix of
+        // `finalText`), so we use the same overlap-based slice instead of
+        // a length-based one. When the overlap covers all of `finalText`
+        // (i.e. nothing more to emit) `unsent` is empty and we skip.
+        //
+        // The `!messageText.includes(finalText)` guard skips the
+        // duplicate-trim case where finalText is a substring of the
+        // streamed text (e.g. native `.trim()` shrinkage). See the
+        // companion comment above for the case-distinction rationale.
+        if (hasEmittedMessage && finalText && !tagBuffer.suppressed && !messageText.includes(finalText)) {
+          const overlap = longestSuffixPrefixOverlap(messageText, finalText);
+          const unsent = finalText.slice(overlap);
+          if (unsent) {
+            messageText += unsent;
+            writeSSEEvent(res, 'response.output_text.delta', {
+              item_id: messageItemId,
+              output_index: outputItems.findIndex((i) => i.id === messageItemId),
+              content_index: 0,
+              delta: unsent,
+            });
+          }
         }
 
         // Recovery: text was never emitted during streaming but final has text

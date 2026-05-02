@@ -193,6 +193,18 @@ fn parse_config(model_path: &Path) -> Result<Gemma4Config> {
             .get("vision_soft_tokens_per_image")
             .and_then(|v| v.as_i64())
             .map(|v| v as i32),
+
+        // Paged-attention knobs — opt-in, default to None so existing
+        // checkpoints without these keys load unchanged.
+        paged_cache_memory_mb: raw
+            .get("paged_cache_memory_mb")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32),
+        paged_block_size: raw
+            .get("paged_block_size")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32),
+        use_block_paged_cache: raw.get("use_block_paged_cache").and_then(|v| v.as_bool()),
     })
 }
 
@@ -1367,12 +1379,16 @@ impl Gemma4Model {
                 let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
                 let model_id = inner.model_id;
                 let has_vision = inner.image_processor.is_some();
-                Ok((inner, (model_id, has_vision, cache_limit_guard)))
+                let paged_active = inner.paged_adapter.is_some();
+                Ok((
+                    inner,
+                    (model_id, has_vision, cache_limit_guard, paged_active),
+                ))
             },
             super::model::handle_gemma4_cmd,
         );
 
-        let (model_id, has_vision, cache_limit_guard) = init_rx
+        let (model_id, has_vision, cache_limit_guard, paged_active) = init_rx
             .await
             .map_err(|_| napi::Error::from_reason("Model thread exited during load"))??;
 
@@ -1381,6 +1397,7 @@ impl Gemma4Model {
             model_id,
             has_vision,
             initialized: true,
+            paged_active,
             _cache_limit_guard: Some(cache_limit_guard),
         })
     }

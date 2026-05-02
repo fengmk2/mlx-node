@@ -845,12 +845,15 @@ impl PagedKVCache {
             offset: slot_info.offset,
         };
 
-        // Determine dtype based on FP8 mode
-        let dtype = if use_fp8 {
+        // Determine cache dtype based on FP8 mode. Legacy `PagedKVCache`
+        // continues to assume Float16 K/V input (matching its original
+        // behavior); the new split-dtype dispatcher just makes that explicit.
+        let cache_dtype = if use_fp8 {
             MetalDtype::UChar
         } else {
             MetalDtype::Float16
         };
+        let input_dtype = MetalDtype::Float16;
 
         // Dispatch the kernel
         // SAFETY: Buffer pointers are valid (extracted from MLX arrays above)
@@ -862,7 +865,8 @@ impl PagedKVCache {
                 value_cache,
                 &slot_raw,
                 &params,
-                dtype,
+                input_dtype,
+                cache_dtype,
             )?;
         }
 
@@ -987,12 +991,15 @@ impl PagedKVCache {
             offset: 0,
         };
 
-        // Determine dtype based on FP8 mode
-        let dtype = if use_fp8 {
+        // Determine cache dtype based on FP8 mode. Same explicit-input note
+        // as `update`: legacy `PagedKVCache` keeps its Float16-input
+        // assumption.
+        let cache_dtype = if use_fp8 {
             MetalDtype::UChar
         } else {
             MetalDtype::Float16
         };
+        let input_dtype = MetalDtype::Float16;
 
         // Dispatch the kernel
         // SAFETY: Buffer pointers are valid (extracted from MLX arrays and created above)
@@ -1004,7 +1011,8 @@ impl PagedKVCache {
                 value_cache,
                 &slot_raw,
                 &params,
-                dtype,
+                input_dtype,
+                cache_dtype,
             )?;
         }
 
@@ -1161,6 +1169,9 @@ impl PagedKVCache {
             kv_head_stride,
             k_scale,
             v_scale,
+            // Phase 7: legacy PagedKVCache forward path; sliding-window
+            // masking is opt-in elsewhere.
+            sliding_window: 0,
         };
 
         let query_raw = RawBufferInfo {
@@ -1168,12 +1179,16 @@ impl PagedKVCache {
             offset: query_info.offset,
         };
 
-        // Determine dtype based on config
-        let dtype = if self.config.use_fp8() {
+        // Determine cache dtype based on config. The legacy `PagedKVCache`
+        // path is only wired up for Float16 io (queries/output) — preserve
+        // that here. The new `LayerKVPool::gather_attention` path threads
+        // io_dtype through from the production model.
+        let cache_dtype = if self.config.use_fp8() {
             MetalDtype::UChar
         } else {
             MetalDtype::Float16
         };
+        let io_dtype = MetalDtype::Float16;
 
         // Dispatch the kernel
         let output = unsafe {
@@ -1185,7 +1200,8 @@ impl PagedKVCache {
                 &context_lens_buffer,
                 max_context_len,
                 &params,
-                dtype,
+                io_dtype,
+                cache_dtype,
             )?
         };
 
@@ -1316,6 +1332,9 @@ impl PagedKVCache {
             kv_head_stride,
             k_scale,
             v_scale,
+            // Phase 7: legacy PagedKVCache forward path; sliding-window
+            // masking is opt-in elsewhere.
+            sliding_window: 0,
         };
 
         let query_raw = RawBufferInfo {
@@ -1323,12 +1342,13 @@ impl PagedKVCache {
             offset: query_info.offset,
         };
 
-        // Determine dtype based on config
-        let dtype = if self.config.use_fp8() {
+        // Determine cache dtype based on config. Legacy path: Float16 io.
+        let cache_dtype = if self.config.use_fp8() {
             MetalDtype::UChar
         } else {
             MetalDtype::Float16
         };
+        let io_dtype = MetalDtype::Float16;
 
         let output = unsafe {
             dispatch_paged_attention_auto(
@@ -1339,7 +1359,8 @@ impl PagedKVCache {
                 &context_lens_buffer,
                 max_context_len,
                 &params,
-                dtype,
+                io_dtype,
+                cache_dtype,
             )?
         };
 

@@ -287,12 +287,16 @@ impl PagedAttentionLayer {
             offset: 0,
         };
 
-        // Determine dtype based on FP8 config
-        let dtype = if self.use_fp8 {
+        // Determine cache dtype based on FP8 config. The legacy `PagedKVCache`
+        // path historically uses Float16 for both input and cache (non-FP8),
+        // and Float16 input + UChar cache (FP8). The split-input/cache
+        // dispatcher signature makes this explicit.
+        let cache_dtype = if self.use_fp8 {
             MetalDtype::UChar
         } else {
             MetalDtype::Float16
         };
+        let input_dtype = MetalDtype::Float16;
 
         // Dispatch reshape_and_cache
         unsafe {
@@ -303,7 +307,8 @@ impl PagedAttentionLayer {
                 value_cache,
                 &slot_raw,
                 &reshape_params,
-                dtype,
+                input_dtype,
+                cache_dtype,
             )?;
         }
 
@@ -344,6 +349,10 @@ impl PagedAttentionLayer {
             kv_head_stride,
             k_scale: self.k_scale,
             v_scale: self.v_scale,
+            // Phase 7: PagedAttentionLayer is the legacy non-block-paged
+            // path; sliding-window masking is opt-in via the lower-level
+            // FFI dispatcher. Keep the default off here.
+            sliding_window: 0,
         };
 
         let query_raw = RawBufferInfo {
@@ -351,12 +360,17 @@ impl PagedAttentionLayer {
             offset: query_info.offset,
         };
 
-        // Determine dtype based on FP8 config
-        let dtype = if self.use_fp8 {
+        // Determine cache dtype based on FP8 config. The legacy
+        // `AttentionLayer` path has only ever been wired up against Float16
+        // io (queries/output) — preserve that here. For BF16 production
+        // models the new `LayerKVPool::gather_attention` path threads the
+        // model's actual io dtype through to the dispatcher.
+        let cache_dtype = if self.use_fp8 {
             MetalDtype::UChar
         } else {
             MetalDtype::Float16
         };
+        let io_dtype = MetalDtype::Float16;
 
         // Dispatch paged attention
         let output = unsafe {
@@ -368,7 +382,8 @@ impl PagedAttentionLayer {
                 context_lens_buffer,
                 max_context_len,
                 &attn_params,
-                dtype,
+                io_dtype,
+                cache_dtype,
             )?
         };
 

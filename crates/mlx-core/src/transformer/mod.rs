@@ -20,6 +20,8 @@ pub mod mlp;
 #[cfg(test)]
 mod mlp_test;
 pub mod paged_attention;
+pub mod paged_attention_inputs;
+pub mod paged_kv_cache_adapter;
 pub mod quantized_kv_cache;
 #[cfg(test)]
 mod quantized_kv_cache_test;
