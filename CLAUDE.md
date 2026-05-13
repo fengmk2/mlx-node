@@ -1,490 +1,121 @@
 # MLX-Node: High-Performance ML Framework for Node.js
 
-## Project Overview
+MLX-Node brings Apple's MLX library to Node.js with Metal GPU acceleration through a Rust/NAPI/C++ bridge. It supports inference (Qwen3, Qwen3.5, Gemma4, LFM2.5), training (GRPO, SFT), vision-language models, document processing (PaddleOCR-VL, PP-\* pipelines), and embeddings (Harrier).
 
-MLX-Node is a high-performance machine learning framework for Node.js that brings Apple's MLX library to JavaScript/TypeScript. It supports inference (Qwen3, Qwen3.5, PaddleOCR-VL), training (GRPO, SFT), vision-language models, and document processing pipelines. Uses Metal GPU acceleration through a Rust/NAPI/C++ bridge.
+## References
 
-### Core Technology Stack
+There are already some wild used inference implementations for your reference:
 
-- **MLX**: Apple's ML framework with Metal GPU acceleration
-- **Rust**: ~100,000 lines across 5 crates (mlx-core, mlx-sys, mlx-paged-attn, mlx-tui, mlx-db)
-- **C++**: ~7,700 lines (11 .cpp files + 2 headers) for compiled forward passes and FFI bridge
-- **Metal**: ~2,500 lines of custom shaders (paged attention, gated delta recurrence)
-- **NAPI-RS**: 328 NAPI exports, 221 FFI bindings
-- **TypeScript**: 7,671 source lines across 5 packages + 9,125 test lines
-- **Tests**: 1,315 total (900 Rust + 415 TypeScript)
+- ./mlx-lm, the MLX inference Python library from the official MLX team
+- ./mlx-vlm, the MLX vision-language model inference library, more active maintenance
+- ~/workspace/github/vllm, the state of art inference library, mostly optimized for CUDA/ROCm but we borrow a lot of paged attention design from it. Widely used in server production environments.
 
----
+## Topic guides
 
-## Architecture
+- [docs/architecture.md](docs/architecture.md) — Workspace layout, packages, dependency chain, build flow, adding native ops / TS utilities
+- [docs/models.md](docs/models.md) — Model implementations, ChatSession API, streaming, VLM, document pipelines
+- [docs/training.md](docs/training.md) — GRPO, SFT, autograd, optimizers, `mlx-train` TUI, persistence
+- [docs/paged-cache.md](docs/paged-cache.md) — Block-paged KV cache support matrix and parity gates
+- [docs/ffi-cpp.md](docs/ffi-cpp.md) — C++ FFI bridge, compiled Qwen3.5 forward paths, Metal shaders
+- [docs/perf.md](docs/perf.md) — Profiling, env-var inventory, GPU arch detection, quantization
+- [docs/cli.md](docs/cli.md) — `mlx download`, `mlx convert`, `mlx launch claude`
 
-```
-┌──────────────────────────────────────────────────┐
-│  TypeScript Layer (7,671 lines, 5 packages)      │
-│  @mlx-node/lm   - Inference, streaming, configs  │
-│  @mlx-node/trl  - GRPO/SFT training, datasets    │
-│  @mlx-node/vlm  - VLM, document pipelines        │
-│  @mlx-node/cli  - Model download, conversion      │
-│  @mlx-node/core - Native addon (NAPI bindings)    │
-├──────────────────────────────────────────────────┤
-│  Rust Compute Layer (~100,000 lines, 5 crates)   │
-│  Models: Qwen3, Qwen3.5 Dense/MoE, PaddleOCR-VL │
-│  Document: DocLayout, TextDet, TextRec, Ori, Unwarp│
-│  Training: GRPO engine, SFT engine, autograd      │
-│  Infra: transformers, sampling, tokenizer, KVCache │
-│  Paged attention with Metal kernels               │
-├──────────────────────────────────────────────────┤
-│  C++ Bridge (7,700 lines) → Compiled forward paths│
-│  221 FFI functions, compiled decode (mlx::compile) │
-├──────────────────────────────────────────────────┤
-│  MLX → Metal/Accelerate GPU Backend               │
-└──────────────────────────────────────────────────┘
-```
-
-### Package Dependency Chain
+## Top-level structure
 
 ```
-@mlx-node/core (Rust/NAPI native addon - 328 exports)
-    ├── @mlx-node/lm   (inference: models, streaming, profiling, tools)
-    │     ├── @mlx-node/trl (training: GRPO, SFT, datasets, rewards)
-    │     └── @mlx-node/vlm (vision: VLM, OCR, document pipeline)
-    └── @mlx-node/cli  (CLI: download, convert)
+crates/                           Rust workspace (5 crates)
+├── mlx-sys/                      C++ FFI bridge → MLX
+├── mlx-core/                     All NAPI exports
+├── mlx-paged-attn/               Paged attention + Metal kernels
+├── mlx-db/                       SQLite training persistence
+└── mlx-tui/                      mlx-train Ratatui binary
+
+packages/                         npm workspaces (@mlx-node/*)
+├── core/                         Native addon + .d.cts
+├── lm/                           Inference, ChatSession, streaming
+├── trl/                          GRPO / SFT trainers
+├── vlm/                          Vision + document pipelines
+├── server/                       /v1/responses, /v1/messages, SessionRegistry
+└── cli/                          mlx binary
 ```
 
-### Rust Crate Inventory
+## Build, test, lint
 
-| Crate              | Lines                  | Purpose                                         |
-| ------------------ | ---------------------- | ----------------------------------------------- |
-| **mlx-core**       | 82,339                 | All NAPI exports: models, training, ops, vision |
-| **mlx-paged-attn** | 8,473 + 2,043 Metal    | PagedAttention with Metal kernels               |
-| **mlx-tui**        | 5,567                  | Ratatui training TUI (`mlx-train` binary)       |
-| **mlx-db**         | 2,345                  | SQLite training output persistence              |
-| **mlx-sys**        | 1,148 Rust + 7,717 C++ | Low-level MLX FFI bridge                        |
+```bash
+# Build
+yarn build                                       # native + TS
+yarn build:native                                # Rust/NAPI native addon (~70s incremental)
+yarn build:ts                                    # tsc -b across packages
+yarn typecheck                                   # TS type-check only
+cargo build --release -p mlx-tui                 # mlx-train TUI binary
 
-### mlx-core Key Modules
+# Test
+yarn vite run test                               # all TS tests
+yarn vitest __test__/path/to.test.ts             # single TS test
+cargo test -p mlx-core                           # Rust unit tests
+cargo test -p mlx-paged-attn                     # paged-attention tests
 
-| Module               | Lines  | Purpose                                                                  |
-| -------------------- | ------ | ------------------------------------------------------------------------ |
-| `models/`            | 36,867 | 9 model implementations (see Models section)                             |
-| `transformer/`       | 9,228  | Attention, KVCache, BatchKVCache, RotatingKVCache, QuantizedKVCache, MLP |
-| `utils/`             | 6,981  | GGUF, foreign weights, SafeTensors, functional, pickle, imatrix          |
-| `grpo/`              | 6,505  | GRPO/DAPO/Dr.GRPO/BNPO loss, advantages, entropy, engine, rewards        |
-| `array/`             | 3,972  | 90+ core ops, padding, masking, thread-safe handles                      |
-| `nn/`                | 4,010  | Activations, Linear, Conv1d, RMSNorm, LayerNorm, Embedding, Losses       |
-| `vision/`            | 2,178  | Conv2d, interpolate, vision encoder, embeddings, projector, 2D RoPE      |
-| `optimizers/`        | 2,203  | Adam, AdamW, SGD, RMSprop                                                |
-| `convert.rs`         | 1,765  | Model conversion (dtype, quantization, FP8, recipes)                     |
-| `sft/`               | 1,192  | SFT training engine with autograd                                        |
-| `output_store/`      | 1,155  | Training output persistence (SQLite)                                     |
-| `tools/`             | 1,004  | Tool call/thinking parsing (`<tool_call>`, `<think>` tags)               |
-| `tokenizer.rs`       | 1,054  | HuggingFace tokenizers + Jinja2 chat templates                           |
-| `sampling.rs`        | 882    | Temperature, top-k/p, min-p, repetition penalty                          |
-| `decode_profiler.rs` | 706    | Per-generation profiling with TTFT, memory snapshots                     |
-| `autograd.rs`        | 503    | MLX value_and_grad integration                                           |
-| `profiling.rs`       | 417    | Global profiling store, NAPI exports                                     |
+# Lint & format
+yarn vite fmt                                    # Oxfmt via Vite+
+yarn vite lint --type-aware --type-check         # Oxlint with type checking
+cargo clippy --all --fix --allow-dirty --allow-staged
+cargo fmt
 
----
+# Scripts
+oxnode <file.ts>                                 # run a TS file (NOT tsx)
+```
 
-## Models (9 implementations)
+`yarn build:native` is the canonical native build — running `cargo build` directly does **not** produce the `.node` addon.
 
-### Language Models
-
-All generative wrappers share a uniform `ChatSession<M>` surface (`send` / `sendStream` / `sendToolResult` / `reset`) driven by the native `chatSessionStart` / `chatSessionContinue` / `chatSessionContinueTool` NAPI entry points. The legacy `model.chat()` / `model.chatStream()` methods have been removed.
-
-| Model             | Lines | generate() | session | Training | Special                               |
-| ----------------- | ----- | :--------: | :-----: | :------: | ------------------------------------- |
-| **Qwen3**         | 7,061 |    Yes     |   Yes   | GRPO/SFT | Speculative decoding, Paged attention |
-| **Qwen3.5 Dense** | 6,768 |    Yes     |   Yes   | GRPO/SFT | Compiled C++ forward, VLM variant     |
-| **Qwen3.5 MoE**   | 4,267 |    Yes     |   Yes   | GRPO/SFT | Compiled C++ forward, VLM variant     |
-| **Gemma4**        | —     |    Yes     |   Yes   |    No    | Session-driven streaming              |
-| **LFM2.5**        | —     |    Yes     |   Yes   |    No    | Hybrid conv + attention               |
-
-### Vision-Language Models
-
-| Model            | Lines      | Purpose                                                              |
-| ---------------- | ---------- | -------------------------------------------------------------------- |
-| **PaddleOCR-VL** | 6,770      | OCR + document understanding (ERNIE language model + vision encoder) |
-| **Qwen3.5 VLM**  | integrated | Vision encoder (27 layers) on Qwen3.5 dense/MoE with LRU image cache |
-
-### Document Processing Pipeline
-
-| Model                 | Lines | Purpose                                                              |
-| --------------------- | ----- | -------------------------------------------------------------------- |
-| **PP-DocLayoutV3**    | 6,680 | Document layout analysis (RT-DETR + HGNetV2 backbone, 25 categories) |
-| **PP-TextDet**        | 2,082 | Text line detection (DBNet with PPHGNetV2 backbone)                  |
-| **PP-TextRec**        | 1,635 | Text recognition (SVTR neck + CTC head, character dictionary)        |
-| **PP-DocOrientation** | 695   | 4-class orientation classifier (0/90/180/270 degrees)                |
-| **PP-DocUnwarp**      | 895   | Document dewarping via 2D displacement field (UVDocNet)              |
-
-### Compiled C++ Forward Paths
-
-Qwen3.5 models use `mlx::core::compile` for graph caching — traces forward pass once, reuses via `compile_replace`. Files:
-
-- `mlx_qwen35.cpp` (285 lines) — dense compiled decode
-- `mlx_qwen35_moe.cpp` (772 lines) — MoE compiled decode with expert routing
-- `mlx_qwen35_vlm.cpp` (199 lines) — VLM compiled prefill
-- `mlx_qwen35_common.h` (712 lines) — shared helpers (linear_proj, attn, GDN, RoPE)
-
----
-
-## Training
-
-### GRPO (Group-based Relative Policy Optimization)
-
-Production-ready with 4 loss variants (GRPO, DAPO, Dr.GRPO, BNPO), entropy filtering, importance sampling, batch generation, reward functions.
+## Imports
 
 ```typescript
-import { loadModel } from '@mlx-node/lm';
-import { GRPOTrainer, GRPOConfig } from '@mlx-node/trl';
-```
+// Inference + chat sessions
+import {
+  Qwen3Model,
+  Qwen35Model,
+  Qwen35MoeModel,
+  Gemma4Model,
+  Lfm2Model,
+  loadModel,
+  loadSession,
+  ChatSession,
+  QWEN3_CONFIGS,
+  QWEN35_CONFIGS,
+  LFM2_CONFIGS,
+  enableProfiling,
+  disableProfiling,
+} from '@mlx-node/lm';
 
-### SFT (Supervised Fine-Tuning)
+// Training
+import { GRPOTrainer, GRPOTrainerConfig, SFTTrainer, SFTTrainerConfig } from '@mlx-node/trl';
 
-Full SFT training engine with autograd, gradient accumulation, NaN detection, gradient clipping, weight decay, checkpoint resume.
+// Vision + document processing
+import {
+  VLModel,
+  QianfanOCRModel,
+  StructureV3Pipeline,
+  DocLayoutModel,
+  TextDetModel,
+  TextRecModel,
+  DocOrientationModel,
+  DocUnwarpModel,
+} from '@mlx-node/vlm';
 
-```typescript
-import { SFTTrainer, SFTTrainerConfig } from '@mlx-node/trl';
-```
-
-### Autograd
-
-Functional forward pass architecture — stateless transformer components enable MLX to trace the computation graph from parameters to loss. 311 gradients computed automatically for full Qwen3 model.
-
----
-
-## Key Features
-
-### Streaming API
-
-AsyncGenerator-based streaming for every generative model flows through `ChatSession.sendStream()`:
-
-```typescript
-import { loadSession } from '@mlx-node/lm';
-
-const session = await loadSession('./models/Qwen3.5-0.8B');
+// Streaming chat via ChatSession
+const session = await loadSession('./model-path');
 for await (const event of session.sendStream('Hello!')) {
   if (!event.done) process.stdout.write(event.text);
 }
 ```
 
-### ChatSession Architecture
-
-`ChatSession<M>` is the cross-model chat wrapper in `packages/lm/src/chat-session.ts`. It holds a `SessionCapableModel` and exposes `send`, `sendStream`, `sendToolResult`, `sendToolResultStream`, and `reset`, plus `primeHistory` / `startFromHistory` / `startFromHistoryStream` for server-side cold-start replay. All generative wrappers (Qwen3, Qwen3.5 Dense, Qwen3.5 MoE, Lfm2, Gemma4, and the VLM `QianfanOCRModel` in `@mlx-node/vlm`) structurally satisfy `SessionCapableModel` — any of them can be passed to `new ChatSession(model)`.
-
-Turn 0 (and any turn whose image set changed) dispatches through the native `chatSessionStart` with the full rebuilt history; later turns take the cheap `chatSessionContinue` delta path that reuses the live KV cache. Tool-result turns always use `chatSessionContinueTool`. The server-side `/v1/responses` and `/v1/messages` endpoints route through a per-model `SessionRegistry` that owns the `ChatSession` lifetimes — clients pass `previous_response_id` and the registry handles resume vs. cold-start replay internally.
-
-The legacy `.chat()` / `.chatStream()` surface is fully removed from all generative models. The only exception is PaddleOCR-VL's `VLModel.chat()`, which remains as a deliberate single-turn OCR entry point and is intentionally kept out of the session API.
-
-### CLI Tool (`@mlx-node/cli`)
-
-```bash
-mlx download model --model Qwen/Qwen3-0.6B   # Download from HuggingFace
-mlx download dataset                           # Download + Parquet→JSONL
-mlx convert --model ./model --dtype bf16       # Weight conversion
-mlx convert --model ./model --quantize --q-recipe mixed_4_6  # Quantization
-mlx convert --model ./model.gguf               # GGUF→SafeTensors
-```
-
-### Document Processing Pipeline
-
-```typescript
-import { StructureV3Pipeline } from '@mlx-node/vlm';
-const pipeline = await StructureV3Pipeline.load(modelDir);
-const result = await pipeline.analyze(imageBuffer);
-```
-
-### Profiling
-
-Enable via `enableProfiling()` from `@mlx-node/lm` or `MLX_PROFILE_DECODE=1` env var. Reports per-generation timing, phase breakdown (forward, sample, eval, extract), memory snapshots, and TTFT.
-
-**Note**: MLX lazy evaluation means `prefillMs` measures only graph construction (~1ms). Use `timeToFirstTokenMs` (TTFT) as the real prefill latency indicator.
-
----
-
-## Project Structure
-
-```
-mlx-node/
-├── Cargo.toml                        # Cargo workspace (5 crates)
-├── package.json                      # npm workspaces (5 packages + examples)
-├── vite.config.ts                    # Vitest + Oxlint + Oxfmt config
-├── tsconfig.json                     # TypeScript project references
-│
-├── crates/
-│   ├── mlx-sys/                      # Low-level MLX C/C++ bindings
-│   │   ├── src/lib.rs                # 221 FFI declarations
-│   │   ├── src/mlx_*.cpp             # 11 C++ bridge files (6,702 lines)
-│   │   ├── src/mlx_*.h               # 2 headers (1,015 lines)
-│   │   └── mlx/                      # MLX git submodule
-│   │
-│   ├── mlx-core/                     # @mlx-node/core - All NAPI exports
-│   │   └── src/
-│   │       ├── array/                # Core tensor ops (3,972 lines)
-│   │       ├── nn/                   # Neural network layers (4,010 lines)
-│   │       ├── transformer/          # Attention, caches, blocks (9,228 lines)
-│   │       ├── models/               # 9 model implementations (36,867 lines)
-│   │       │   ├── qwen3/            # Qwen3 (7,061 lines)
-│   │       │   ├── qwen3_5/          # Qwen3.5 Dense + VLM (6,768 lines)
-│   │       │   ├── qwen3_5_moe/      # Qwen3.5 MoE (4,267 lines)
-│   │       │   ├── paddleocr_vl/     # PaddleOCR VLM (6,770 lines)
-│   │       │   ├── pp_doclayout_v3/  # Document layout (6,680 lines)
-│   │       │   ├── pp_text_det/      # Text detection (2,082 lines)
-│   │       │   ├── pp_text_rec/      # Text recognition (1,635 lines)
-│   │       │   ├── pp_doc_ori/       # Orientation (695 lines)
-│   │       │   └── pp_doc_unwarp/    # Dewarping (895 lines)
-│   │       ├── vision/               # Shared vision components (2,178 lines)
-│   │       ├── grpo/                 # GRPO training (6,505 lines)
-│   │       ├── sft/                  # SFT training (1,192 lines)
-│   │       ├── optimizers/           # Adam, AdamW, SGD, RMSprop (2,203 lines)
-│   │       ├── gradients/            # Manual backward passes (974 lines)
-│   │       ├── utils/                # GGUF, foreign weights, functional (6,981 lines)
-│   │       ├── output_store/         # Training persistence (1,155 lines)
-│   │       ├── tools/                # Tool call/thinking parsing (1,004 lines)
-│   │       ├── convert.rs            # Model conversion pipeline (1,765 lines)
-│   │       ├── tokenizer.rs          # HuggingFace + Jinja2 (1,054 lines)
-│   │       ├── sampling.rs           # All sampling strategies (882 lines)
-│   │       ├── decode_profiler.rs    # Generation profiling (706 lines)
-│   │       ├── autograd.rs           # Automatic differentiation (503 lines)
-│   │       └── profiling.rs          # Global profiling store (417 lines)
-│   │
-│   ├── mlx-paged-attn/              # PagedAttention + Metal kernels
-│   │   ├── src/                      # 8,473 Rust lines
-│   │   └── metal/                    # 2,043 lines of Metal shaders
-│   │
-│   ├── mlx-tui/                      # Training TUI (Ratatui, 5,567 lines)
-│   └── mlx-db/                       # SQLite persistence (2,345 lines)
-│
-├── packages/
-│   ├── core/                         # @mlx-node/core (native addon)
-│   ├── lm/                           # @mlx-node/lm (808 lines)
-│   │   └── src/
-│   │       ├── stream.ts             # Session-aware model wrappers + `_runChatStream` callback→AsyncGenerator bridge
-│   │       ├── chat-session.ts       # `ChatSession<M>` cross-model chat wrapper (send/sendStream/sendToolResult/reset)
-│   │       ├── profiling.ts          # JS profiling API
-│   │       ├── models/               # loadModel, Qwen3/3.5 configs
-│   │       └── tools/                # Tool definition types
-│   ├── trl/                          # @mlx-node/trl (5,298 lines)
-│   │   └── src/
-│   │       ├── trainers/             # GRPO trainer, SFT trainer, logger, configs
-│   │       ├── data/                 # Dataset, SFT dataset
-│   │       └── utils/                # XML parser, path security
-│   ├── vlm/                          # @mlx-node/vlm (633 lines)
-│   │   └── src/
-│   │       ├── models/               # PaddleOCR-VL configs
-│   │       └── pipeline/             # StructureV3Pipeline
-│   └── cli/                          # @mlx-node/cli (932 lines)
-│       └── src/commands/             # download-model, download-dataset, convert
-│
-├── __test__/                         # 415 TypeScript tests (9,125 lines)
-│   ├── core/                         # Autograd, functional, profiling
-│   ├── models/                       # All model tests
-│   ├── trainers/                     # GRPO, SFT tests
-│   ├── tokenization/                 # Tokenizer tests
-│   ├── tools/                        # Chat tests
-│   └── utils/                        # Dataset, XML, path security
-│
-└── examples/                         # Example scripts
-```
-
----
-
-## Development Guide
-
-### Building
-
-```bash
-yarn install                      # Install dependencies
-yarn build                        # Build native + TypeScript
-yarn build:native                 # Build native addon only (~70s incremental)
-yarn build:ts                     # Build TypeScript packages only (tsc -b)
-cargo build --release -p mlx-tui  # Build mlx-train TUI binary
-```
-
-### Testing
-
-```bash
-yarn vite run test                      # Run all TS tests (415 tests)
-yarn vitest __test__/path/to.test.ts    # Run specific TS test
-cargo test -p mlx-core                  # Run Rust tests (810 tests)
-cargo test -p mlx-paged-attn            # Run paged attention tests (83 tests)
-```
-
-### Lint & Format
-
-```bash
-yarn vite fmt                                           # Format TS/JS
-yarn vite lint --type-aware --type-check                # Lint TS/JS
-cargo clippy --all --fix --allow-dirty --allow-staged   # Rust lint
-cargo fmt                                               # Rust format
-```
-
-### Build Flow
-
-```
-yarn build:native → packages/core/index.cjs + mlx-core.darwin-arm64.node + mlx.metallib
-yarn build:ts     → packages/*/dist/ (via tsc -b with project references)
-```
-
-### Adding New Native Operations
-
-1. Add FFI binding in `crates/mlx-sys/src/lib.rs`
-2. Add C++ bridge in appropriate `crates/mlx-sys/src/mlx_*.cpp` file
-3. Add Rust wrapper in `crates/mlx-core/src/` with `#[napi]` exports
-4. Run `yarn build:native` to generate NAPI binding + TypeScript definitions
-5. Add tests using TypedArray helpers
-
-### Adding TypeScript Utilities
-
-1. Add to appropriate package (`lm` for inference, `trl` for training, `vlm` for vision, `cli` for CLI)
-2. Export from `packages/{package}/src/index.ts`
-3. Run `yarn build:ts && yarn typecheck`
-
----
-
-## Import Patterns
-
-```typescript
-// Inference + chat sessions
-import { Qwen3Model, Qwen35Model, loadModel, loadSession, ChatSession, QWEN3_CONFIGS } from '@mlx-node/lm';
-
-// Training
-import { GRPOTrainer, GRPOConfig, SFTTrainer } from '@mlx-node/trl';
-
-// Vision & Document Processing
-import { VLModel, QianfanOCRModel, StructureV3Pipeline, DocLayoutModel } from '@mlx-node/vlm';
-
-// Streaming chat via ChatSession
-const session = await loadSession('./model-path');
-for await (const event of session.sendStream('Hello!')) { ... }
-```
-
----
-
-## Performance
-
-- **Metal GPU acceleration** on Apple Silicon
-- **Compiled forward passes** via `mlx::core::compile` for graph caching
-- **Qwen3.5 Dense**: ~6.4 tok/s on M3 Max (matches Python mlx-lm)
-- **Qwen3.5 MoE**: ~47-52 tok/s (compiled + MXFP8 quantization)
-- **Paged attention** with Metal kernels for memory-efficient serving
-- **Quantization**: 4-bit affine, MXFP8, FP8 dequant, mixed-precision recipes
-- **Quantized KV cache**: FP8/INT8 for reduced memory during inference
-
-### Key Performance Patterns
-
-- `token.eval()` after sampling — prevents unbounded lazy graph
-- `synchronize_and_clear_cache()` every 256 steps — prevents memory accumulation
-- Dtype-aware scalar ops — ANY f32 scalar in binary op with bf16 promotes entire result to f32
-- Token-only eval — caches materialize through dependency graph (no need to eval all caches)
-
----
-
-## Block-paged KV cache (vLLM-aligned, opt-in)
-
-A second KV-cache backend lives alongside the legacy flat `Vec<KVCache>` path: a vLLM-style block-paged adapter that lets multiple in-flight requests share refcounted KV blocks for any prompt prefix they have in common (system prompt, shared few-shot preamble, repeated tool-result frames, etc.). It is **off by default** behind the per-model `use_block_paged_cache` config flag (`Option<bool>`, defaults to `None` / treated as `false`) and only the full-attention layers of supported models route through it — sliding-window, conv, and recurrent (GDN) layers continue to use their existing dedicated cache types regardless of the flag.
-
-### Foundation types (`crates/mlx-paged-attn` + `crates/mlx-core/src/transformer`)
-
-- `BlockAllocator` (`crates/mlx-paged-attn/src/block_allocator.rs`) — owns the _logical_ lifecycle: per-block refcounts, LRU eviction, and the prefix-hash table that lets a new request find blocks left over from a prior request whose token prefix matches.
-- `LayerKVPool` (`crates/mlx-paged-attn/src/layer_kv_pool.rs`) — owns the _physical_ storage: per-layer Metal `Buffer` pairs (one for K, one for V) sized to the configured `paged_cache_memory_mb` budget. Independent from `BlockAllocator` so the legacy `CacheEngineManager` path is left untouched.
-- `PagedKVCacheAdapter` (`crates/mlx-core/src/transformer/paged_kv_cache_adapter.rs`) — the session-friendly wrapper the model forward path actually talks to. Holds `(Arc<Mutex<BlockAllocator>>, Arc<LayerKVPool>)` and exposes the per-request lifecycle: `reset_for_new_request` → `find_cached_prefix` → `allocate_suffix_blocks` → `record_tokens` (per token) → `register_full_blocks_for_reuse` → `release_request`.
-
-### Per-model support matrix
-
-| Model             | Config flag wired | Forward dispatch wired | Default | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| ----------------- | :---------------: | :--------------------: | :-----: | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Qwen3**         |        Yes        |          Yes           | **on**  | Default flipped 2026-04-28 after `qwen3_paged_vs_flat_parity` integration test verified greedy byte-equal + prefix-reuse byte-equal at BF16 against real Qwen3-0.6B weights. Opt out via `use_block_paged_cache: Some(false)`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| **LFM2.5**        |        Yes        |          Yes           | **on**  | Default flipped 2026-04-28 after `lfm2_paged_vs_flat_parity` integration test verified the same on real LFM2.5-1.2B weights. Hybrid arch: only `full_attention` layers use the adapter; conv layers stay on `Lfm2LayerCache::Conv`. Opt out via `use_block_paged_cache: Some(false)`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| **Gemma4**        |        Yes        |          Yes           | **on**  | Default flipped 2026-04-28 after `gemma4_paged_vs_flat_parity` integration test verified greedy byte-equal across 4 prompts × 32 tokens + two-turn prefix-reuse byte-equal at BF16 against real Gemma-4-E2B-IT weights. Forward dispatch: LFM2-style monolithic template + per-layer routing via `Gemma4LayerKind`. Sliding layers stay on flat `RotatingKVCache`; global layers route through the paged adapter; KV-shared layers consume the anchor's K/V via `SharedOnGlobal` (paged anchor) / `SharedOnSliding` (flat anchor stash). MoE/PLE/4-norm/layer-scalar reuse the existing `apply_ffn_ple_scalar` tail unchanged. **Final fix landed two pieces**: (1) `chat_tokens_delta_sync` and `chat_stream_tokens_delta_sync_inner` now early-return into `chat_sync_core_paged` / `chat_stream_sync_core_paged` when the adapter is configured (mirrors Qwen3's `chat_tokens_delta_sync` paged dispatch), reconstructing the full token history so `find_cached_prefix` rediscovers turn 1's registered prefix; previously the delta path always took the flat branch and forwarded through reset sliding caches with no global-layer K/V; (2) every decode loop (paged and all flat variants) calls `current_y.eval()` (or `y.eval()` for the paged loop, mirroring `qwen3/model.rs:2935`) before `item_at_int32(0)` because `read_scalar` (mlx_nn_ops.cpp) reads `arr.data<T>()` directly without forcing eval — async_eval'd sample tensors otherwise return raw uninitialized bits as the "token id" on iterations where no later forward consumes the previous tensor. Opt out via `use_block_paged_cache: Some(false)`. |
-| **Qwen3.5 Dense** |        Yes        |          Yes           |   off   | Forward dispatch wired via `Qwen3_5LayerKind` (`Linear` GDN / `FullAttentionPaged`). GDN linear-attention layers stay on flat `Qwen3_5LayerCache::Linear(ArraysCache)` and are reset+reprefilled every paged turn (no cross-request prefix reuse — vLLM `MambaManager` stance). Full-attention layers route through `Qwen3_5Attention::forward_paged`. **Compile lockout**: each chat-dispatch site (`chat_sync_core`, `chat_tokens_delta_sync`, `chat_stream_sync_inner`, `chat_stream_tokens_delta_sync_inner`) early-returns into `chat_sync_core_paged` / `chat_stream_sync_core_paged` BEFORE acquiring `DENSE_COMPILED_MUTEX`/`COMPILED_WEIGHTS_RWLOCK` and never calls `mlx_qwen35_compiled_init_from_prefill`, so flat-path turns and paged-path turns can interleave without corrupting compiled state. **VLM permitted (text-only)**: `set_vision_encoder` succeeds when `paged_adapter.is_some()`; chat-entry sites reject `has_images && paged_adapter` so image-bearing turns surface a clear runtime error while text-only turns proceed (text-only flat passes `position_ids = None` so `Qwen3_5Attention::forward` uses the same `self.rope` as `forward_paged`). Single-turn greedy parity verified byte-equal on Qwen3.5-0.8B BF16 (4 prompts × 32 tokens) on 2026-04-28 via `qwen3_5_paged_vs_flat_parity`. Default stays `Some(false)` until the perf trade-off versus the compiled C++ flat path (~6.4 tok/s on M3 Max) is profiled.                                                                                                                                                                         |
-| **Qwen3.5 MoE**   |        Yes        |          Yes           |   off   | Same forward dispatch + compile-lockout as Qwen3.5 Dense; routes through MoE `DecoderLayer::forward_paged_or_flat` so the MoE/dense MLP variant stays unchanged. VLM checkpoints permitted under the same text-only contract as dense. Default stays `Some(false)` until `qwen3_5_moe_paged_vs_flat_parity` confirms parity on real weights (no MoE checkpoint locally available; gate compiles + skips cleanly without weights).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| Other models      |         —         |           —            |    —    | OCR / document pipelines have no chat dispatch and no KV cache to retrofit.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-
-The flag is **independent of `use_paged_attention`** — that knob drives the legacy `PagedKVCache` + `ContinuousBatchingScheduler` path, which is a different codepath. Both can be on or off independently.
-
-### Default flip + parity gate
-
-Qwen3, LFM2, and Gemma4 paged paths are byte-equal to the flat path under greedy decode, verified by:
-
-- `crates/mlx-core/tests/qwen3_paged_vs_flat_parity.rs` (gated on `MLX_TEST_MODEL_PATH=./.cache/models/qwen3-0.6b-mlx-bf16`)
-- `crates/mlx-core/tests/lfm2_paged_vs_flat_parity.rs` (gated on `MLX_TEST_MODEL_PATH=./.cache/models/lfm2.5-1.2b-thinking-mlx`)
-- `crates/mlx-core/tests/gemma4_paged_vs_flat_parity.rs` (gated on `MLX_TEST_MODEL_PATH=./.cache/models/gemma-4-e2b-it-mlx`)
-
-Run with `cargo test -p mlx-core --test qwen3_paged_vs_flat_parity -- --ignored --nocapture` (analogous for LFM2 / Gemma4). Without the env var, the tests skip cleanly. Pass criteria: byte-equal `tokens` and `raw_text` across 4 prompts × 32 tokens, plus byte-equal across a 2-turn dialog (validating `find_cached_prefix` + `finalize_turn_keep_live` cross-turn semantics).
-
-Qwen3.5 (Dense + MoE) stays default-off pending a perf decision (compiled C++ flat vs. pure-Rust paged). Qwen3.5 forward dispatch is wired; the parity-test scaffolds in `crates/mlx-core/tests/qwen3_5_paged_vs_flat_parity.rs` and `crates/mlx-core/tests/qwen3_5_moe_paged_vs_flat_parity.rs` are gated on `MLX_TEST_MODEL_PATH` and `#[ignore]`-marked so they compile + skip cleanly without weights. Dense parity is now byte-equal verified on Qwen3.5-0.8B BF16 (single-turn greedy, 4 prompts × 32 tokens, 2026-04-28); MoE parity is unverified pending a local MoE checkpoint.
-
-Server-side Phase 7 simplification (collapsing `SessionRegistry.getOrCreateWarmAny` from the `/v1/messages` warm-slot path, since the native block cache supersedes the JS-side warm slot for full-attention models) becomes safe to land for Qwen3/LFM2 traffic now that paged is on by default.
-
-### Parity gate (must pass before flipping the default)
-
-Before `use_block_paged_cache` can flip from `None` to `Some(true)`, the wired models must demonstrate byte-equal greedy-decode output between the flat path and the paged path on real weights. Three test surfaces gate the flip:
-
-- `crates/mlx-core/tests/qwen3_paged_vs_flat_parity.rs` — Qwen3 single-turn (4 prompts × 32 tokens) and two-turn (prefix-reuse) parity. Run with:
-  ```shell
-  MLX_TEST_MODEL_PATH=./.cache/models/qwen3-0.6b-mlx-bf16 \
-      cargo test -p mlx-core --test qwen3_paged_vs_flat_parity \
-      -- --ignored --nocapture
-  ```
-- `crates/mlx-core/tests/lfm2_paged_vs_flat_parity.rs` — LFM2 single-turn + two-turn parity (validates per-layer routing where conv layers bypass the adapter and only `full_attention` layers go through it). Run with:
-  ```shell
-  MLX_TEST_MODEL_PATH=./.cache/models/lfm2.5-1.2b-thinking-mlx \
-      cargo test -p mlx-core --test lfm2_paged_vs_flat_parity \
-      -- --ignored --nocapture
-  ```
-- `__test__/models/qwen3-paged-parity.test.ts` — Qwen3 end-to-end parity through the public NAPI surface. Loads two `Qwen3Model` instances from the same checkpoint (one with `use_block_paged_cache: true` patched into `config.json`) and asserts identical `text` and `numTokens` from `model.chatSessionStart(..., { temperature: 0 })`. (The TS test deliberately uses `chatSessionStart` rather than `generate`: `generate_sync` always uses fresh flat caches and never consults `paged_adapter`, so it would silently mask any paged-vs-flat divergence and falsely report parity.) The test is gated on `QWEN3_PAGED_PARITY_MODEL_PATH` (parallel to the Rust `MLX_TEST_MODEL_PATH` `#[ignore]` opt-in) and skips via `it.runIf` when the env var is unset, so the gate never blocks default CI:
-  ```shell
-  QWEN3_PAGED_PARITY_MODEL_PATH=./.cache/models/qwen3-0.6b-mlx-bf16 \
-      yarn vite run test __test__/models/qwen3-paged-parity.test.ts
-  ```
-
-**Pass criteria**: byte-equal `text` and `num_tokens` between flat and paged on every prompt; identical first-divergence-free token sequences. The standalone BF16 logit max-abs-diff variant from the original spec (tolerance `5e-2`) is intentionally not implemented because `forward_fused` / `forward_paged_adapter` are not exposed publicly enough to drive directly from an integration test, and the gate would require model-code changes that are explicitly out of scope. Greedy-token parity catches the same regressions any logit drift would surface as.
-
-CI gates the default flip on all three tests passing. The default-flip commit itself is a separate follow-up that can land only once these tests are green and stable on the supported checkpoints.
-
----
-
-## C++ FFI Files (crates/mlx-sys/src/)
-
-| File                   | Lines | Purpose                                                         |
-| ---------------------- | ----- | --------------------------------------------------------------- |
-| `mlx_advanced_ops.cpp` | 1,932 | quantized_matmul, gather_qmm, conv2d, FP8, PaddleOCR forward    |
-| `mlx_nn_ops.cpp`       | 875   | Neural network ops, data extraction, random, math               |
-| `mlx_qwen35_moe.cpp`   | 772   | Compiled MoE forward with expert routing                        |
-| `mlx_fused_ops.cpp`    | 628   | Fused attention, SwiGLU MLP, transformer block                  |
-| `mlx_array_ops.cpp`    | 622   | Array construction, arithmetic, indexing, dtype-safe scalar ops |
-| `mlx_misc_ops.cpp`     | 591   | Synchronization, compiled sampling pipeline                     |
-| `mlx_gated_delta.cpp`  | 388   | Metal GDN kernels, GPU architecture detection                   |
-| `mlx_qwen35.cpp`       | 285   | Compiled Qwen3.5 dense forward                                  |
-| `mlx_autograd.cpp`     | 223   | value_and_grad integration                                      |
-| `mlx_qwen35_vlm.cpp`   | 199   | VLM compiled prefill                                            |
-| `mlx_stream.cpp`       | 187   | Stream/device management, memory limits                         |
-| `mlx_qwen35_common.h`  | 712   | Shared helpers: linear_proj, attn, GDN, RoPE                    |
-| `mlx_common.h`         | 303   | FFI macros, error handling, array conversion                    |
-
----
-
-## Security Model
-
-Model files are assumed from **trusted sources**. Jinja2 chat templates from `tokenizer_config.json` are executed with user message content (minijinja sandbox — no file/code access, but malicious templates could cause DoS).
-
----
-
-## Known Limitations
+## Known limitations
 
 - macOS only (Metal backend, Apple Silicon)
 - No CUDA support
-- Compiled C++ forward paths use process-wide globals (serialized via Tokio mutex)
+- Compiled C++ forward paths use process-wide globals (serialized via `std::sync::Mutex` + `RwLock` in `crates/mlx-core/src/models/qwen3_5/model.rs`)
 
 ---
-
-_Last updated: March 2026_
-_Total Code: ~120,000 lines (100K Rust + 7.7K C++ + 2.5K Metal + 7.7K TS source + 9.1K TS tests)_
-_Tests: 1,315 (900 Rust + 415 TypeScript)_
-_Models: 9 (3 language + 2 VLM + 5 document processing)_
-_NAPI Exports: 328 | FFI Functions: 221_
-
-<!--VITE PLUS START-->
 
 # Using Vite+, the Unified Toolchain for the Web
 
@@ -570,5 +201,4 @@ For GitHub Actions, consider using [`voidzero-dev/setup-vp`](https://github.com/
 ## Review Checklist for Agents
 
 - [ ] Run `vp install` after pulling remote changes and before getting started.
-- [ ] Run `vp check` and `vp test` to validate changes.
-<!--VITE PLUS END-->
+- [ ] Run `vp check` and `vp test` and `cargo test` to validate changes.
