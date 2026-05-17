@@ -115,6 +115,15 @@ unsafe extern "C-unwind" {
         w_down: *mut mlx_array,
     ) -> *mut mlx_array;
 
+    // E39: SwiGLU MLP with pre-stacked + pre-transposed weights
+    //   w_gate_up_t: [hidden, 2*intermediate]
+    //   w_down_t:    [intermediate, hidden]
+    pub fn mlx_swiglu_mlp_forward_stacked(
+        x: *mut mlx_array,
+        w_gate_up_t: *mut mlx_array,
+        w_down_t: *mut mlx_array,
+    ) -> *mut mlx_array;
+
     // Fused Transformer Block forward (without KV cache)
     pub fn mlx_fused_transformer_block_forward(
         x: *mut mlx_array,
@@ -1576,6 +1585,42 @@ unsafe extern "C-unwind" {
     pub fn mlx_qwen35_vlm_cache_count() -> i32;
     pub fn mlx_qwen35_vlm_get_cache(index: i32) -> *mut mlx_array;
     pub fn mlx_qwen35_vlm_reset();
+
+    // ============================================
+    // Qwen3.5 Text Prefill (E53 scaffolding)
+    //
+    // Text-only sibling of VLM prefill: pre-embedded inputs, scalar RoPE,
+    // no M-RoPE. Currently scaffolding — Rust dispatch wiring + cache
+    // transfer land in a follow-on session. See
+    // experiments/E53-text-prefill-compile-scope.md for the full plan.
+    // ============================================
+
+    pub fn mlx_qwen35_text_prefill(
+        inputs_embeds: *mut mlx_array,
+        num_layers: i32,
+        hidden_size: i32,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        rope_theta: f32,
+        rope_dims: i32,
+        rms_norm_eps: f32,
+        full_attention_interval: i32,
+        linear_num_k_heads: i32,
+        linear_num_v_heads: i32,
+        linear_key_head_dim: i32,
+        linear_value_head_dim: i32,
+        linear_conv_kernel_dim: i32,
+        tie_word_embeddings: i32,
+        max_kv_len: i32,
+        batch_size: i32,
+        output_logits: *mut *mut mlx_array,
+    );
+
+    pub fn mlx_qwen35_text_cache_count() -> i32;
+    pub fn mlx_qwen35_text_get_cache(index: i32) -> *mut mlx_array;
+    pub fn mlx_qwen35_text_get_offset() -> i32;
+    pub fn mlx_qwen35_text_reset();
 
     // ============================================
     // Qwen3.5 MoE Forward Pass (non-compiled)

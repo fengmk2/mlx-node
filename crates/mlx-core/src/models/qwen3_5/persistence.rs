@@ -405,6 +405,10 @@ fn apply_weights_inner(
                 if let Some(w) = params.get(&format!("{}.linear_attn.A_log", prefix)) {
                     gdn.set_a_log(w)?;
                 }
+                // E51: precompute the stacked [in_proj_qkvz; in_proj_ba].T
+                // weight so forward() does one matmul + two slices instead of
+                // two separate matmuls. No-op for quantized variants.
+                gdn.finalize_in_proj()?;
             }
             AttentionType::Full(attn) => {
                 if is_quantized {
@@ -508,6 +512,10 @@ fn apply_weights_inner(
                     if let Some(w) = params.get(&format!("{}.mlp.down_proj.weight", prefix)) {
                         mlp.set_down_proj_weight(w)?;
                     }
+                    // E39: precompute the stacked [gate;up].T + down.T weights
+                    // so the per-forward MLP path uses one matmul instead of two
+                    // and reads pre-transposed weights.
+                    mlp.finalize_gate_up()?;
                 }
             }
             MLPVariant::Quantized { .. } => {}

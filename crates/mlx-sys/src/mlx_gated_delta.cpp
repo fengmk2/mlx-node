@@ -22,6 +22,20 @@ static const char* gated_delta_chunked_source =
     #include "metal/gated_delta_chunked.metal.inc"
 ;
 
+// E47 (catalog D1): per-step kernel with 2 v-columns per simdgroup.
+// Same shape contract as gated_delta_sources[0] (non-vec, non-mask) but each
+// simdgroup processes dv_A=2y and dv_B=2y+1, sharing q[Dk] + k[Dk] loads.
+// Grid Y must be halved by the dispatcher.
+static const char* gated_delta_step_2vcol_source =
+    #include "metal/gated_delta_step_2vcol.metal.inc"
+;
+
+// E48: per-step kernel with 4 v-columns per simdgroup.
+// Extends E47 by another factor. Grid Y must be quartered by the dispatcher.
+static const char* gated_delta_step_4vcol_source =
+    #include "metal/gated_delta_step_4vcol.metal.inc"
+;
+
 static const char* gated_delta_fused_gating_source =
     #include "metal/gated_delta_fused_gating.metal.inc"
 ;
@@ -30,8 +44,10 @@ static const char* gated_delta_fused_gating_source =
 static std::mutex kernel_cache_mutex;
 static std::unordered_map<int, mlx::core::fast::CustomKernelFunction> kernel_cache;
 
-static mlx::core::fast::CustomKernelFunction& get_or_create_kernel(bool has_mask, bool vectorized) {
-    int key = (has_mask ? 1 : 0) | (vectorized ? 2 : 0);
+// per_step_variant: 0=legacy 1-vcol, 1=E47 2-vcol, 2=E48 4-vcol.
+static mlx::core::fast::CustomKernelFunction& get_or_create_kernel(
+    bool has_mask, bool vectorized, int per_step_variant) {
+    int key = (has_mask ? 1 : 0) | (vectorized ? 2 : 0) | (per_step_variant << 2);
     std::lock_guard<std::mutex> lock(kernel_cache_mutex);
     auto it = kernel_cache.find(key);
     if (it != kernel_cache.end()) {
@@ -41,17 +57,28 @@ static mlx::core::fast::CustomKernelFunction& get_or_create_kernel(bool has_mask
     std::string suffix;
     if (vectorized) suffix += "_vec";
     if (has_mask) suffix += "_mask";
+    if (per_step_variant == 1) suffix += "_2v";
+    else if (per_step_variant == 2) suffix += "_4v";
 
     std::vector<std::string> inputs = {"q", "k", "v", "g", "beta", "state_in", "T"};
     if (has_mask) {
         inputs.push_back("mask");
     }
 
+    const char* src;
+    if (per_step_variant == 1) {
+        src = gated_delta_step_2vcol_source;
+    } else if (per_step_variant == 2) {
+        src = gated_delta_step_4vcol_source;
+    } else {
+        src = gated_delta_sources[key & 3];
+    }
+
     auto kernel = fast::metal_kernel(
         "gated_delta_step" + suffix,
         inputs,
         {"y", "state_out"},
-        gated_delta_sources[key]
+        src
     );
 
     auto [inserted, success] = kernel_cache.emplace(key, std::move(kernel));
@@ -125,13 +152,29 @@ bool mlx_gated_delta_kernel(
             {"Hv", Hv},
         };
 
-        auto& kernel = get_or_create_kernel(has_mask, vectorized);
+        // per_step_variant: default = E47 (2 v-cols). Opt-in:
+        //   MLX_ENABLE_E48_GDN_4VCOL=1 → 4 v-cols (E48 experimental).
+        //   MLX_DISABLE_E47_GDN_2VCOL=1 → legacy 1 v-col (overrides E48).
+        int per_step_variant = 0;
+        bool elig = !has_mask && !vectorized;
+        if (elig && std::getenv("MLX_DISABLE_E47_GDN_2VCOL") == nullptr) {
+            if (std::getenv("MLX_ENABLE_E48_GDN_4VCOL") != nullptr && Dv % 4 == 0) {
+                per_step_variant = 2;
+            } else if (Dv % 2 == 0) {
+                per_step_variant = 1;
+            }
+        }
+        auto& kernel = get_or_create_kernel(has_mask, vectorized, per_step_variant);
+
+        int grid_y = Dv;
+        if (per_step_variant == 1) grid_y = Dv / 2;
+        else if (per_step_variant == 2) grid_y = Dv / 4;
 
         auto results = kernel(
             inputs,
             {Shape{B, T, Hv, Dv}, state_arr.shape()},  // output_shapes
             {input_type, input_type},                     // output_dtypes
-            std::make_tuple(32, Dv, B * Hv),             // grid
+            std::make_tuple(32, grid_y, B * Hv),         // grid
             std::make_tuple(32, 4, 1),                    // threadgroup
             template_args,
             std::nullopt,                                 // init_value
