@@ -1279,6 +1279,15 @@ pub async fn convert_gguf_to_safetensors(
         )));
     }
 
+    // Serialize all conversions process-wide before touching MLX's default
+    // device + stream. Then route every MLX op through CPU for the duration
+    // of this call. See `crate::convert::convert_mutex` and
+    // `crate::convert::CpuConvertGuard` for the full rationale — same
+    // reasoning applies here for GGUF→SafeTensors conversion of huge MoE
+    // checkpoints.
+    let _convert_lock = crate::convert::convert_mutex().lock().await;
+    let _stream_guard = crate::convert::CpuConvertGuard::enter_cpu();
+
     // Parse GGUF header and metadata
     info!("Parsing GGUF file: {}", input_path.display());
     let gguf = parse_gguf(&input_path)?;
@@ -1569,10 +1578,16 @@ pub async fn convert_gguf_to_safetensors(
         .unwrap_or("model.safetensors");
     let safetensors_path = output_dir.join(safetensors_filename);
     info!("Saving to {}", safetensors_path.display());
+    // Capture tensor names BEFORE `save_safetensors` — it drains `weights`
+    // as it streams each tensor to disk so MLX-allocated backing buffers
+    // can be released immediately on large MoE checkpoints. Reading
+    // `weights.keys()` after the save would return an empty list and the
+    // GgufConversionResult would report num_tensors = 0 to JS callers.
+    let tensor_names: Vec<String> = weights.keys().cloned().collect();
     // Add "format: mlx" metadata so loaders (e.g., mlx-vlm) know weights are
     // already in MLX layout and skip sanitize (which would double-apply +1.0 to norms).
     let st_metadata = serde_json::json!({ "format": "mlx" });
-    save_safetensors(&safetensors_path, &weights, Some(st_metadata))?;
+    save_safetensors(&safetensors_path, &mut weights, Some(st_metadata))?;
 
     // Only write config.json and tokenizer files for the primary model file.
     // Secondary files (e.g., vision.safetensors for mmproj) should not overwrite
@@ -1651,8 +1666,6 @@ pub async fn convert_gguf_to_safetensors(
         .map(|(t, c)| format!("{t}({c})"))
         .collect::<Vec<_>>()
         .join(", ");
-
-    let tensor_names: Vec<String> = weights.keys().cloned().collect();
 
     Ok(GgufConversionResult {
         num_tensors: tensor_names.len() as i32,
