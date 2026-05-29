@@ -46,30 +46,11 @@ async function main() {
 
   switch (command) {
     case 'download': {
-      if (!subcommand || subcommand === '--help' || subcommand === '-h') {
-        console.log(`
-Usage:
-  mlx download model     Download a model from HuggingFace
-  mlx download dataset   Download a dataset from HuggingFace
-
-Run mlx download <subcommand> --help for more information.
-`);
-        return;
-      }
-
-      const rest = args.slice(2);
-
-      if (subcommand === 'model') {
-        const { run } = await import('./commands/download-model.js');
-        await run(rest);
-      } else if (subcommand === 'dataset') {
-        const { run } = await import('./commands/download-dataset.js');
-        await run(rest);
-      } else {
-        console.error(`Unknown download subcommand: ${subcommand}`);
-        console.error('Available: model, dataset');
-        process.exit(1);
-      }
+      // Delegate the whole arg list to the download dispatcher; the token is a
+      // download-wide credential, so flags like `--set-token` are handled
+      // there rather than being interpreted as a subcommand at this level.
+      const { run } = await import('./commands/download.js');
+      await run(args.slice(1));
       break;
     }
 

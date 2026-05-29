@@ -4,18 +4,15 @@ import { homedir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { parseArgs } from 'node:util';
 
-import { listFiles, whoAmI, downloadFileToCacheDir, type ListFileEntry } from '@huggingface/hub';
-import { input } from '@inquirer/prompts';
-import { AsyncEntry } from '@napi-rs/keyring';
+import { listFiles, downloadFileToCacheDir, type ListFileEntry } from '@huggingface/hub';
 
 import { resolveModelsDir } from '../config.js';
 import { ensureDir, formatBytes } from '../utils.js';
+import { resolveHuggingFaceToken, setToken } from './hf-token.js';
 
 const DEFAULT_CACHE_DIR = join(homedir(), '.cache', 'huggingface');
 
 const DEFAULT_MODEL = 'Qwen/Qwen3-0.6B';
-
-const keyringEntry = new AsyncEntry('mlx-node', 'huggingface-token');
 
 function printHelp(): void {
   console.log(`
@@ -54,36 +51,6 @@ Examples:
   # Download all .gguf files (skip everything else)
   mlx download model -m unsloth/Qwen3.5-9B-GGUF -g "*.gguf"
 `);
-}
-
-async function setToken() {
-  const token = await input({
-    message: 'Enter your HuggingFace token:',
-    required: true,
-    theme: {
-      validationFailureMode: 'clear',
-    },
-    validate: async (value) => {
-      if (!value) {
-        return 'Token is required';
-      }
-      if (!value.startsWith('hf_')) {
-        return 'HuggingFace token must start with "hf_"';
-      }
-      try {
-        const { auth } = await whoAmI({ accessToken: value });
-        if (!auth) {
-          return 'Invalid token';
-        }
-        return true;
-      } catch {
-        return 'Invalid token';
-      }
-    },
-  });
-  if (token) {
-    await keyringEntry.setPassword(token);
-  }
 }
 
 const CORE_FILES = [
@@ -422,7 +389,7 @@ export async function run(argv: string[]) {
   const modelSlug = modelName.split('/').pop()!.toLowerCase();
   const outputDir = resolve(args.output ?? join(resolveModelsDir(), modelSlug));
 
-  const HUGGINGFACE_TOKEN = (await keyringEntry.getPassword()) ?? process.env.HUGGINGFACE_TOKEN ?? undefined;
+  const HUGGINGFACE_TOKEN = await resolveHuggingFaceToken();
 
   if (!HUGGINGFACE_TOKEN) {
     console.warn('No HuggingFace token found, the model will download with anonymous access');

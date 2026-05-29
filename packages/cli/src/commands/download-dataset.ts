@@ -7,6 +7,7 @@ import { snapshotDownload } from '@huggingface/hub';
 import { convertParquetToJsonl } from '@mlx-node/core';
 
 import { ensureDir } from '../utils.js';
+import { resolveHuggingFaceToken } from './hf-token.js';
 
 const DEFAULT_DATASET = 'openai/gsm8k';
 const DEFAULT_REVISION = 'main';
@@ -102,7 +103,7 @@ export async function run(argv: string[]) {
   console.log(`Downloading ${dataset}@${revision} snapshot from Hugging Face…`);
 
   const cacheDir = args['cache-dir'] ? resolve(args['cache-dir']) : DEFAULT_CACHE_DIR;
-  const accessToken = process.env.HUGGINGFACE_TOKEN ?? undefined;
+  const accessToken = await resolveHuggingFaceToken();
   const snapshotPath = await snapshotDownload({
     repo: { type: 'dataset', name: dataset },
     revision,
