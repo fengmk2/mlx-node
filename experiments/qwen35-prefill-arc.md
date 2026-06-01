@@ -37,18 +37,18 @@ Two pushes are bundled:
 
 ## Shipped wins (composable, all independently revertable)
 
-| Tag | Where | Toggle | Mechanism |
-|---|---|---|---|
-| **E37** | `qwen3_5/model.rs::forward_inner` | `MLX_DISABLE_E37_LAST_TOKEN_SLICE=1` | Slice `h` to last token before `final_norm + lm_head`. Skips ~T-1 rows of a `[B,T,2560] @ [2560,vocab]` matmul. |
-| **E38** | `qwen3_5/decoder_layer.rs::forward_with_optional_last_slice` | (same as E37) | Last layer slices `h` to last token AFTER attention residual, BEFORE post-attention norm + MLP. KV writes preserved on full T. |
-| **E28+E31** | `qwen3_5/model.rs::chunked_prefill` | `MLX_PREFILL_SYNC_BETWEEN_CHUNKS=1` | `PREFILL_STEP_SIZE` 2048→1024 + `async_eval_layer_caches` between chunks (vs the prior sync `eval`). |
-| **E39** | `transformer/mlp.rs::finalize_gate_up` + `mlx_fused_ops.cpp::mlx_swiglu_mlp_forward_stacked` | `MLX_DISABLE_E39_STACKED_MLP=1` | Pre-stack `[w_gate; w_up]^T` at model load. One matmul instead of two; per-call transposes baked in. |
-| **E40** | `mlx_fused_ops.cpp` | (same as E39) | In the E39 stacked path, use `qwen35_common::swiglu()` (mlx::core::compile-cached fused sigmoid·gate·up) instead of inline ops. |
-| **E5+E36** | `crates/mlx-sys/src/metal/gated_delta_chunked.metal.inc` | (no toggle — kernel-internal) | Threadgroup `decay_mat[BT*BT]` and `decay_self[BT]` precompute. **M5+ only** (`CHUNK_MIN_GPU_GEN=17`); correctness was verified on M3 by temporarily lowering the gate. |
-| **E47** | `crates/mlx-sys/src/metal/gated_delta_step_2vcol.metal.inc` + `mlx_gated_delta.cpp` dispatch | `MLX_DISABLE_E47_GDN_2VCOL=1` | Per-step GDN kernel: each simdgroup handles 2 v-cols (dv_A=2y, dv_B=2y+1), sharing q[Dk]+k[Dk] loads. Grid-Y halves to Dv/2. -2.0% at 1024 single-chunk; neutral at 4096+. |
-| **E48** *(opt-in)* | `gated_delta_step_4vcol.metal.inc` + dispatch | `MLX_ENABLE_E48_GDN_4VCOL=1` | 4-vcol variant of E47. +0.5% on top of E47 for large-Dv models. Default-off because the grid-Y reduction could regress on smaller-Dv shapes. |
-| **E51** | `gated_delta_net.rs::finalize_in_proj` + `persistence.rs` | `MLX_DISABLE_E51_STACKED_GDN_IN_PROJ=1` | Load-time stack of `in_proj_qkvz` + `in_proj_ba` into `[hidden, qkvz_dim+ba_dim]^T`. Forward does one matmul + two axis-2 slices instead of two matmuls. -0.44% across 24 GDN layers. No-op for quantized variants. |
-| **E55** | `qwen3_5/model.rs::PREFILL_STEP_SIZE` | (no toggle — const) | `PREFILL_STEP_SIZE` 1024 → 2048 to match mlx-lm's default and close the long-context gap. Halves chunk count at multi-chunk prompts. At T ≤ 2048 the const is irrelevant (single `remaining` branch). −5-7% at 20k. |
+| Tag                | Where                                                                                        | Toggle                                  | Mechanism                                                                                                                                                                                                           |
+| ------------------ | -------------------------------------------------------------------------------------------- | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **E37**            | `qwen3_5/model.rs::forward_inner`                                                            | `MLX_DISABLE_E37_LAST_TOKEN_SLICE=1`    | Slice `h` to last token before `final_norm + lm_head`. Skips ~T-1 rows of a `[B,T,2560] @ [2560,vocab]` matmul.                                                                                                     |
+| **E38**            | `qwen3_5/decoder_layer.rs::forward_with_optional_last_slice`                                 | (same as E37)                           | Last layer slices `h` to last token AFTER attention residual, BEFORE post-attention norm + MLP. KV writes preserved on full T.                                                                                      |
+| **E28+E31**        | `qwen3_5/model.rs::chunked_prefill`                                                          | `MLX_PREFILL_SYNC_BETWEEN_CHUNKS=1`     | `PREFILL_STEP_SIZE` 2048→1024 + `async_eval_layer_caches` between chunks (vs the prior sync `eval`).                                                                                                                |
+| **E39**            | `transformer/mlp.rs::finalize_gate_up` + `mlx_fused_ops.cpp::mlx_swiglu_mlp_forward_stacked` | `MLX_DISABLE_E39_STACKED_MLP=1`         | Pre-stack `[w_gate; w_up]^T` at model load. One matmul instead of two; per-call transposes baked in.                                                                                                                |
+| **E40**            | `mlx_fused_ops.cpp`                                                                          | (same as E39)                           | In the E39 stacked path, use `qwen35_common::swiglu()` (mlx::core::compile-cached fused sigmoid·gate·up) instead of inline ops.                                                                                     |
+| **E5+E36**         | `crates/mlx-sys/src/metal/gated_delta_chunked.metal.inc`                                     | (no toggle — kernel-internal)           | Threadgroup `decay_mat[BT*BT]` and `decay_self[BT]` precompute. **M5+ only** (`CHUNK_MIN_GPU_GEN=17`); correctness was verified on M3 by temporarily lowering the gate.                                             |
+| **E47**            | `crates/mlx-sys/src/metal/gated_delta_step_2vcol.metal.inc` + `mlx_gated_delta.cpp` dispatch | `MLX_DISABLE_E47_GDN_2VCOL=1`           | Per-step GDN kernel: each simdgroup handles 2 v-cols (dv_A=2y, dv_B=2y+1), sharing q[Dk]+k[Dk] loads. Grid-Y halves to Dv/2. -2.0% at 1024 single-chunk; neutral at 4096+.                                          |
+| **E48** _(opt-in)_ | `gated_delta_step_4vcol.metal.inc` + dispatch                                                | `MLX_ENABLE_E48_GDN_4VCOL=1`            | 4-vcol variant of E47. +0.5% on top of E47 for large-Dv models. Default-off because the grid-Y reduction could regress on smaller-Dv shapes.                                                                        |
+| **E51**            | `gated_delta_net.rs::finalize_in_proj` + `persistence.rs`                                    | `MLX_DISABLE_E51_STACKED_GDN_IN_PROJ=1` | Load-time stack of `in_proj_qkvz` + `in_proj_ba` into `[hidden, qkvz_dim+ba_dim]^T`. Forward does one matmul + two axis-2 slices instead of two matmuls. -0.44% across 24 GDN layers. No-op for quantized variants. |
+| **E55**            | `qwen3_5/model.rs::PREFILL_STEP_SIZE`                                                        | (no toggle — const)                     | `PREFILL_STEP_SIZE` 1024 → 2048 to match mlx-lm's default and close the long-context gap. Halves chunk count at multi-chunk prompts. At T ≤ 2048 the const is irrelevant (single `remaining` branch). −5-7% at 20k. |
 
 To verify the composed delta, run two same-binary passes with all
 toggles flipped to legacy vs all on. The exact env-var combo for
@@ -74,35 +74,36 @@ M3 bench (no toggle).
 Multi-chunk perf was measured during the original arc; not re-measured
 after E47+E51.
 
-| Prompt tokens | Chunks | best | legacy | Δ |
-|---:|---:|---:|---:|---:|
-| 1024 (single chunk) | 1 | 572 ms | 682 ms | **-16.4%** (with E47+E51) |
-| 2048 | 2 | 1410 ms | 1537 ms | -8.3% |
-| 4096 | 3-4 | 2593 ms | 2707 ms | -4.2% |
-| 8192 | 7 | 5032 ms | 5040 ms | -0.15% |
+|       Prompt tokens | Chunks |    best |  legacy |                         Δ |
+| ------------------: | -----: | ------: | ------: | ------------------------: |
+| 1024 (single chunk) |      1 |  572 ms |  682 ms | **-16.4%** (with E47+E51) |
+|                2048 |      2 | 1410 ms | 1537 ms |                     -8.3% |
+|                4096 |    3-4 | 2593 ms | 2707 ms |                     -4.2% |
+|                8192 |      7 | 5032 ms | 5040 ms |                    -0.15% |
 
 Why the falloff at long prompts: E37+E38 save fixed work (one lm_head
-+ one last-layer MLP slice per chunk). E39+E40 save kernel-launch
-overhead on the 32-per-chunk MLPs. E47 saves per-timestep work in the
-GDN kernel — that DOES scale with T, but the full-attn SDPA's
-`O(T · T_ctx)` cost takes over at 8192+. None of the wins target SDPA.
+
+- one last-layer MLP slice per chunk). E39+E40 save kernel-launch
+  overhead on the 32-per-chunk MLPs. E47 saves per-timestep work in the
+  GDN kernel — that DOES scale with T, but the full-attn SDPA's
+  `O(T · T_ctx)` cost takes over at 8192+. None of the wins target SDPA.
 
 ## What didn't ship (and why)
 
 Recorded so the next iteration doesn't re-discover the same dead ends.
 
-| Tag | Tried | Verdict | Why |
-|---|---|---|---|
-| **E41** | Load-time Q+K+V projection stack (MLP-style for attention) | REJECT, +2% regression at 1024 | MLX inserted hidden contiguous-materialization copies (~330 MB/chunk) when the strided slice got reshaped to per-head. The fix (C++ fused slice+copy helper) was deferred — not worth doubling implementation effort for ~0.3% theoretical gain. |
-| **E42** | Last-layer attention internal slice (queries→1 before SDPA) | REJECT, mixed | SDPA dispatch regimes differ between prefill (large T_q) and decode (T_q=1, small T_ctx). A "1 query, large T_ctx" call falls between — slower at 1024–2048, marginally faster at 4096+. Wrong tradeoff for the 1024 headline. |
-| **E43** | Skip per-chunk `clear_cache()` | REJECT, within noise | The clear cost is small vs chunk compute; skipping just raises peak memory 0.07–0.2 GB without latency gain. |
-| **E44** | Force chunked GDN kernel on M3 (bypass M5+ gate) | REJECT, 2.1–2.3× slower | The chunked kernel's `simdgroup_matrix` needs Neural Accelerators (M5+). On M3 it's bandwidth-bound and loses to per-step badly. M5+ gate stays. |
-| **E45** | `DV_PER_TG` / `TG_Y` sweep for per-step kernel | REJECT, default optimal | TG_Y=4 wins at 4096 by 4%; at 1024 all variants within 3.8% (noise). Threadgroup geometry is in its sweet spot. |
-| **E46** | Cooperative TG q/k cache across T_BLOCK=8 timesteps | REJECT, 2–6% slower | Threadgroup memory traffic + barrier cost outweighs L1 reuse. Apple GPU's L1 was absorbing the redundant loads near-free anyway. |
-| **E49** | `TG_Y` env-var sweep on E47/E48 variants | REJECT, all within noise | TG_Y=4 stays optimal for both 2-vcol and 4-vcol kernels. Reverted the env-var addition to keep dispatch minimal. |
-| **E50** | 8 v-cols per simdgroup (extend register-blocking past E48) | REJECT, ties E48 within 0.07% | Diminishing returns past 4 v-cols on M3: grid Y drops to Dv/8=16 → only 16 total TGs at B=1,Hv=4, occupancy-bound. |
-| **E52** *(investigated, not implemented)* | Q+K+V stack revisited with reshape-then-slice | REJECT | Theoretical max gain ~0.3% (8 attn layers vs E51's 24 GDN); E41 downside risk (~2%) is precedented. Asymmetric risk profile not worth the implementation cost. |
-| **E54** *(methodology)* | Re-validate E48 via cross-process bench | INCONCLUSIVE | Cross-process variance (~15.8% between two E47-default runs) dwarfs sub-1% kernel deltas. The earlier 0.5% E48 in-process measurement remains the best estimate. |
+| Tag                                       | Tried                                                       | Verdict                        | Why                                                                                                                                                                                                                                              |
+| ----------------------------------------- | ----------------------------------------------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **E41**                                   | Load-time Q+K+V projection stack (MLP-style for attention)  | REJECT, +2% regression at 1024 | MLX inserted hidden contiguous-materialization copies (~330 MB/chunk) when the strided slice got reshaped to per-head. The fix (C++ fused slice+copy helper) was deferred — not worth doubling implementation effort for ~0.3% theoretical gain. |
+| **E42**                                   | Last-layer attention internal slice (queries→1 before SDPA) | REJECT, mixed                  | SDPA dispatch regimes differ between prefill (large T_q) and decode (T_q=1, small T_ctx). A "1 query, large T_ctx" call falls between — slower at 1024–2048, marginally faster at 4096+. Wrong tradeoff for the 1024 headline.                   |
+| **E43**                                   | Skip per-chunk `clear_cache()`                              | REJECT, within noise           | The clear cost is small vs chunk compute; skipping just raises peak memory 0.07–0.2 GB without latency gain.                                                                                                                                     |
+| **E44**                                   | Force chunked GDN kernel on M3 (bypass M5+ gate)            | REJECT, 2.1–2.3× slower        | The chunked kernel's `simdgroup_matrix` needs Neural Accelerators (M5+). On M3 it's bandwidth-bound and loses to per-step badly. M5+ gate stays.                                                                                                 |
+| **E45**                                   | `DV_PER_TG` / `TG_Y` sweep for per-step kernel              | REJECT, default optimal        | TG_Y=4 wins at 4096 by 4%; at 1024 all variants within 3.8% (noise). Threadgroup geometry is in its sweet spot.                                                                                                                                  |
+| **E46**                                   | Cooperative TG q/k cache across T_BLOCK=8 timesteps         | REJECT, 2–6% slower            | Threadgroup memory traffic + barrier cost outweighs L1 reuse. Apple GPU's L1 was absorbing the redundant loads near-free anyway.                                                                                                                 |
+| **E49**                                   | `TG_Y` env-var sweep on E47/E48 variants                    | REJECT, all within noise       | TG_Y=4 stays optimal for both 2-vcol and 4-vcol kernels. Reverted the env-var addition to keep dispatch minimal.                                                                                                                                 |
+| **E50**                                   | 8 v-cols per simdgroup (extend register-blocking past E48)  | REJECT, ties E48 within 0.07%  | Diminishing returns past 4 v-cols on M3: grid Y drops to Dv/8=16 → only 16 total TGs at B=1,Hv=4, occupancy-bound.                                                                                                                               |
+| **E52** _(investigated, not implemented)_ | Q+K+V stack revisited with reshape-then-slice               | REJECT                         | Theoretical max gain ~0.3% (8 attn layers vs E51's 24 GDN); E41 downside risk (~2%) is precedented. Asymmetric risk profile not worth the implementation cost.                                                                                   |
+| **E54** _(methodology)_                   | Re-validate E48 via cross-process bench                     | INCONCLUSIVE                   | Cross-process variance (~15.8% between two E47-default runs) dwarfs sub-1% kernel deltas. The earlier 0.5% E48 in-process measurement remains the best estimate.                                                                                 |
 
 ## Methodology
 
@@ -157,20 +158,20 @@ E47 (-2.0%) and E51 (-0.44%) shipped as small but consistent wins, formally belo
 
 From the original FlashQLA idea catalogue, with M3-feasibility annotations:
 
-| Idea | Source | M3-feasible? | Notes |
-|---|---|---|---|
-| **A1** Cache `exp(gcum[i])` in TG memory (chunked kernel) | FlashQLA `fused_fwd.py` | M5+ only | The chunked kernel is gated. Worth doing if/when chunked beats per-step on M3, or directly on M5+ silicon. |
-| **A2** Fold decay into k_chunk at load time | FlashQLA `fused_fwd.py` | M5+ only | Depends on A1; numerical stability concern (sqrt of small numbers). |
-| **A3** Reduce Phase-4 barriers | (audit our chunked kernel) | M5+ only | Apple GPU barriers are expensive; might save µs. |
-| **A4** `1/decay` once per chunk for state update | derived from A1 | M5+ only | Extends A1. |
-| **B1** WY-transform precomputation (kkt_solve analog) | FlashQLA `kkt_solve.py` | M5+ only, high payoff/risk | Splits the chunked kernel; eliminates O(BT) sequential dep. Parity test critical. |
-| **B2** Separate `prepare_h` kernel | FlashQLA `prepare_h.py` | M5+ only | More global memory traffic vs more parallelism; probably bandwidth-bound loss on Apple, but try last. |
-| **B3** Gate-driven early termination | FlashQLA CP module | M3-feasible, long-context wins | Skip state-update terms when `gcum[i] − gcum[end] < −10` (contribution below bf16 epsilon). Most impact at long-context prefill, less at 1024-prompt. |
-| **C1** `BT = 64` | FlashQLA chunk size | M5+ only | Doubles arithmetic intensity; needs 32 KB threadgroup memory (tight on M5+). |
-| **C2** `DV_PER_TG` sweep (chunked kernel) | tile tuning | M5+ only | 1 LOC + bench. |
-| **C3** Grid-layout sweep along S dim | tile tuning | M5+ only | Same insight as B3 expressed as launch parallelism. |
-| **C4** Drop M5+ gate after A/B/C wins | gate revisit | depends | Only after chunked beats per-step on M3. |
-| **D2** Pre-reduce mask for prefill (masked per-step variants) | classic | M3-feasible | Replace per-timestep mask load with single `mask_len` int. Only useful for masked variants; the 1024-prompt bench uses unmasked. |
+| Idea                                                          | Source                     | M3-feasible?                   | Notes                                                                                                                                                 |
+| ------------------------------------------------------------- | -------------------------- | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **A1** Cache `exp(gcum[i])` in TG memory (chunked kernel)     | FlashQLA `fused_fwd.py`    | M5+ only                       | The chunked kernel is gated. Worth doing if/when chunked beats per-step on M3, or directly on M5+ silicon.                                            |
+| **A2** Fold decay into k_chunk at load time                   | FlashQLA `fused_fwd.py`    | M5+ only                       | Depends on A1; numerical stability concern (sqrt of small numbers).                                                                                   |
+| **A3** Reduce Phase-4 barriers                                | (audit our chunked kernel) | M5+ only                       | Apple GPU barriers are expensive; might save µs.                                                                                                      |
+| **A4** `1/decay` once per chunk for state update              | derived from A1            | M5+ only                       | Extends A1.                                                                                                                                           |
+| **B1** WY-transform precomputation (kkt_solve analog)         | FlashQLA `kkt_solve.py`    | M5+ only, high payoff/risk     | Splits the chunked kernel; eliminates O(BT) sequential dep. Parity test critical.                                                                     |
+| **B2** Separate `prepare_h` kernel                            | FlashQLA `prepare_h.py`    | M5+ only                       | More global memory traffic vs more parallelism; probably bandwidth-bound loss on Apple, but try last.                                                 |
+| **B3** Gate-driven early termination                          | FlashQLA CP module         | M3-feasible, long-context wins | Skip state-update terms when `gcum[i] − gcum[end] < −10` (contribution below bf16 epsilon). Most impact at long-context prefill, less at 1024-prompt. |
+| **C1** `BT = 64`                                              | FlashQLA chunk size        | M5+ only                       | Doubles arithmetic intensity; needs 32 KB threadgroup memory (tight on M5+).                                                                          |
+| **C2** `DV_PER_TG` sweep (chunked kernel)                     | tile tuning                | M5+ only                       | 1 LOC + bench.                                                                                                                                        |
+| **C3** Grid-layout sweep along S dim                          | tile tuning                | M5+ only                       | Same insight as B3 expressed as launch parallelism.                                                                                                   |
+| **C4** Drop M5+ gate after A/B/C wins                         | gate revisit               | depends                        | Only after chunked beats per-step on M3.                                                                                                              |
+| **D2** Pre-reduce mask for prefill (masked per-step variants) | classic                    | M3-feasible                    | Replace per-timestep mask load with single `mask_len` int. Only useful for masked variants; the 1024-prompt bench uses unmasked.                      |
 
 ## The one unfinished piece — E53
 

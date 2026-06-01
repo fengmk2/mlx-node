@@ -97,15 +97,15 @@ These can land in a follow-up if the first-cut bench shows a win.
 
 ## Estimated effort
 
-| Step | Estimate |
-|------|----------|
-| Write `attn_prefill_fn_scalar` helper | 30 min |
-| Write `mlx_qwen35_text_prefill` FFI + globals | 1 h |
-| Wire FFI signature into `mlx-sys/src/lib.rs` | 15 min |
-| Rust dispatch in `forward_inner` | 45 min |
-| Build, parity test, fix issues | 1 h |
-| Cold-state A/B (3–5 batches of 4 runs each) | 30 min |
-| **Total** | **~4 h** |
+| Step                                          | Estimate |
+| --------------------------------------------- | -------- |
+| Write `attn_prefill_fn_scalar` helper         | 30 min   |
+| Write `mlx_qwen35_text_prefill` FFI + globals | 1 h      |
+| Wire FFI signature into `mlx-sys/src/lib.rs`  | 15 min   |
+| Rust dispatch in `forward_inner`              | 45 min   |
+| Build, parity test, fix issues                | 1 h      |
+| Cold-state A/B (3–5 batches of 4 runs each)   | 30 min   |
+| **Total**                                     | **~4 h** |
 
 Multi-session scope. Recommend splitting into two sessions:
 
@@ -123,7 +123,7 @@ Multi-session scope. Recommend splitting into two sessions:
 2. **Cache lifecycle.** The Rust dispatch must guarantee the per-layer
    caches are populated equivalently to the legacy path. If we punt
    that for the first cut (return only logits, no cache write-back),
-   the bench is still valid for measuring prefill *throughput*, but
+   the bench is still valid for measuring prefill _throughput_, but
    subsequent decode would fail. The MLX_DISABLE_E53… toggle should
    default to legacy until cache lifecycle is solved.
 3. **Compile-graph rebuilds.** mlx::core::compile caches by
