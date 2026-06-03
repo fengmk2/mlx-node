@@ -72,6 +72,36 @@ static bool g_moe_inited = false;
 static std::vector<LayerQuantInfo> g_layer_quant;     // per-layer MoE quant info
 static std::vector<DenseMLPQuantInfo> g_dense_quant;  // per-layer dense MLP quant info
 
+// W6 MoE (MTP) — last post-final-norm hidden of the LAST committed token,
+// stashed at the LM-head boundary inside `moe_compiled_decode_fn` BEFORE
+// the `lm_head` linear runs. Shape is `[B, hidden_size]` after the
+// per-row final_norm produces (decode batch is `[1, 1]` → `[1, hidden]`).
+// The W6 MoE MTP seeding path consumes this via
+// `mlx_qwen35_moe_export_last_hidden` to get the first draft step's
+// `prev_hidden` without re-running the main MoE forward.
+//
+// Cleared on `mlx_qwen35_moe_reset` so cross-turn stale handles never
+// leak. The C++ side keeps a `std::optional<array>` so we can
+// distinguish "never populated" from "populated with zeros".
+static std::optional<array> g_moe_last_hidden;
+
+// W6 MoE (MTP) Bug #4 fix — snapshot of the GDN linear-attention
+// caches (conv_state + recurrent_state) plus the decode offset taken
+// BEFORE the verify FFI runs its D+1 sequential MoE forwards. The
+// verify loop mutates `g_moe_caches` in place; for linear-attention
+// layers the recurrent / conv state advances through D+1 tokens that
+// may or may not all be accepted. On rejection we restore this
+// snapshot so the linear state matches the pre-verify "after Step A"
+// state; the caller then replays exactly K accepted drafts via the
+// main MoE forward FFI to bring the linear state forward through the
+// committed drafts only. Mirrors the dense-path snapshot
+// (`g_compiled_linear_snapshot` in mlx_qwen35.cpp).
+//
+// Cleared on `mlx_qwen35_moe_reset`.
+static std::vector<array> g_moe_linear_snapshot;
+static int g_moe_linear_snapshot_offset = 0;
+static bool g_moe_linear_snapshot_taken = false;
+
 // =====================================================================
 // Phase 4 piece 1: paged-decode globals.
 //
@@ -529,6 +559,16 @@ static std::vector<array> moe_compiled_decode_fn(const std::vector<array>& input
 
   // Final norm + LM head
   h = fast::rms_norm(h, get_weight("final_norm.weight"), cfg.rms_norm_eps);
+  // W6 MoE (MTP) — emit the post-final-norm hidden of the last decoded
+  // token alongside logits so `mlx_qwen35_moe_forward` can stash it
+  // into `g_moe_last_hidden`. Unlike the dense flat path (which calls
+  // `qwen35_decode_fn` directly and can assign a global from the body),
+  // MoE wraps this function in `mlx::core::compile`, so any global
+  // assignment inside the body would only fire at trace time. Returning
+  // the hidden as an extra output threads it through the compiled
+  // graph on every call. Shape after the per-row final_norm is
+  // `[1, hidden_size]` for the flat-path decode (batch=1, single token).
+  array last_hidden = h;
   if (cfg.tie_word_embeddings) {
     h = linear_proj(h, "embedding");
   } else {
@@ -538,16 +578,43 @@ static std::vector<array> moe_compiled_decode_fn(const std::vector<array>& input
   auto new_offset = offset_arr + array(1, mlx::core::int32);
 
   std::vector<array> result;
-  result.reserve(2 + cfg.num_layers * 2);
+  result.reserve(3 + cfg.num_layers * 2);
   result.push_back(std::move(h));
   result.push_back(std::move(new_offset));
+  result.push_back(std::move(last_hidden));
   for (auto& c : new_caches) result.push_back(std::move(c));
   return result;
 }
 
-static auto& compiled_moe_decode() {
-  static auto fn = mlx::core::compile(moe_compiled_decode_fn);
-  return fn;
+// Dispatch-table type for the compiled MoE graphs. `BatchedVerifyFn` itself
+// lives in mlx_qwen35.cpp's anonymous namespace (a separate translation
+// unit), so we re-declare the identical signature here. All three MoE
+// compiled bodies share `std::vector<array>(const std::vector<array>&)`.
+using MoeCompiledFn = std::function<std::vector<array>(const std::vector<array>&)>;
+
+// PR #65 (mtp-reload P1) — resettable file-scope globals. These compiled MoE
+// graphs read expert + attention weights via `get_weight(...)` INSIDE the
+// traced closure, so `mlx::core::compile(...)` bakes the captured weight
+// arrays into a process-lifetime cache. On a model RELOAD they would be
+// stale, so a second same-shape model would decode/verify with the FIRST
+// model's weights (silent corruption). The slots start empty and are lazily
+// assigned `compile(...)` on first call (on the inference thread, under the
+// Rust `COMPILED_WEIGHTS_RWLOCK.read()`); `mlx_qwen35_moe_invalidate_compiled_graphs()`
+// nulls them under the write lock so the next call re-traces against the live
+// registry. (Empty-function default is well-formed; `array` has no default
+// ctor but `std::function<>` does.)
+static MoeCompiledFn g_moe_decode_compiled;
+static MoeCompiledFn g_moe_verify_batched_compiled;
+static MoeCompiledFn g_moe_decode_paged_compiled;
+
+// Resettable global cleared by `mlx_qwen35_moe_invalidate_compiled_graphs()`
+// on reload — see the `g_moe_decode_compiled` declaration above. This is the
+// MoE AR-decode graph.
+static MoeCompiledFn& compiled_moe_decode() {
+  if (!g_moe_decode_compiled) {
+    g_moe_decode_compiled = compile_resettable_weight_graph(moe_compiled_decode_fn);
+  }
+  return g_moe_decode_compiled;
 }
 
 // =====================================================================
@@ -685,9 +752,148 @@ static std::vector<array> moe_compiled_decode_fn_paged(const std::vector<array>&
   return result;
 }
 
-static auto& compiled_moe_decode_paged() {
-  static auto fn = mlx::core::compile(moe_compiled_decode_fn_paged);
-  return fn;
+// =====================================================================
+// W6.7 — MoE batched verify decode graph.
+//
+// Direct MoE mirror of `qwen35_verify_batched_decode_fn<false>` in
+// `mlx_qwen35.cpp` (the MoE path doesn't ship W6.6 tape-replay yet — it
+// stays out of scope, matching the W6.6 commit body). One forward over
+// `T = depth + 1` tokens replacing the prior D+1 sequential
+// `mlx_qwen35_moe_forward` calls.
+//
+// Input vector layout (matches the per-step MoE graph plus the 3D h):
+//   [0]                  h_3d         [B, T, hidden]  bf16
+//   [1]                  offset_arr   [1]             int32
+//   For each layer i in [0, num_layers):
+//     [2 + i*2 + 0]      cache_a      (k for full-attn, conv_state for linear)
+//     [2 + i*2 + 1]      cache_b      (v for full-attn, recurrent_state for linear)
+//
+// Output vector layout:
+//   [0]                  logits       [B, T, vocab]
+//   [1]                  new_offset_arr — `offset_arr + T`
+//   [2]                  hiddens      [B, T, hidden]  pre-lm_head hidden
+//   For each layer i:
+//     [3 + i*2 + 0]      new_cache_a
+//     [3 + i*2 + 1]      new_cache_b
+//
+// `last_hidden` is kept at slot 2 to mirror the per-step graph layout —
+// the FFI consumes it independently of the cache stride.
+// =====================================================================
+static std::vector<array> moe_verify_batched_decode_fn(
+    const std::vector<array>& inputs) {
+  const auto& cfg = g_moe_config;
+  auto h          = inputs[0];        // [B, T, hidden]
+  auto offset_arr = inputs[1];        // [1] int32
+
+  int B = h.shape(0);
+  int T = h.shape(1);
+  int hidden = h.shape(2);
+
+  // Tail-causal mask `[1, 1, T, max_kv_len]`: at query row `t`, valid
+  // keys are `[0..offset + t]`. Built once for all full-attention layers.
+  int first_fa = cfg.full_attention_interval - 1;
+  int max_kv_len = inputs[2 + first_fa * 2].shape(2);
+  auto col_positions = arange(0, max_kv_len, mlx::core::int32);   // [K]
+  auto row_idx       = arange(0, T, mlx::core::int32);            // [T]
+  auto col_row = reshape(col_positions, {1, max_kv_len});         // [1, K]
+  auto row_col = reshape(row_idx, {T, 1}) + offset_arr;           // [T, 1]
+  auto valid_2d = less_equal(col_row, row_col);                   // [T, K]
+  auto attn_mask = where(valid_2d,
+      array(0.0f, mlx::core::bfloat16),
+      array(-std::numeric_limits<float>::infinity(), mlx::core::bfloat16));
+  attn_mask = reshape(attn_mask, {1, 1, T, max_kv_len});
+
+  std::vector<array> new_caches;
+  new_caches.reserve(cfg.num_layers * 2);
+  for (int i = 0; i < cfg.num_layers * 2; i++) {
+    new_caches.push_back(zeros({}, mlx::core::bfloat16));
+  }
+
+  for (int i = 0; i < cfg.num_layers; i++) {
+    bool is_linear = !((i + 1) % cfg.full_attention_interval == 0);
+    std::string lp = "layers." + std::to_string(i);
+
+    auto normed = fast::rms_norm(h, get_weight(lp + ".input_layernorm.weight"),
+                                 cfg.rms_norm_eps);
+
+    array layer_out = zeros({}, mlx::core::bfloat16);
+    if (is_linear) {
+      const auto& cs = inputs[2 + i * 2];
+      const auto& rs = inputs[2 + i * 2 + 1];
+      auto res = gdn_batched_verify_fn(normed, i, cs, rs, cfg);
+      layer_out = std::move(res.output);
+      new_caches[i * 2]     = std::move(res.conv_state);
+      new_caches[i * 2 + 1] = std::move(res.recurrent_state);
+    } else {
+      const auto& kk = inputs[2 + i * 2];
+      const auto& kv = inputs[2 + i * 2 + 1];
+      auto res = attn_batched_verify_fn(normed, i, kk, kv, attn_mask, offset_arr, cfg);
+      layer_out = std::move(res.output);
+      new_caches[i * 2]     = std::move(res.keys);
+      new_caches[i * 2 + 1] = std::move(res.values);
+    }
+    h = h + layer_out;
+
+    // Post-attn norm + MoE/Dense MLP. The MLP helpers expect 2D input
+    // `[B*T, hidden]` (they internally treat `B` as the token count
+    // for routing / expert dispatch). Flatten time into batch.
+    auto h_flat = reshape(h, {B * T, hidden});
+    auto mlp_in = fast::rms_norm(h_flat, get_weight(lp + ".post_attention_layernorm.weight"),
+                                 cfg.rms_norm_eps);
+
+    array mlp_out = zeros({}, mlx::core::bfloat16);
+    bool moe = is_moe_layer(i, cfg);
+    if (moe) {
+      mlp_out = sparse_moe_fn(mlp_in, i, cfg, g_layer_quant[i]);
+    } else {
+      mlp_out = dense_mlp_fn(mlp_in, i, cfg, g_dense_quant[i]);
+    }
+    h = h + reshape(mlp_out, {B, T, hidden});
+  }
+
+  // Final norm + LM head on flat 2D, then reshape outputs.
+  auto h_flat = reshape(h, {B * T, hidden});
+  h_flat = fast::rms_norm(h_flat, get_weight("final_norm.weight"), cfg.rms_norm_eps);
+  array last_hidden = reshape(h_flat, {B, T, hidden});
+
+  auto logits_flat = cfg.tie_word_embeddings
+      ? linear_proj(h_flat, "embedding")
+      : linear_proj(h_flat, "lm_head");
+  int vocab = logits_flat.shape(-1);
+  auto logits = reshape(logits_flat, {B, T, vocab});
+
+  auto new_offset = offset_arr + array(T, mlx::core::int32);
+
+  std::vector<array> result;
+  result.reserve(3 + cfg.num_layers * 2);
+  result.push_back(std::move(logits));
+  result.push_back(std::move(new_offset));
+  result.push_back(std::move(last_hidden));
+  for (auto& c : new_caches) result.push_back(std::move(c));
+  return result;
+}
+
+// Resettable global cleared by `mlx_qwen35_moe_invalidate_compiled_graphs()`
+// on reload — see the `g_moe_decode_compiled` declaration above. This is the
+// MoE MTP-verify graph (the explicit PR #65 P1, sibling of the dense bucket
+// tables that ARE invalidated by `mlx_qwen35_invalidate_compiled_graphs`).
+static MoeCompiledFn& compiled_moe_verify_batched() {
+  if (!g_moe_verify_batched_compiled) {
+    g_moe_verify_batched_compiled =
+        compile_resettable_weight_graph(moe_verify_batched_decode_fn);
+  }
+  return g_moe_verify_batched_compiled;
+}
+
+// Resettable global cleared by `mlx_qwen35_moe_invalidate_compiled_graphs()`
+// on reload — see the `g_moe_decode_compiled` declaration above. This is the
+// paged MoE AR-decode graph.
+static MoeCompiledFn& compiled_moe_decode_paged() {
+  if (!g_moe_decode_paged_compiled) {
+    g_moe_decode_paged_compiled =
+        compile_resettable_weight_graph(moe_compiled_decode_fn_paged);
+  }
+  return g_moe_decode_paged_compiled;
 }
 
 }  // namespace
@@ -882,11 +1088,26 @@ void mlx_qwen35_moe_forward(
         ? moe_compiled_decode_fn(fn_inputs)
         : compiled_moe_decode()(fn_inputs);
 
-    // Extract outputs: [logits, new_offset, new_caches...]
+    // Extract outputs: [logits, new_offset, last_hidden, new_caches...].
+    // W6 MoE (MTP) introduced `last_hidden` at index 2 so caches now
+    // start at index 3. The hidden is stashed for
+    // `mlx_qwen35_moe_export_last_hidden`; non-MTP callers pay nothing
+    // beyond one extra array copy in the result vector.
+    const size_t expected_outputs = 3 + static_cast<size_t>(cfg.num_layers) * 2;
+    if (outputs.size() != expected_outputs) {
+      fprintf(stderr,
+              "[MLX] moe_compiled_decode_fn returned %zu outputs, expected %zu "
+              "(layout: [logits, offset, hidden, caches...]). Stride drift.\n",
+              outputs.size(), expected_outputs);
+      fflush(stderr);
+      *output_logits = nullptr;
+      return;
+    }
     *output_logits = reinterpret_cast<mlx_array*>(new array(outputs[0]));
     g_moe_offset_int++;
+    g_moe_last_hidden = outputs[2];
     for (int i = 0; i < cfg.num_layers * 2; i++) {
-      g_moe_caches[i] = outputs[2 + i];
+      g_moe_caches[i] = outputs[3 + i];
     }
 
     if (cache_offset_out) {
@@ -901,6 +1122,242 @@ void mlx_qwen35_moe_forward(
     fflush(stderr);
     *output_logits = nullptr;
   }
+}
+
+// -----------------------------------------------------------------------------
+// W6.7 — MoE batched verify forward (MoE twin of
+// `mlx_qwen35_forward_batched_verify`).
+//
+// Runs ONE compiled forward over `T = depth + 1` tokens, replacing the prior
+// D+1 sequential `mlx_qwen35_moe_forward` calls performed inside the per-
+// depth MoE verify closure. Emits `[1, T, vocab]` logits + `[1, T, hidden]`
+// post-final-norm hiddens in one dispatch. Does NOT support W6.6 tape-replay
+// (MoE tape-replay is deferred).
+//
+// Inputs:
+//   - input_ids:        `[1, T]` int32 tokens (T = depth + 1).
+//   - embedding_weight: model's embedding table (or LM-head if untied).
+//   - depth:            T = depth + 1; depth ∈ [1, 5] enforced by caller.
+// Outputs (heap-allocated, caller owns):
+//   - out_logits:       `[1, T, vocab]` bf16 logits.
+//   - out_hiddens:      `[1, T, hidden_size]` bf16 post-final-norm.
+// Side effects:
+//   - `g_moe_offset_int` += T
+//   - `g_moe_caches[]` updated in place with the post-verify state.
+//   - `g_moe_last_hidden` is NOT touched here; the batched FFI returns the
+//     full `[1, T, hidden]` directly so the legacy per-step stash isn't used.
+//
+// Caller MUST hold `MOE_COMPILED_MUTEX` and the weights read lock.
+// -----------------------------------------------------------------------------
+void mlx_qwen35_moe_forward_batched_verify(
+    mlx_array* input_ids_ptr,
+    mlx_array* embedding_weight_ptr,
+    int depth,
+    mlx_array** out_logits,
+    mlx_array** out_hiddens
+) {
+  if (out_logits) *out_logits = nullptr;
+  if (out_hiddens) *out_hiddens = nullptr;
+  if (!input_ids_ptr || !embedding_weight_ptr || !out_logits || !out_hiddens) {
+    return;
+  }
+  if (!g_moe_inited) return;
+  if (depth < 1 || depth > 5) {
+    fprintf(stderr,
+            "[MLX] mlx_qwen35_moe_forward_batched_verify: depth %d outside [1, 5]\n",
+            depth);
+    fflush(stderr);
+    return;
+  }
+  const auto& cfg = g_moe_config;
+  int T = depth + 1;
+
+  try {
+    auto& input_ids        = *reinterpret_cast<array*>(input_ids_ptr);
+    auto& embedding_weight = *reinterpret_cast<array*>(embedding_weight_ptr);
+
+    if (input_ids.ndim() != 2 || input_ids.shape(0) != 1 ||
+        input_ids.shape(1) != T) {
+      fprintf(stderr,
+              "[MLX] mlx_qwen35_moe_forward_batched_verify: input_ids shape must be "
+              "[1, %d], got ndim=%d shape=[%lld,%lld]\n",
+              T, input_ids.ndim(),
+              input_ids.ndim() >= 1 ? (long long)input_ids.shape(0) : -1LL,
+              input_ids.ndim() >= 2 ? (long long)input_ids.shape(1) : -1LL);
+      fflush(stderr);
+      return;
+    }
+
+    // Embed: `[1, T]` int32 → `[1, T, hidden]` bf16.
+    auto flat_ids = reshape(input_ids, {-1});
+    auto emb_flat = take(embedding_weight, flat_ids, 0);
+    auto h_3d = reshape(emb_flat, {1, T, cfg.hidden_size});
+
+    std::vector<array> fn_inputs;
+    fn_inputs.reserve(2 + cfg.num_layers * 2);
+    fn_inputs.push_back(std::move(h_3d));
+    fn_inputs.push_back(reshape(array(g_moe_offset_int, mlx::core::int32), {1}));
+    for (const auto& c : g_moe_caches) {
+      fn_inputs.push_back(c);
+    }
+
+    static bool no_compile = std::getenv("MLX_NO_COMPILE") != nullptr;
+    auto outputs = no_compile
+        ? moe_verify_batched_decode_fn(fn_inputs)
+        : compiled_moe_verify_batched()(fn_inputs);
+
+    // outputs[0]: logits  [1, T, vocab]
+    // outputs[1]: new_offset_arr (unused — we maintain `g_moe_offset_int` here)
+    // outputs[2]: hiddens [1, T, hidden]
+    // outputs[3..]: updated caches
+    const size_t expected = 3 + static_cast<size_t>(cfg.num_layers) * 2;
+    if (outputs.size() != expected) {
+      fprintf(stderr,
+              "[MLX] moe_verify_batched_decode_fn returned %zu outputs, expected %zu\n",
+              outputs.size(), expected);
+      fflush(stderr);
+      return;
+    }
+    // Stage allocations into locals first: if `new array(...)` throws on
+    // the SECOND call (`std::bad_alloc` under OOM) we'd otherwise leak the
+    // first heap `array` already written to `*out_logits`. Only commit to
+    // the out-pointers after both allocations succeed.
+    array* logits_alloc  = new array(outputs[0]);
+    array* hiddens_alloc = nullptr;
+    try {
+      hiddens_alloc = new array(outputs[2]);
+    } catch (...) {
+      delete logits_alloc;
+      throw;
+    }
+    *out_logits  = reinterpret_cast<mlx_array*>(logits_alloc);
+    *out_hiddens = reinterpret_cast<mlx_array*>(hiddens_alloc);
+
+    for (int i = 0; i < cfg.num_layers * 2; i++) {
+      g_moe_caches[i] = outputs[3 + i];
+    }
+    g_moe_offset_int += T;
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[MLX] Exception in mlx_qwen35_moe_forward_batched_verify: %s\n",
+            e.what());
+    fflush(stderr);
+    if (out_logits) *out_logits = nullptr;
+    if (out_hiddens) *out_hiddens = nullptr;
+  } catch (...) {
+    fprintf(stderr,
+            "[MLX] Unknown exception in mlx_qwen35_moe_forward_batched_verify\n");
+    fflush(stderr);
+    if (out_logits) *out_logits = nullptr;
+    if (out_hiddens) *out_hiddens = nullptr;
+  }
+}
+
+// -----------------------------------------------------------------------------
+// W6.7 follow-up — Eagerly compile the MoE batched verify graph for ALL depths
+// in {1..5}. MoE has only ONE variant (no tape-replay — W6.6 deferred for MoE)
+// so this prewarms 5 graph shapes total.
+//
+// PRIOR (W6.7): `compiled_moe_verify_batched()` lazily compiles its graph on
+// first call (now a resettable file-scope global; previously a function-local
+// static — same fire-on-first-call timing), so the first verify cycle of each
+// MoE prompt pays the trace+compile cost for its depth-D shape.
+//
+// NOW: this entry point runs ONE dummy verify forward per depth to force
+// `mlx::core::eval` of the compiled-graph outputs, populating MLX's
+// internal shape-keyed compile cache. Subsequent verifies at the same
+// shape hit the cache.
+//
+// State preservation:
+//   - Snapshots `g_moe_caches[]` and `g_moe_offset_int` before any dummy
+//     call and restores them afterward, so the main MoE path's state is
+//     unchanged.
+//
+// Preconditions:
+//   - `g_moe_inited` is true.
+//   - Embedding weight (`"embedding"` or `"lm_head"`) is registered.
+//
+// Failure handling: best-effort; exceptions are logged and swallowed.
+// -----------------------------------------------------------------------------
+void mlx_qwen35_moe_prewarm_verify_compiled() {
+  if (!g_moe_inited) {
+    return;
+  }
+  const auto& cfg = g_moe_config;
+  if (g_moe_caches.empty()) {
+    return;
+  }
+
+  // Weights are registered under e.g. `"embedding.weight"` /
+  // `"lm_head.weight"` — match the production fetch via the `.weight`
+  // suffix.
+  array embedding_weight = zeros({}, mlx::core::bfloat16);
+  try {
+    if (cfg.tie_word_embeddings && has_weight("embedding.weight")) {
+      embedding_weight = get_weight("embedding.weight");
+    } else if (has_weight("lm_head.weight")) {
+      embedding_weight = get_weight("lm_head.weight");
+    } else if (has_weight("embedding.weight")) {
+      embedding_weight = get_weight("embedding.weight");
+    } else {
+      fprintf(stderr,
+              "[MLX] moe_prewarm_verify_compiled: no embedding.weight/lm_head.weight "
+              "registered; skipping prewarm.\n");
+      fflush(stderr);
+      return;
+    }
+  } catch (const std::exception& e) {
+    fprintf(stderr,
+            "[MLX] moe_prewarm_verify_compiled: failed to fetch embedding "
+            "weight: %s\n", e.what());
+    fflush(stderr);
+    return;
+  }
+
+  std::vector<array> saved_caches = g_moe_caches;
+  int saved_offset_int = g_moe_offset_int;
+
+  auto run_one = [&](int depth) {
+    int T = depth + 1;
+    g_moe_caches = saved_caches;
+    g_moe_offset_int = saved_offset_int;
+
+    array dummy_ids = zeros({1, T}, mlx::core::int32);
+    array emb_copy = embedding_weight;
+    mlx_array* logits_ptr = nullptr;
+    mlx_array* hidden_ptr = nullptr;
+    mlx_qwen35_moe_forward_batched_verify(
+        reinterpret_cast<mlx_array*>(&dummy_ids),
+        reinterpret_cast<mlx_array*>(&emb_copy),
+        depth,
+        &logits_ptr,
+        &hidden_ptr);
+    if (!logits_ptr || !hidden_ptr) {
+      if (logits_ptr) delete reinterpret_cast<array*>(logits_ptr);
+      if (hidden_ptr) delete reinterpret_cast<array*>(hidden_ptr);
+      throw std::runtime_error(
+          "mlx_qwen35_moe_prewarm_verify_compiled: batched verify returned null");
+    }
+    array logits = *reinterpret_cast<array*>(logits_ptr);
+    delete reinterpret_cast<array*>(logits_ptr);
+    array hiddens = *reinterpret_cast<array*>(hidden_ptr);
+    delete reinterpret_cast<array*>(hidden_ptr);
+    mlx::core::eval({logits, hiddens});
+  };
+
+  try {
+    for (int d = 1; d <= 5; d++) run_one(d);
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[MLX] Exception in mlx_qwen35_moe_prewarm_verify_compiled: %s\n",
+            e.what());
+    fflush(stderr);
+  } catch (...) {
+    fprintf(stderr,
+            "[MLX] Unknown exception in mlx_qwen35_moe_prewarm_verify_compiled\n");
+    fflush(stderr);
+  }
+
+  g_moe_caches = std::move(saved_caches);
+  g_moe_offset_int = saved_offset_int;
 }
 
 // Eval token (+ caches implicitly via dependency graph).
@@ -935,6 +1392,53 @@ void mlx_qwen35_moe_eval_token_and_caches(mlx_array* next_token_ptr) {
   }
 }
 
+// W6.5-resume — same as `mlx_qwen35_moe_eval_token_and_caches` but
+// also folds an arbitrary `extra` array into the async_eval dispatch.
+// Used by the chained-cycles MTP path on the MoE twin to fuse the
+// `verify_hidden[K]` slice with the next-cycle draft eval. Mirrors
+// `mlx_qwen35_eval_token_caches_and_extra` on the dense side; see
+// that comment block for the full rationale.
+//
+// Honours `MLX_EVAL_ALL_CACHES` for parity with the non-chained
+// helper: when set, the dispatch batches token + extra + all MoE
+// caches; when unset, only token + extra (matching the default
+// behaviour that token-only eval implicitly drains the compiled
+// graph). `extra_ptr` MAY be null.
+void mlx_qwen35_moe_eval_token_caches_and_extra(
+    mlx_array* next_token_ptr, mlx_array* extra_ptr) {
+  try {
+    static bool eval_all = std::getenv("MLX_EVAL_ALL_CACHES") != nullptr;
+    if (eval_all) {
+      std::vector<array> to_eval;
+      to_eval.reserve(2 + g_moe_caches.size());
+      to_eval.push_back(*reinterpret_cast<array*>(next_token_ptr));
+      if (extra_ptr) {
+        to_eval.push_back(*reinterpret_cast<array*>(extra_ptr));
+      }
+      for (const auto& c : g_moe_caches) {
+        to_eval.push_back(c);
+      }
+      mlx::core::async_eval(std::move(to_eval));
+    } else {
+      if (extra_ptr) {
+        mlx::core::async_eval({*reinterpret_cast<array*>(next_token_ptr),
+                               *reinterpret_cast<array*>(extra_ptr)});
+      } else {
+        mlx::core::async_eval({*reinterpret_cast<array*>(next_token_ptr)});
+      }
+    }
+  } catch (const std::exception& e) {
+    fprintf(stderr,
+            "[MLX] Exception in mlx_qwen35_moe_eval_token_caches_and_extra: %s\n",
+            e.what());
+    fflush(stderr);
+  } catch (...) {
+    fprintf(stderr,
+            "[MLX] Unknown exception in mlx_qwen35_moe_eval_token_caches_and_extra\n");
+    fflush(stderr);
+  }
+}
+
 // Reset MoE state — clears BOTH the legacy flat globals AND the
 // Phase 4 piece 1 paged globals. Keeping these symmetric is required
 // because `mlx_qwen35_moe_init_paged` flips `g_paged_inited` to true
@@ -951,6 +1455,17 @@ void mlx_qwen35_moe_reset() {
   g_dense_quant.clear();
   g_weight_transposes_3d.clear();
 
+  // W6 MoE (MTP) — clear the stashed last-hidden so a subsequent reset →
+  // re-init turn doesn't see a stale handle whose underlying buffer is
+  // no longer valid.
+  g_moe_last_hidden = std::nullopt;
+
+  // W6 MoE (MTP) Bug #4 — drop any pending linear-cache snapshot so it
+  // can't leak across turns / model loads.
+  g_moe_linear_snapshot.clear();
+  g_moe_linear_snapshot_offset = 0;
+  g_moe_linear_snapshot_taken = false;
+
   // Phase 4 piece 1 paged-path globals.
   g_paged_config = MoeConfig{};
   g_k_pools.clear();
@@ -960,6 +1475,38 @@ void mlx_qwen35_moe_reset() {
   g_paged_linear_caches.clear();
   g_paged_offset_int = 0;
   g_paged_inited = false;
+}
+
+// W6 MoE (MTP) — export a heap-allocated deep copy of the
+// post-final-norm hidden state of the last decoded token, captured by
+// the most recent `mlx_qwen35_moe_forward` invocation. Returns nullptr
+// if no forward has run since the last reset / the stash is
+// unpopulated. Caller owns the returned `mlx_array*`
+// (use `mlx_array_delete`).
+//
+// The returned handle is a lazy MLX array whose graph references the
+// final_norm output; the caller MUST `eval()` it before reading any
+// element, and MUST NOT call `mlx_qwen35_moe_reset()` between export
+// and eval (the reset would clear `g_moe_caches` whose inputs the
+// hidden may still depend on via the cached graph). Mirrors the dense
+// `mlx_qwen35_export_last_hidden` contract.
+void mlx_qwen35_moe_export_last_hidden(mlx_array** out) {
+  if (!out) return;
+  *out = nullptr;
+  if (!g_moe_inited || !g_moe_last_hidden.has_value()) {
+    return;
+  }
+  try {
+    *out = reinterpret_cast<mlx_array*>(new array(*g_moe_last_hidden));
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[MLX] Exception in mlx_qwen35_moe_export_last_hidden: %s\n", e.what());
+    fflush(stderr);
+    *out = nullptr;
+  } catch (...) {
+    fprintf(stderr, "[MLX] Unknown exception in mlx_qwen35_moe_export_last_hidden\n");
+    fflush(stderr);
+    *out = nullptr;
+  }
 }
 
 // Export MoE caches for PromptCache reuse.
@@ -1013,6 +1560,91 @@ int mlx_qwen35_moe_get_cache_offset() {
 // Adjust MoE cache offset by delta (for VLM M-RoPE position correction).
 void mlx_qwen35_moe_adjust_offset(int delta) {
   g_moe_offset_int += delta;
+}
+
+// W6 MoE (MTP) Bug #4 — snapshot the GDN linear-attention caches
+// plus the decode offset. Mirrors the dense-path
+// `mlx_qwen35_compiled_snapshot_linear_caches`. Called by the MTP
+// cycle macro AFTER Step A and BEFORE verify.
+//
+// Only linear-attention layer slots are populated; full-attention
+// slots are stored as bf16 zero placeholders so per-layer indexing
+// stays uniform.
+void mlx_qwen35_moe_compiled_snapshot_linear_caches() {
+  if (!g_moe_inited) {
+    g_moe_linear_snapshot_taken = false;
+    return;
+  }
+  const auto& cfg = g_moe_config;
+  try {
+    g_moe_linear_snapshot.clear();
+    g_moe_linear_snapshot.reserve(cfg.num_layers * 2);
+    auto placeholder = []() { return zeros({}, mlx::core::bfloat16); };
+    for (int i = 0; i < cfg.num_layers; i++) {
+      bool is_linear = !((i + 1) % cfg.full_attention_interval == 0);
+      if (is_linear) {
+        // `array(other)` = refcount bump; underlying recurrent/conv
+        // buffer stays alive while the global slot mutates inside the
+        // verify loop.
+        g_moe_linear_snapshot.push_back(array(g_moe_caches[i * 2]));
+        g_moe_linear_snapshot.push_back(array(g_moe_caches[i * 2 + 1]));
+      } else {
+        g_moe_linear_snapshot.push_back(placeholder());
+        g_moe_linear_snapshot.push_back(placeholder());
+      }
+    }
+    g_moe_linear_snapshot_offset = g_moe_offset_int;
+    g_moe_linear_snapshot_taken = true;
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[MLX] Exception in mlx_qwen35_moe_compiled_snapshot_linear_caches: %s\n", e.what());
+    fflush(stderr);
+    g_moe_linear_snapshot.clear();
+    g_moe_linear_snapshot_taken = false;
+  }
+}
+
+// W6 MoE (MTP) Bug #4 — restore the GDN linear caches AND the
+// decode offset from the most recent snapshot. Mirrors the dense-path
+// `mlx_qwen35_compiled_restore_linear_caches`. Called on rejection
+// before replaying K accepted drafts via the main MoE forward FFI.
+//
+// No-op if no snapshot has been taken since the last reset.
+void mlx_qwen35_moe_compiled_restore_linear_caches() {
+  if (!g_moe_inited || !g_moe_linear_snapshot_taken) return;
+  const auto& cfg = g_moe_config;
+  try {
+    for (int i = 0; i < cfg.num_layers; i++) {
+      bool is_linear = !((i + 1) % cfg.full_attention_interval == 0);
+      if (!is_linear) continue;
+      g_moe_caches[i * 2]     = array(g_moe_linear_snapshot[i * 2]);
+      g_moe_caches[i * 2 + 1] = array(g_moe_linear_snapshot[i * 2 + 1]);
+    }
+    g_moe_offset_int = g_moe_linear_snapshot_offset;
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[MLX] Exception in mlx_qwen35_moe_compiled_restore_linear_caches: %s\n", e.what());
+    fflush(stderr);
+  }
+}
+
+// Exposed for `mlx_qwen35_moe_mtp_compiled_init_from_main` so the MTP init
+// can fail loudly if the main MoE compiled path hasn't been initialised yet.
+// Mirrors `mlx_qwen35_is_compile_inited` on the dense side — without this
+// guard the MTP path would mirror a phantom prefix offset into its own
+// `g_mtp_offset_int` from a fresh-zero `g_moe_offset_int`.
+int mlx_qwen35_moe_is_compile_inited() {
+  return g_moe_inited ? 1 : 0;
+}
+
+// Test-only helper: forcibly mark the main MoE compiled path as initialised
+// (or not) without going through the full `init_from_prefill` flow that
+// requires real per-layer KV cache arrays. Used by the W5 MoE MTP FFI smoke
+// tests in `crates/mlx-core/src/models/qwen3_5_moe/mtp.rs` so they can
+// satisfy the new `is_compile_inited` precondition in
+// `mlx_qwen35_moe_mtp_compiled_init_from_main` without standing up a full
+// MoE decoder cache. Production code MUST NOT call this — use
+// `mlx_qwen35_moe_init_from_prefill` instead.
+void mlx_qwen35_moe_compiled_test_force_inited(int inited) {
+  g_moe_inited = (inited != 0);
 }
 
 // =============================================================================
@@ -1619,6 +2251,47 @@ int mlx_qwen35_moe_trace_paged_attn_helper() {
     fflush(stderr);
     return -2;
   }
+}
+
+// PR #65 (mtp-reload P1) — invalidate ALL compiled MoE dispatch graphs (the
+// MTP-verify graph plus the flat + paged AR-decode graphs) so the next call
+// re-traces against the CURRENT weight registry.
+//
+// The compiled MoE bodies read expert + attention weights via `get_weight(...)`
+// INSIDE the traced closure (NOT as compile inputs), so `mlx::core::compile(...)`
+// bakes the captured weight arrays into the cached tape and reuses them verbatim
+// on every later call. These globals are PROCESS-WIDE and deliberately survive
+// the per-turn `mlx_qwen35_moe_reset()` (cross-turn reuse). On a model RELOAD
+// (weights swapped in the registry) the baked weights are stale, so a second
+// same-shape MoE model loaded in the same process would decode/verify with the
+// FIRST model's weights — silent corruption.
+//
+// Each graph is compiled through `compile_resettable_weight_graph` (see
+// `mlx_qwen35_common.h`), which wraps the free function in a CAPTURING lambda so
+// MLX hands it a heap-allocated, UNIQUE `fun_id` whose shared_ptr deleter calls
+// `compile_erase()`. Assigning an empty `std::function{}` therefore destroys the
+// wrapper, ERASES its compile-cache entry (freeing the baked tape), and forces a
+// NEW wrapper (new `fun_id`) to be built on the next call — which re-traces
+// against the live registry on whatever thread next calls `compiled_moe_*`.
+// (A plain `mlx::core::compile(free_fn)` would NOT work here: it keys on the
+// function's stable code address with no eviction hook, so nulling the
+// std::function would silently replay the stale tape.) This is correct
+// regardless of thread because the re-trace is lazy on the inference thread; we
+// do NOT rely on cross-thread `compile_clear_cache()` (MLX's CompilerCache is
+// thread_local).
+//
+// Called by the Rust MoE loader (`register_moe_weights_with_cpp`) on EVERY model
+// reload, immediately after the dense `mlx_qwen35_invalidate_compiled_graphs()`
+// call and INSIDE the `COMPILED_WEIGHTS_RWLOCK` write critical section, so it is
+// serialized against in-flight compiled reads. This mirrors the dense
+// `mlx_qwen35_invalidate_compiled_graphs()` (which nulls the dense bucket/paged
+// verify tables that the MoE path does not use). Also transitively invalidates
+// the MoE MTP draft graph in `mlx_qwen35_moe_mtp_compiled.cpp`.
+void mlx_qwen35_moe_invalidate_compiled_graphs() {
+  g_moe_decode_compiled = MoeCompiledFn{};
+  g_moe_verify_batched_compiled = MoeCompiledFn{};
+  g_moe_decode_paged_compiled = MoeCompiledFn{};
+  mlx_qwen35_moe_mtp_invalidate_compiled_graphs();
 }
 
 }  // extern "C"

@@ -263,6 +263,62 @@ export interface SessionCapableModel {
    * time and never changes for a given model instance.
    */
   hasBlockPagedCache?(): boolean;
+  /**
+   * W7 (MTP): whether the underlying native model checkpoint shipped
+   * an MTP (Multi-Token-Prediction) head — the W2 module loaded by
+   * persistence. Currently surfaced by `Qwen3_5Model` and
+   * `Qwen3_5MoeModel`; all other native wrappers omit the method, in
+   * which case callers treat a missing getter as `false` (no MTP).
+   *
+   * When `true`, {@link ChatSession#mergeConfig} auto-defaults the
+   * per-request `enableMtp` flag to `true` — the W6 speculative-decode
+   * path takes over unless the caller explicitly opts out by passing
+   * `enableMtp: false` in their `ChatConfig` overlay. When `false`
+   * (or the method is missing), `enableMtp` is left untouched.
+   *
+   * Synchronous on every supporting wrapper so the auto-default check
+   * doesn't need a model-thread roundtrip per call — the value is
+   * captured at load time and never changes for a given model
+   * instance.
+   *
+   * ## Companion `ChatConfig` knobs (only meaningful when `enableMtp` is on)
+   *
+   * Two related `ChatConfig` fields tune the speculative-decode loop.
+   * They are forwarded verbatim to the native side via
+   * {@link SendOptions.config} (per-call overlay) or
+   * {@link ChatSessionOptions.defaultConfig} (session default), and
+   * `mergeConfig` shallow-merges per-call over per-session so an
+   * explicit per-send value always wins over the session default for
+   * the same field.
+   *
+   * - **`mtpDepth`** — pins the MTP draft depth per speculative cycle.
+   *   Clamped to `[1, 5]` by the W5 verify FFI contract. When unset,
+   *   native code currently pins depth 1. Setting `mtpDepth` explicitly
+   *   pins that value unless the caller also passes
+   *   `mtpAdaptiveDepth: true` to opt into adaptive depth with the
+   *   supplied maximum/seed.
+   * - **`mtpAdaptiveDepth`** — toggles the W6.8 adaptive depth policy.
+   *   Defaults to OFF. When ON, the default mode runs a 5-state machine
+   *   (`Explore` → `Full` → {`NeighborProbe` | `Reduced` → `Probe`})
+   *   with per-depth EMA tracking of
+   *   `accepted_tokens / cycle_wall_ns` and picks the depth that
+   *   maximizes that rate (DFlash-style, EMA decay α=0.3, drop-back
+   *   threshold 0.75). `MLX_MTP_ADAPTIVE_DEPTH_MODE=expected-value`
+   *   instead uses the MTPLX-style intra-cycle expected-value gate; by
+   *   default it stops at its base depth, with deeper expansion kept
+   *   research-only behind `MLX_MTP_EV_ALLOW_DEEPEN=1`.
+   *   An explicit `false` always wins, pinning the chosen `mtpDepth` for
+   *   every cycle. When `enableMtp` is false (or the model has no MTP
+   *   head) the field is ignored.
+   *
+   * The defaults for both `mtpDepth` and `mtpAdaptiveDepth` are
+   * applied on the native side (see
+   * `crates/mlx-core/src/models/qwen3_5/chat_common.rs` MTP runtime
+   * flag inventory), so omitting them from `defaultConfig` /
+   * `SendOptions.config` is the recommended path for callers that
+   * just want speculative decoding "on with sensible defaults".
+   */
+  hasMtpWeights?(): boolean;
 }
 
 /** Per-call options for {@link ChatSession#send} / `sendStream`. */
@@ -276,7 +332,12 @@ export interface SendOptions {
   /**
    * Per-call `ChatConfig` overlay applied on top of the session's
    * `defaultConfig`. `reuseCache` is always forced on regardless of
-   * what the caller passes.
+   * what the caller passes. The overlay is shallow-merged on top of
+   * the session default, so per-call values always win over per-session
+   * values for the same field — including the W6/W6.8 speculative-decode
+   * knobs `enableMtp`, `mtpDepth`, and `mtpAdaptiveDepth`. See
+   * {@link SessionCapableModel.hasMtpWeights} for the full MTP knob
+   * surface and default-resolution rules.
    */
   config?: ChatConfig;
   /**
@@ -309,7 +370,12 @@ export interface ChatSessionOptions {
   /**
    * Default `ChatConfig` applied to every `send()` / `sendStream()`
    * / `sendToolResult()` call. Per-call config is shallow-merged on
-   * top of this, and `reuseCache` is forced on.
+   * top of this, and `reuseCache` is forced on. Speculative-decode
+   * knobs (`enableMtp`, `mtpDepth`, `mtpAdaptiveDepth`) can be parked
+   * here as session-wide defaults and overridden per call via
+   * {@link SendOptions.config}; see
+   * {@link SessionCapableModel.hasMtpWeights} for the MTP knob surface
+   * and default-resolution rules.
    */
   defaultConfig?: ChatConfig;
 }
@@ -1016,13 +1082,28 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * The session path is a session-reuse operation by construction —
    * `reuseCache: false` on the continue path would wipe the very
    * cache the delta depends on.
+   *
+   * W7 (MTP) auto-default: if neither `defaultConfig` nor `overlay`
+   * sets `enableMtp` AND the underlying model exposes
+   * `hasMtpWeights()` returning `true`, set `enableMtp = true` so the
+   * W6 speculative-decode path runs out of the box on MTP-capable
+   * checkpoints. An explicit `false` from either source wins (the
+   * undefined-check below preserves it).
    */
   private mergeConfig(overlay: ChatConfig | undefined): ChatConfig {
-    return {
+    const merged: ChatConfig = {
       ...this.defaultConfig,
       ...overlay,
       reuseCache: true,
     };
+    if (
+      merged.enableMtp === undefined &&
+      typeof this.model.hasMtpWeights === 'function' &&
+      this.model.hasMtpWeights()
+    ) {
+      merged.enableMtp = true;
+    }
+    return merged;
   }
 
   /**

@@ -56,14 +56,26 @@ Quantization Arguments:
                         Recommended combo: --q-recipe unsloth --q-bits 4 --q-mxfp
                         promotes mlp.gate_proj/up_proj to mxfp4 (q/k/v at 6-bit
                         affine, down_proj at 5-bit affine, router gates at 8-bit
-                        affine, lm_head at 8-bit affine, out_proj stays bf16).
-                        At default --q-bits 3 only down_proj (4b -> mxfp4) gets
-                        the upgrade.
+                        affine, lm_head at 8-bit affine, o_proj/out_proj at
+                        8-bit affine). At default --q-bits 3 only down_proj
+                        (4b -> mxfp4) gets the upgrade.
   --q-recipe <string>   Per-layer mixed-bit quantization recipe
                         Options: mixed_2_6, mixed_3_4, mixed_3_6, mixed_4_6, qwen3_5, unsloth
                         "unsloth" defaults to 3-bit base (gate/up=3b, down=4b,
-                        embed=5b, lm_head=6b, attn q/k/v=5b+AWQ, out_proj=bf16)
+                        embed=5b, lm_head=6b, attn q/k/v=5b+AWQ,
+                        o_proj/out_proj/in_proj_a/in_proj_b=8b affine)
                         "unsloth" requires --imatrix-path for quality
+  --q-mtp <string>      Qwen MTP quantization policy: off (default), cyankiwi,
+                        all, or split (alias drafter).
+                        cyankiwi/all quantize MTP linears as 4-bit affine
+                        group_size=32: dense qwen3_5 into an MTPLX-style
+                        mtp.safetensors sidecar, MoE (qwen3_5_moe) inline in the
+                        main shards (no sidecar). cyankiwi keeps mtp.fc dense;
+                        all also quantizes mtp.fc.
+                        split/drafter emit a body checkpoint with NO mtp.*
+                        tensors plus a separate mtp-drafter/ directory in
+                        mlx-vlm's qwen3_5_mtp format (bf16 head). split does NOT
+                        require --quantize/--q-recipe.
   --imatrix-path <path> imatrix GGUF file for AWQ-style pre-scaling
                         Improves quantization quality using calibration data
                         Required for "unsloth" recipe
@@ -113,6 +125,7 @@ export async function run(argv: string[]) {
       'q-mode': { type: 'string' },
       'q-mxfp': { type: 'boolean', default: false },
       'q-recipe': { type: 'string' },
+      'q-mtp': { type: 'string' },
       'imatrix-path': { type: 'string' },
       mmproj: { type: 'string' },
       help: { type: 'boolean', short: 'h', default: false },
@@ -146,6 +159,7 @@ export async function run(argv: string[]) {
   const quantBits = parsePositiveInt('--q-bits', args['q-bits']);
   const quantGroupSize = parsePositiveInt('--q-group-size', args['q-group-size']);
   const quantMode = args['q-mode'];
+  const quantMtp = args['q-mtp'] ?? 'off';
 
   const validQuantModes = ['affine', 'mxfp4', 'mxfp8', 'nvfp4'];
   if (quantMode !== undefined && !validQuantModes.includes(quantMode)) {
@@ -153,6 +167,14 @@ export async function run(argv: string[]) {
     process.exit(1);
   }
 
+  const validQuantMtpPolicies = ['off', 'cyankiwi', 'all', 'split', 'drafter'];
+  if (!validQuantMtpPolicies.includes(quantMtp)) {
+    console.error(`Error: --q-mtp must be one of ${validQuantMtpPolicies.join(', ')}`);
+    process.exit(1);
+  }
+  // "split"/"drafter" emits a standalone bf16 drafter directory and does NOT
+  // require body quantization.
+  const isSplitMtp = quantMtp === 'split' || quantMtp === 'drafter';
   if (args['q-mxfp'] && !args.quantize) {
     console.error('Error: --q-mxfp requires --quantize');
     process.exit(1);
@@ -166,6 +188,11 @@ export async function run(argv: string[]) {
   }
 
   const quantRecipe = args['q-recipe'];
+  if (quantMtp !== 'off' && !isSplitMtp && (!args.quantize || quantRecipe === undefined)) {
+    console.error('Error: --q-mtp requires --quantize and --q-recipe');
+    process.exit(1);
+  }
+
   const validRecipes = ['mixed_2_6', 'mixed_3_4', 'mixed_3_6', 'mixed_4_6', 'qwen3_5', 'unsloth'];
   if (quantRecipe !== undefined) {
     if (!args.quantize) {
@@ -194,8 +221,9 @@ export async function run(argv: string[]) {
       process.exit(1);
     }
     // Unsloth recipe defaults to 3-bit base (MLP gate/up at 3-bit, down at 4-bit,
-    // embed_tokens at 5-bit, lm_head at 6-bit, attn q/k/v + SSM in_proj at 5-bit
-    // with AWQ pre-scaling via input_layernorm, out_proj/o_proj kept at bf16).
+    // embed_tokens at 5-bit, lm_head at 6-bit, attn q/k/v + SSM in_proj_qkv/z at
+    // 5-bit with AWQ pre-scaling via input_layernorm, o_proj/out_proj and split
+    // in_proj_a/in_proj_b at 8-bit affine for MTP/AR T=0 bit-exactness).
     // Based on Unsloth's per-tensor KLD analysis. Requires imatrix for AWQ correction
     // on the attention/SSM projections.
     if (quantRecipe === 'unsloth' && !args['q-bits'] && quantMode !== 'nvfp4') {
@@ -278,6 +306,10 @@ export async function run(argv: string[]) {
   if (inputPath.endsWith('.gguf')) {
     if (!existsSync(inputPath)) {
       console.error(`Error: GGUF file not found: ${inputPath}`);
+      process.exit(1);
+    }
+    if (quantMtp !== 'off') {
+      console.error('Error: --q-mtp is only supported for SafeTensors Qwen MTP conversion');
       process.exit(1);
     }
 
@@ -429,7 +461,7 @@ export async function run(argv: string[]) {
     const qGs = quantGroupSize || defaultGs;
     const qMxfpSuffix = args['q-mxfp'] ? ', --q-mxfp: 8b->mxfp8, 4b->mxfp4' : '';
     console.log(
-      `Quantize:   ${qBits}-bit ${qMode} (group_size=${qGs})${quantRecipe ? `, recipe=${quantRecipe}` : ''}${qMxfpSuffix}`,
+      `Quantize:   ${qBits}-bit ${qMode} (group_size=${qGs})${quantRecipe ? `, recipe=${quantRecipe}` : ''}${qMxfpSuffix}${quantMtp !== 'off' ? `, mtp=${quantMtp}` : ''}`,
     );
   }
   if (imatrixPath) {
@@ -450,6 +482,7 @@ export async function run(argv: string[]) {
       quantMode,
       quantMxfp: args['q-mxfp'],
       quantRecipe,
+      quantMtp,
       imatrixPath,
     });
 

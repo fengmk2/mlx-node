@@ -23,6 +23,7 @@ use crate::models::qwen3_5::vision::Qwen3_5VisionEncoder;
 use super::config::Qwen3_5MoeConfig;
 use super::decoder_layer::DecoderLayer;
 use super::layer_cache::Qwen3_5LayerCache;
+use super::mtp::Qwen3_5MoeMTPModule;
 use super::persistence;
 use super::quantized_linear::LinearProj;
 use crate::array::MxArray;
@@ -308,6 +309,21 @@ pub(crate) struct Qwen35MoeInner {
     /// full-attention layers — same semantics as the dense model.
     /// **Opt-in via `Qwen3_5MoeConfig::use_block_paged_cache`.**
     pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
+    /// Multi-Token Prediction head — `Some` when `config.n_mtp_layers > 0`
+    /// (the checkpoint shipped MTP weights), `None` otherwise. Owned by
+    /// the model thread; the speculative-decode loop (W6) reads it
+    /// directly. Weight loading happens after construction in
+    /// `apply_weights_moe_inner`.
+    pub(crate) mtp: Option<Qwen3_5MoeMTPModule>,
+    /// W7 (MTP): set `true` by `apply_weights_moe_inner` ONLY after the MTP
+    /// head's required weight set was found COMPLETE. Mirrors the dense
+    /// `Qwen35Inner::mtp_weights_loaded`. The module itself is constructed
+    /// purely from config (`n_mtp_layers > 0`), so `mtp.is_some()` alone does
+    /// NOT prove the head has real weights — a partial/incompatible drafter or
+    /// a truncated inline checkpoint would leave the module default-initialized.
+    /// `has_mtp_weights()` AND-gates on this flag so speculative decode never
+    /// runs against a half-loaded head.
+    pub(crate) mtp_weights_loaded: bool,
     /// Training state owned by the model thread.
     /// Created when `InitTraining` command is received, destroyed when training ends.
     pub(crate) training_state: Option<crate::training_state::ModelThreadTrainingState>,
@@ -769,12 +785,25 @@ impl Qwen35MoeInner {
             None
         };
 
+        // Multi-Token Prediction (MTP) head. Built when the config
+        // reports `n_mtp_layers > 0` (i.e. the checkpoint shipped MTP
+        // weights). The constructor rejects all-linear configs and zero
+        // layer counts; weights are loaded later by
+        // `apply_weights_moe_inner`. None when MTP is absent — keeps
+        // the decode path cost-free on non-MTP checkpoints.
+        let mtp = if config.n_mtp_layers > 0 {
+            Some(Qwen3_5MoeMTPModule::new(&config)?)
+        } else {
+            None
+        };
+
         info!(
-            "Qwen3.5 MoE inner created: {} layers, fa_idx={}, experts={}, paged={}",
+            "Qwen3.5 MoE inner created: {} layers, fa_idx={}, experts={}, paged={}, mtp_layers={}",
             config.num_layers,
             fa_idx,
             config.num_experts,
-            paged_adapter.is_some()
+            paged_adapter.is_some(),
+            config.n_mtp_layers
         );
 
         Ok(Self {
@@ -800,6 +829,8 @@ impl Qwen35MoeInner {
             gdn_prefix_checkpoints: VecDeque::new(),
             gdn_last_history_checkpoint: None,
             paged_adapter,
+            mtp,
+            mtp_weights_loaded: false,
             training_state: None,
         })
     }
@@ -1545,7 +1576,7 @@ impl Qwen35MoeInner {
             let _moe_guard = MoeResetGuard;
             use mlx_sys as sys;
             let prefill_len = seq_len as i32;
-            let max_kv_len = ((prefill_len + max_new_tokens + 255) / 256) * 256;
+            let max_kv_len = chat_common::kv_capacity_round_up(prefill_len, max_new_tokens)?;
             let num_layers = self.config.num_layers as usize;
             let mut cache_ptrs: Vec<*mut sys::mlx_array> =
                 vec![std::ptr::null_mut(); num_layers * 2];
@@ -1614,33 +1645,199 @@ impl Qwen35MoeInner {
 
             profiler.set_label("moe_chat_compiled");
 
-            let mut ops = chat_common::DecodeOps {
-                forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
-                    Ok((forward_moe_cpp(ids, emb)?, false))
-                },
-                eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
-                    eval_token_and_moe_caches(token);
-                    if budget_forced {
-                        logits.eval();
+            // W6 MoE (MTP) — opt-in speculative decode. Effective only
+            // when both the per-request flag and the model checkpoint
+            // carry an MTP head. The init mirrors the main MoE path's
+            // `mlx_qwen35_moe_init_from_prefill` and shares the C++
+            // `g_weights` store. Init failure (no MTP weights,
+            // mismatched config) silently disables MTP for this turn —
+            // the regular single-token loop continues to work. We
+            // already hold `MOE_COMPILED_MUTEX` + `COMPILED_WEIGHTS_RWLOCK`
+            // here so the entire draft+verify cycle is safely serialised
+            // against any other turn's main MoE forward.
+            let mtp_active = p.enable_mtp && self.has_mtp_weights() && {
+                match init_moe_mtp_compiled_from_main(&self.config, max_kv_len) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        warn!(
+                            "W6 MoE MTP init failed; falling back to single-token decode: {}",
+                            e.reason
+                        );
+                        false
                     }
-                },
+                }
             };
-            chat_common::decode_loop!(
-                ops: ops,
-                y: y,
-                embedding_weight: embedding_weight,
-                params: p,
-                reasoning_tracker: reasoning_tracker,
-                profiler: profiler,
-                max_new_tokens: max_new_tokens,
-                eos_id: eos_id,
-                generated_tokens: generated_tokens,
-                token_history: token_history,
-                finish_reason: finish_reason,
-                first_token_instant: first_token_instant,
-                report_perf: p.report_performance,
-                generation_stream: generation_stream
-            );
+            if mtp_active {
+                let mut rng = rand::rng();
+                let mut mtp_ops = chat_common::MtpOps {
+                    forward_with_hidden: |ids: &MxArray,
+                                          emb: &MxArray|
+                     -> Result<(MxArray, MxArray, bool)> {
+                        let (l, h) = forward_moe_compiled_with_hidden(ids, emb)?;
+                        Ok((l, h, false))
+                    },
+                    draft_step: |prev_hidden: &MxArray,
+                                 prev_emb: &MxArray|
+                     -> Result<(MxArray, MxArray)> {
+                        forward_moe_mtp_draft_compiled(prev_hidden, prev_emb)
+                    },
+                    verify_step: |ids: &MxArray,
+                                  emb: &MxArray,
+                                  depth: usize|
+                     -> Result<chat_common::MtpVerifyOutput> {
+                        // W6.5 — return (logits, verify-final hidden)
+                        // so the cycle macro can chain into the next
+                        // cycle's first MTP draft and skip Step A's
+                        // ~150 ms main-MoE forward.
+                        {
+                            let (logits, hiddens) = forward_moe_mtp_verify_compiled_with_hidden(
+                                ids,
+                                emb,
+                                depth as i32,
+                            )?;
+                            Ok(chat_common::MtpVerifyOutput::logits_only(logits, hiddens))
+                        }
+                    },
+                    verify_step_argmax_only: None,
+                    verify_step_sparse: None,
+                    rollback: |accepted_drafts: usize, depth: usize| unsafe {
+                        // MoE MTP path only. The main MoE path's offset
+                        // and GDN linear caches are restored via the
+                        // `snapshot_main_linear` / `restore_and_replay_main`
+                        // pair below (W6 Bug #4 fix). Calling
+                        // `mlx_qwen35_moe_adjust_offset(delta)` here
+                        // would double-rewind the main offset.
+                        //
+                        //   - MTP delta: drafts wrote `depth` K/V slots;
+                        //     we keep `accepted_drafts` → delta = K - depth.
+                        let delta = accepted_drafts as i32 - depth as i32;
+                        if delta != 0 {
+                            mlx_sys::mlx_qwen35_moe_mtp_compiled_adjust_offset(delta);
+                        }
+                    },
+                    eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
+                        eval_token_and_moe_caches(token);
+                        if budget_forced {
+                            logits.eval();
+                        }
+                    },
+                    // W6.5-resume — MoE twin: fold the chained
+                    // `verify_hidden[K]` slice into the same async_eval
+                    // dispatch as the post-cycle token + (optional) MoE
+                    // caches. See the dense site for the full rationale.
+                    eval_step_with_chained_hidden: |token: &MxArray, chained_hidden: &MxArray| {
+                        eval_token_moe_caches_and_chained_hidden(token, chained_hidden);
+                    },
+                    // W6 Bug #2 fix (Option Reset): reset MoE MTP K/V
+                    // and re-anchor MTP offset to the main MoE path's
+                    // current offset before each draft cycle. See the
+                    // dense site for the full rationale.
+                    begin_cycle: |_| unsafe {
+                        let old_mtp_offset = mlx_sys::mlx_qwen35_moe_mtp_get_offset();
+                        let main_offset = mlx_sys::mlx_qwen35_moe_get_cache_offset();
+                        mlx_sys::mlx_qwen35_moe_mtp_compiled_begin_cycle(main_offset);
+                        tracing::debug!(
+                            target: "mlx_core::mtp",
+                            old_mtp_offset,
+                            main_offset,
+                            new_mtp_offset = mlx_sys::mlx_qwen35_moe_mtp_get_offset(),
+                            "MTP begin_cycle: cache re-anchored to main offset"
+                        );
+                    },
+                    // W6 MoE Bug #4 fix — snapshot the main MoE path's
+                    // GDN linear caches + offset BEFORE the verify FFI
+                    // runs its D+1 sequential MoE forwards. Verify
+                    // mutates `g_moe_caches` in place; without restoring
+                    // on rejection the GDN recurrent state stays polluted
+                    // and the next Step A produces wrong logits.
+                    snapshot_main_linear: || unsafe {
+                        mlx_sys::mlx_qwen35_moe_compiled_snapshot_linear_caches();
+                    },
+                    // W6 MoE Bug #4 fix — on rejection: restore linear
+                    // caches + offset, then replay the K accepted drafts
+                    // via `forward_moe_compiled_with_hidden` so the main
+                    // MoE linear state matches the committed token
+                    // stream. Mirrors the dense-path closure.
+                    restore_and_replay_main: |accepted_drafts: &[u32],
+                                              emb: &MxArray|
+                     -> Result<()> {
+                        unsafe {
+                            mlx_sys::mlx_qwen35_moe_compiled_restore_linear_caches();
+                        }
+                        for &tok in accepted_drafts {
+                            let id_arr = MxArray::from_int32(&[tok as i32], &[1, 1])?;
+                            let (logits, _hidden) = forward_moe_compiled_with_hidden(&id_arr, emb)?;
+                            logits.eval();
+                        }
+                        Ok(())
+                    },
+                    // Phase C — committed-history is dense-only at this
+                    // task scope. The MoE path keeps the legacy
+                    // cycle-history policy (its C++ `begin_cycle` still
+                    // zeroes the MTP cache), so its commit hook is a
+                    // no-op.
+                    commit_mtp: |_anchor: chat_common::MtpCommitAnchor,
+                                 _seed_hidden: &MxArray,
+                                 _verify_hiddens: &MxArray,
+                                 _committed_ids: &[u32],
+                                 _k_accepted: usize,
+                                 _emb: &MxArray|
+                     -> Result<()> { Ok(()) },
+                    // Phase C — committed-history is dense-only; the
+                    // MoE path keeps the legacy cycle-history policy.
+                    committed_history_active: false,
+                    rollback_unemitted: |_: usize| {},
+                };
+                chat_common::decode_loop_mtp!(
+                    mtp_ops: mtp_ops,
+                    mtp_depth: p.mtp_depth,
+                    mtp_rng: rng,
+                    y: y,
+                    embedding_weight: embedding_weight,
+                    params: p,
+                    reasoning_tracker: reasoning_tracker,
+                    profiler: profiler,
+                    max_new_tokens: max_new_tokens,
+                    eos_id: eos_id,
+                    generated_tokens: generated_tokens,
+                    token_history: token_history,
+                    finish_reason: finish_reason,
+                    first_token_instant: first_token_instant,
+                    report_perf: p.report_performance,
+                    generation_stream: generation_stream
+                );
+                unsafe {
+                    mlx_sys::mlx_qwen35_moe_mtp_compiled_reset();
+                }
+            } else {
+                let mut ops = chat_common::DecodeOps {
+                    forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
+                        Ok((forward_moe_cpp(ids, emb)?, false))
+                    },
+                    eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
+                        eval_token_and_moe_caches(token);
+                        if budget_forced {
+                            logits.eval();
+                        }
+                    },
+                };
+                chat_common::decode_loop!(
+                    ops: ops,
+                    y: y,
+                    embedding_weight: embedding_weight,
+                    params: p,
+                    reasoning_tracker: reasoning_tracker,
+                    profiler: profiler,
+                    max_new_tokens: max_new_tokens,
+                    eos_id: eos_id,
+                    generated_tokens: generated_tokens,
+                    token_history: token_history,
+                    finish_reason: finish_reason,
+                    first_token_instant: first_token_instant,
+                    report_perf: p.report_performance,
+                    generation_stream: generation_stream
+                );
+            }
 
             // Export caches from C++ before MoeResetGuard drops
             if reuse_cache {
@@ -1740,7 +1937,11 @@ impl Qwen35MoeInner {
             first_token_instant,
             prefill_tokens.len(),
             generated_tokens.len(),
-        );
+        )
+        .map(|mut m| {
+            profiler.fill_mtp_acceptance(&mut m);
+            m
+        });
 
         let mut result = finalize_chat_result(
             &tokenizer,
@@ -2196,7 +2397,8 @@ impl Qwen35MoeInner {
         let mut cpp_compiled_step_completed = false;
 
         let max_new_tokens = p.max_new_tokens;
-        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens.max(0) as usize);
+        let mut generated_tokens: Vec<u32> =
+            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens));
         let mut finish_reason = String::from("length");
 
         // Compile-cached `max_blocks_per_seq` shape — picking the
@@ -2351,7 +2553,7 @@ impl Qwen35MoeInner {
             };
 
             let next_logits = if reasoning_tracker.should_force_think_end() {
-                let forced_id = reasoning_tracker.forced_token_id() as i32;
+                let forced_id = reasoning_tracker.forced_token_id()? as i32;
                 y = MxArray::from_int32(&[forced_id], &[1])?;
                 y.eval();
                 continue;
@@ -2919,7 +3121,8 @@ impl Qwen35MoeInner {
         let mut cpp_compiled_step_completed = false;
 
         let max_new_tokens = p.max_new_tokens;
-        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens.max(0) as usize);
+        let mut generated_tokens: Vec<u32> =
+            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens));
         let mut finish_reason = String::from("length");
         let decode_trace_start = trace_enabled.then(std::time::Instant::now);
         let decode_progress_interval = if trace_enabled {
@@ -3126,7 +3329,7 @@ impl Qwen35MoeInner {
             };
 
             let next_logits = if reasoning_tracker.should_force_think_end() {
-                let forced_id = reasoning_tracker.forced_token_id() as i32;
+                let forced_id = reasoning_tracker.forced_token_id()? as i32;
                 y = MxArray::from_int32(&[forced_id], &[1])?;
                 y.eval();
                 continue;
@@ -3557,7 +3760,7 @@ impl Qwen35MoeInner {
             let _moe_guard = MoeResetGuard;
             use mlx_sys as sys;
             let prefill_len = seq_len as i32;
-            let max_kv_len = ((prefill_len + p.max_new_tokens + 255) / 256) * 256;
+            let max_kv_len = chat_common::kv_capacity_round_up(prefill_len, p.max_new_tokens)?;
             let num_layers = self.config.num_layers as usize;
             let mut cache_ptrs: Vec<*mut sys::mlx_array> =
                 vec![std::ptr::null_mut(); num_layers * 2];
@@ -3624,41 +3827,203 @@ impl Qwen35MoeInner {
 
             profiler.set_label("moe_chat_stream_compiled");
 
-            let mut ops = chat_common::DecodeOps {
-                forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
-                    Ok((forward_moe_cpp(ids, emb)?, false))
-                },
-                eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
-                    eval_token_and_moe_caches(token);
-                    if budget_forced {
-                        logits.eval();
+            // W6 MoE (MTP) — opt-in speculative decode. See sync sibling
+            // for rationale. We already hold MOE_COMPILED_MUTEX +
+            // COMPILED_WEIGHTS_RWLOCK.
+            let mtp_active = p.enable_mtp && self.has_mtp_weights() && {
+                match init_moe_mtp_compiled_from_main(&self.config, max_kv_len) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        warn!(
+                            "W6 MoE MTP init failed; falling back to single-token decode: {}",
+                            e.reason
+                        );
+                        false
                     }
-                },
-            };
-            chat_common::decode_loop!(
-                ops: ops,
-                y: y,
-                embedding_weight: embedding_weight,
-                params: p,
-                reasoning_tracker: reasoning_tracker,
-                profiler: profiler,
-                max_new_tokens: p.max_new_tokens,
-                eos_id: eos_id,
-                generated_tokens: generated_tokens,
-                token_history: token_history,
-                finish_reason: finish_reason,
-                first_token_instant: first_token_instant,
-                report_perf: p.report_performance,
-                generation_stream: generation_stream,
-                streaming: {
-                    callback: cb,
-                    cancelled: cancelled,
-                    decode_stream: decode_stream,
-                    tokenizer: tokenizer_for_decode,
-                    streamed_text_len: streamed_text_len,
-                    last_is_reasoning: last_is_reasoning
                 }
-            );
+            };
+            if mtp_active {
+                let mut rng = rand::rng();
+                let mut mtp_ops = chat_common::MtpOps {
+                    forward_with_hidden: |ids: &MxArray,
+                                          emb: &MxArray|
+                     -> Result<(MxArray, MxArray, bool)> {
+                        let (l, h) = forward_moe_compiled_with_hidden(ids, emb)?;
+                        Ok((l, h, false))
+                    },
+                    draft_step: |prev_hidden: &MxArray,
+                                 prev_emb: &MxArray|
+                     -> Result<(MxArray, MxArray)> {
+                        forward_moe_mtp_draft_compiled(prev_hidden, prev_emb)
+                    },
+                    verify_step: |ids: &MxArray,
+                                  emb: &MxArray,
+                                  depth: usize|
+                     -> Result<chat_common::MtpVerifyOutput> {
+                        // W6.5 — return (logits, verify-final hidden)
+                        // so the cycle macro can chain into the next
+                        // cycle's first MTP draft and skip Step A's
+                        // ~150 ms main-MoE forward.
+                        {
+                            let (logits, hiddens) = forward_moe_mtp_verify_compiled_with_hidden(
+                                ids,
+                                emb,
+                                depth as i32,
+                            )?;
+                            Ok(chat_common::MtpVerifyOutput::logits_only(logits, hiddens))
+                        }
+                    },
+                    verify_step_argmax_only: None,
+                    verify_step_sparse: None,
+                    rollback: |accepted_drafts: usize, depth: usize| unsafe {
+                        // MoE MTP path only — main offset/linear restored
+                        // via `restore_and_replay_main`. See the first
+                        // MoE dispatch site (chat_sync_core_compiled_inner)
+                        // for the full W6 Bug #4 rationale.
+                        let delta = accepted_drafts as i32 - depth as i32;
+                        if delta != 0 {
+                            mlx_sys::mlx_qwen35_moe_mtp_compiled_adjust_offset(delta);
+                        }
+                    },
+                    eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
+                        eval_token_and_moe_caches(token);
+                        if budget_forced {
+                            logits.eval();
+                        }
+                    },
+                    // W6.5-resume — MoE twin: fold the chained
+                    // `verify_hidden[K]` slice into the same async_eval
+                    // dispatch as the post-cycle token + (optional) MoE
+                    // caches. See the dense site for the full rationale.
+                    eval_step_with_chained_hidden: |token: &MxArray, chained_hidden: &MxArray| {
+                        eval_token_moe_caches_and_chained_hidden(token, chained_hidden);
+                    },
+                    // W6 Bug #2 fix (Option Reset): reset MoE MTP K/V
+                    // and re-anchor MTP offset to the main MoE path's
+                    // current offset before each draft cycle. See the
+                    // dense site for the full rationale.
+                    begin_cycle: |_| unsafe {
+                        let old_mtp_offset = mlx_sys::mlx_qwen35_moe_mtp_get_offset();
+                        let main_offset = mlx_sys::mlx_qwen35_moe_get_cache_offset();
+                        mlx_sys::mlx_qwen35_moe_mtp_compiled_begin_cycle(main_offset);
+                        tracing::debug!(
+                            target: "mlx_core::mtp",
+                            old_mtp_offset,
+                            main_offset,
+                            new_mtp_offset = mlx_sys::mlx_qwen35_moe_mtp_get_offset(),
+                            "MTP begin_cycle: cache re-anchored to main offset"
+                        );
+                    },
+                    // W6 MoE Bug #4 fix — snapshot the main MoE path's
+                    // GDN linear caches + offset BEFORE the verify FFI
+                    // runs its D+1 sequential MoE forwards. Verify
+                    // mutates `g_moe_caches` in place; without restoring
+                    // on rejection the GDN recurrent state stays polluted
+                    // and the next Step A produces wrong logits.
+                    snapshot_main_linear: || unsafe {
+                        mlx_sys::mlx_qwen35_moe_compiled_snapshot_linear_caches();
+                    },
+                    // W6 MoE Bug #4 fix — on rejection: restore linear
+                    // caches + offset, then replay the K accepted drafts
+                    // via `forward_moe_compiled_with_hidden` so the main
+                    // MoE linear state matches the committed token
+                    // stream. Mirrors the dense-path closure.
+                    restore_and_replay_main: |accepted_drafts: &[u32],
+                                              emb: &MxArray|
+                     -> Result<()> {
+                        unsafe {
+                            mlx_sys::mlx_qwen35_moe_compiled_restore_linear_caches();
+                        }
+                        for &tok in accepted_drafts {
+                            let id_arr = MxArray::from_int32(&[tok as i32], &[1, 1])?;
+                            let (logits, _hidden) = forward_moe_compiled_with_hidden(&id_arr, emb)?;
+                            logits.eval();
+                        }
+                        Ok(())
+                    },
+                    // Phase C — committed-history is dense-only at this
+                    // task scope. The MoE path keeps the legacy
+                    // cycle-history policy (its C++ `begin_cycle` still
+                    // zeroes the MTP cache), so its commit hook is a
+                    // no-op.
+                    commit_mtp: |_anchor: chat_common::MtpCommitAnchor,
+                                 _seed_hidden: &MxArray,
+                                 _verify_hiddens: &MxArray,
+                                 _committed_ids: &[u32],
+                                 _k_accepted: usize,
+                                 _emb: &MxArray|
+                     -> Result<()> { Ok(()) },
+                    // Phase C — committed-history is dense-only; the
+                    // MoE path keeps the legacy cycle-history policy.
+                    committed_history_active: false,
+                    rollback_unemitted: |_: usize| {},
+                };
+                chat_common::decode_loop_mtp!(
+                    mtp_ops: mtp_ops,
+                    mtp_depth: p.mtp_depth,
+                    mtp_rng: rng,
+                    y: y,
+                    embedding_weight: embedding_weight,
+                    params: p,
+                    reasoning_tracker: reasoning_tracker,
+                    profiler: profiler,
+                    max_new_tokens: p.max_new_tokens,
+                    eos_id: eos_id,
+                    generated_tokens: generated_tokens,
+                    token_history: token_history,
+                    finish_reason: finish_reason,
+                    first_token_instant: first_token_instant,
+                    report_perf: p.report_performance,
+                    generation_stream: generation_stream,
+                    streaming: {
+                        callback: cb,
+                        cancelled: cancelled,
+                        decode_stream: decode_stream,
+                        tokenizer: tokenizer_for_decode,
+                        streamed_text_len: streamed_text_len,
+                        last_is_reasoning: last_is_reasoning
+                    }
+                );
+                unsafe {
+                    mlx_sys::mlx_qwen35_moe_mtp_compiled_reset();
+                }
+            } else {
+                let mut ops = chat_common::DecodeOps {
+                    forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
+                        Ok((forward_moe_cpp(ids, emb)?, false))
+                    },
+                    eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
+                        eval_token_and_moe_caches(token);
+                        if budget_forced {
+                            logits.eval();
+                        }
+                    },
+                };
+                chat_common::decode_loop!(
+                    ops: ops,
+                    y: y,
+                    embedding_weight: embedding_weight,
+                    params: p,
+                    reasoning_tracker: reasoning_tracker,
+                    profiler: profiler,
+                    max_new_tokens: p.max_new_tokens,
+                    eos_id: eos_id,
+                    generated_tokens: generated_tokens,
+                    token_history: token_history,
+                    finish_reason: finish_reason,
+                    first_token_instant: first_token_instant,
+                    report_perf: p.report_performance,
+                    generation_stream: generation_stream,
+                    streaming: {
+                        callback: cb,
+                        cancelled: cancelled,
+                        decode_stream: decode_stream,
+                        tokenizer: tokenizer_for_decode,
+                        streamed_text_len: streamed_text_len,
+                        last_is_reasoning: last_is_reasoning
+                    }
+                );
+            }
 
             // Export caches from C++ before MoeResetGuard drops
             if reuse_cache {
@@ -3815,7 +4180,11 @@ impl Qwen35MoeInner {
             first_token_instant,
             prefill_tokens.len(),
             generated_tokens.len(),
-        );
+        )
+        .map(|mut m| {
+            profiler.fill_mtp_acceptance(&mut m);
+            m
+        });
 
         // Send final done chunk
         cb.call(
@@ -4092,7 +4461,7 @@ impl Qwen35MoeInner {
             let _moe_guard = MoeResetGuard;
             use mlx_sys as sys;
             let prefill_len = seq_len as i32;
-            let max_kv_len = ((prefill_len + max_new_tokens + 255) / 256) * 256;
+            let max_kv_len = chat_common::kv_capacity_round_up(prefill_len, max_new_tokens)?;
             let num_layers = self.config.num_layers as usize;
             let mut cache_ptrs: Vec<*mut sys::mlx_array> =
                 vec![std::ptr::null_mut(); num_layers * 2];
@@ -4164,33 +4533,186 @@ impl Qwen35MoeInner {
 
             profiler.set_label("moe_chat_delta_compiled");
 
-            let mut ops = chat_common::DecodeOps {
-                forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
-                    Ok((forward_moe_cpp(ids, emb)?, false))
-                },
-                eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
-                    eval_token_and_moe_caches(token);
-                    if budget_forced {
-                        logits.eval();
+            // W6 MoE (MTP) — opt-in speculative decode. See the chat
+            // sync site for full rationale.
+            let mtp_active = p.enable_mtp && self.has_mtp_weights() && {
+                match init_moe_mtp_compiled_from_main(&self.config, max_kv_len) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        warn!(
+                            "W6 MoE MTP init failed; falling back to single-token decode: {}",
+                            e.reason
+                        );
+                        false
                     }
-                },
+                }
             };
-            chat_common::decode_loop!(
-                ops: ops,
-                y: y,
-                embedding_weight: embedding_weight,
-                params: p,
-                reasoning_tracker: reasoning_tracker,
-                profiler: profiler,
-                max_new_tokens: max_new_tokens,
-                eos_id: eos_id,
-                generated_tokens: generated_tokens,
-                token_history: token_history,
-                finish_reason: finish_reason,
-                first_token_instant: first_token_instant,
-                report_perf: p.report_performance,
-                generation_stream: generation_stream
-            );
+            if mtp_active {
+                let mut rng = rand::rng();
+                let mut mtp_ops = chat_common::MtpOps {
+                    forward_with_hidden: |ids: &MxArray,
+                                          emb: &MxArray|
+                     -> Result<(MxArray, MxArray, bool)> {
+                        let (l, h) = forward_moe_compiled_with_hidden(ids, emb)?;
+                        Ok((l, h, false))
+                    },
+                    draft_step: |prev_hidden: &MxArray,
+                                 prev_emb: &MxArray|
+                     -> Result<(MxArray, MxArray)> {
+                        forward_moe_mtp_draft_compiled(prev_hidden, prev_emb)
+                    },
+                    verify_step: |ids: &MxArray,
+                                  emb: &MxArray,
+                                  depth: usize|
+                     -> Result<chat_common::MtpVerifyOutput> {
+                        // W6.5 — return (logits, verify-final hidden)
+                        // so the cycle macro can chain into the next
+                        // cycle's first MTP draft and skip Step A's
+                        // ~150 ms main-MoE forward.
+                        {
+                            let (logits, hiddens) = forward_moe_mtp_verify_compiled_with_hidden(
+                                ids,
+                                emb,
+                                depth as i32,
+                            )?;
+                            Ok(chat_common::MtpVerifyOutput::logits_only(logits, hiddens))
+                        }
+                    },
+                    verify_step_argmax_only: None,
+                    verify_step_sparse: None,
+                    rollback: |accepted_drafts: usize, depth: usize| unsafe {
+                        // MoE MTP path only — main offset/linear restored
+                        // via `restore_and_replay_main`. See the first
+                        // MoE dispatch site (chat_sync_core_compiled_inner)
+                        // for the full W6 Bug #4 rationale.
+                        let delta = accepted_drafts as i32 - depth as i32;
+                        if delta != 0 {
+                            mlx_sys::mlx_qwen35_moe_mtp_compiled_adjust_offset(delta);
+                        }
+                    },
+                    eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
+                        eval_token_and_moe_caches(token);
+                        if budget_forced {
+                            logits.eval();
+                        }
+                    },
+                    // W6.5-resume — MoE twin: fold the chained
+                    // `verify_hidden[K]` slice into the same async_eval
+                    // dispatch as the post-cycle token + (optional) MoE
+                    // caches. See the dense site for the full rationale.
+                    eval_step_with_chained_hidden: |token: &MxArray, chained_hidden: &MxArray| {
+                        eval_token_moe_caches_and_chained_hidden(token, chained_hidden);
+                    },
+                    // W6 Bug #2 fix (Option Reset): reset MoE MTP K/V
+                    // and re-anchor MTP offset to the main MoE path's
+                    // current offset before each draft cycle. See the
+                    // dense site for the full rationale.
+                    begin_cycle: |_| unsafe {
+                        let old_mtp_offset = mlx_sys::mlx_qwen35_moe_mtp_get_offset();
+                        let main_offset = mlx_sys::mlx_qwen35_moe_get_cache_offset();
+                        mlx_sys::mlx_qwen35_moe_mtp_compiled_begin_cycle(main_offset);
+                        tracing::debug!(
+                            target: "mlx_core::mtp",
+                            old_mtp_offset,
+                            main_offset,
+                            new_mtp_offset = mlx_sys::mlx_qwen35_moe_mtp_get_offset(),
+                            "MTP begin_cycle: cache re-anchored to main offset"
+                        );
+                    },
+                    // W6 MoE Bug #4 fix — snapshot the main MoE path's
+                    // GDN linear caches + offset BEFORE the verify FFI
+                    // runs its D+1 sequential MoE forwards. Verify
+                    // mutates `g_moe_caches` in place; without restoring
+                    // on rejection the GDN recurrent state stays polluted
+                    // and the next Step A produces wrong logits.
+                    snapshot_main_linear: || unsafe {
+                        mlx_sys::mlx_qwen35_moe_compiled_snapshot_linear_caches();
+                    },
+                    // W6 MoE Bug #4 fix — on rejection: restore linear
+                    // caches + offset, then replay the K accepted drafts
+                    // via `forward_moe_compiled_with_hidden` so the main
+                    // MoE linear state matches the committed token
+                    // stream. Mirrors the dense-path closure.
+                    restore_and_replay_main: |accepted_drafts: &[u32],
+                                              emb: &MxArray|
+                     -> Result<()> {
+                        unsafe {
+                            mlx_sys::mlx_qwen35_moe_compiled_restore_linear_caches();
+                        }
+                        for &tok in accepted_drafts {
+                            let id_arr = MxArray::from_int32(&[tok as i32], &[1, 1])?;
+                            let (logits, _hidden) = forward_moe_compiled_with_hidden(&id_arr, emb)?;
+                            logits.eval();
+                        }
+                        Ok(())
+                    },
+                    // Phase C — committed-history is dense-only at this
+                    // task scope. The MoE path keeps the legacy
+                    // cycle-history policy (its C++ `begin_cycle` still
+                    // zeroes the MTP cache), so its commit hook is a
+                    // no-op.
+                    commit_mtp: |_anchor: chat_common::MtpCommitAnchor,
+                                 _seed_hidden: &MxArray,
+                                 _verify_hiddens: &MxArray,
+                                 _committed_ids: &[u32],
+                                 _k_accepted: usize,
+                                 _emb: &MxArray|
+                     -> Result<()> { Ok(()) },
+                    // Phase C — committed-history is dense-only; the
+                    // MoE path keeps the legacy cycle-history policy.
+                    committed_history_active: false,
+                    rollback_unemitted: |_: usize| {},
+                };
+                chat_common::decode_loop_mtp!(
+                    mtp_ops: mtp_ops,
+                    mtp_depth: p.mtp_depth,
+                    mtp_rng: rng,
+                    y: y,
+                    embedding_weight: embedding_weight,
+                    params: p,
+                    reasoning_tracker: reasoning_tracker,
+                    profiler: profiler,
+                    max_new_tokens: max_new_tokens,
+                    eos_id: eos_id,
+                    generated_tokens: generated_tokens,
+                    token_history: token_history,
+                    finish_reason: finish_reason,
+                    first_token_instant: first_token_instant,
+                    report_perf: p.report_performance,
+                    generation_stream: generation_stream
+                );
+                unsafe {
+                    mlx_sys::mlx_qwen35_moe_mtp_compiled_reset();
+                }
+            } else {
+                let mut ops = chat_common::DecodeOps {
+                    forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
+                        Ok((forward_moe_cpp(ids, emb)?, false))
+                    },
+                    eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
+                        eval_token_and_moe_caches(token);
+                        if budget_forced {
+                            logits.eval();
+                        }
+                    },
+                };
+                chat_common::decode_loop!(
+                    ops: ops,
+                    y: y,
+                    embedding_weight: embedding_weight,
+                    params: p,
+                    reasoning_tracker: reasoning_tracker,
+                    profiler: profiler,
+                    max_new_tokens: max_new_tokens,
+                    eos_id: eos_id,
+                    generated_tokens: generated_tokens,
+                    token_history: token_history,
+                    finish_reason: finish_reason,
+                    first_token_instant: first_token_instant,
+                    report_perf: p.report_performance,
+                    generation_stream: generation_stream
+                );
+            }
 
             // Export caches from C++ before MoeResetGuard drops
             if p.reuse_cache {
@@ -4287,7 +4809,11 @@ impl Qwen35MoeInner {
             first_token_instant,
             delta_tokens.len(),
             generated_tokens.len(),
-        );
+        )
+        .map(|mut m| {
+            profiler.fill_mtp_acceptance(&mut m);
+            m
+        });
 
         let _final_sampled_token = y;
 
@@ -4764,7 +5290,7 @@ impl Qwen35MoeInner {
             let _moe_guard = MoeResetGuard;
             use mlx_sys as sys;
             let prefill_len = seq_len as i32;
-            let max_kv_len = ((prefill_len + p.max_new_tokens + 255) / 256) * 256;
+            let max_kv_len = chat_common::kv_capacity_round_up(prefill_len, p.max_new_tokens)?;
             let num_layers = self.config.num_layers as usize;
             let mut cache_ptrs: Vec<*mut sys::mlx_array> =
                 vec![std::ptr::null_mut(); num_layers * 2];
@@ -4834,41 +5360,202 @@ impl Qwen35MoeInner {
 
             profiler.set_label("moe_chat_stream_delta_compiled");
 
-            let mut ops = chat_common::DecodeOps {
-                forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
-                    Ok((forward_moe_cpp(ids, emb)?, false))
-                },
-                eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
-                    eval_token_and_moe_caches(token);
-                    if budget_forced {
-                        logits.eval();
+            // W6 MoE (MTP) — opt-in speculative decode. See the chat
+            // sync site for full rationale.
+            let mtp_active = p.enable_mtp && self.has_mtp_weights() && {
+                match init_moe_mtp_compiled_from_main(&self.config, max_kv_len) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        warn!(
+                            "W6 MoE MTP init failed; falling back to single-token decode: {}",
+                            e.reason
+                        );
+                        false
                     }
-                },
-            };
-            chat_common::decode_loop!(
-                ops: ops,
-                y: y,
-                embedding_weight: embedding_weight,
-                params: p,
-                reasoning_tracker: reasoning_tracker,
-                profiler: profiler,
-                max_new_tokens: p.max_new_tokens,
-                eos_id: eos_id,
-                generated_tokens: generated_tokens,
-                token_history: token_history,
-                finish_reason: finish_reason,
-                first_token_instant: first_token_instant,
-                report_perf: p.report_performance,
-                generation_stream: generation_stream,
-                streaming: {
-                    callback: cb,
-                    cancelled: cancelled,
-                    decode_stream: decode_stream,
-                    tokenizer: tokenizer_for_decode,
-                    streamed_text_len: streamed_text_len,
-                    last_is_reasoning: last_is_reasoning
                 }
-            );
+            };
+            if mtp_active {
+                let mut rng = rand::rng();
+                let mut mtp_ops = chat_common::MtpOps {
+                    forward_with_hidden: |ids: &MxArray,
+                                          emb: &MxArray|
+                     -> Result<(MxArray, MxArray, bool)> {
+                        let (l, h) = forward_moe_compiled_with_hidden(ids, emb)?;
+                        Ok((l, h, false))
+                    },
+                    draft_step: |prev_hidden: &MxArray,
+                                 prev_emb: &MxArray|
+                     -> Result<(MxArray, MxArray)> {
+                        forward_moe_mtp_draft_compiled(prev_hidden, prev_emb)
+                    },
+                    verify_step: |ids: &MxArray,
+                                  emb: &MxArray,
+                                  depth: usize|
+                     -> Result<chat_common::MtpVerifyOutput> {
+                        // W6.5 — return (logits, verify-final hidden)
+                        // so the cycle macro can chain into the next
+                        // cycle's first MTP draft and skip Step A's
+                        // ~150 ms main-MoE forward.
+                        {
+                            let (logits, hiddens) = forward_moe_mtp_verify_compiled_with_hidden(
+                                ids,
+                                emb,
+                                depth as i32,
+                            )?;
+                            Ok(chat_common::MtpVerifyOutput::logits_only(logits, hiddens))
+                        }
+                    },
+                    verify_step_argmax_only: None,
+                    verify_step_sparse: None,
+                    rollback: |accepted_drafts: usize, depth: usize| unsafe {
+                        // MoE MTP path only — main offset/linear restored
+                        // via `restore_and_replay_main`. See the first
+                        // MoE dispatch site (chat_sync_core_compiled_inner)
+                        // for the full W6 Bug #4 rationale.
+                        let delta = accepted_drafts as i32 - depth as i32;
+                        if delta != 0 {
+                            mlx_sys::mlx_qwen35_moe_mtp_compiled_adjust_offset(delta);
+                        }
+                    },
+                    eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
+                        eval_token_and_moe_caches(token);
+                        if budget_forced {
+                            logits.eval();
+                        }
+                    },
+                    // W6.5-resume — MoE twin: fold the chained
+                    // `verify_hidden[K]` slice into the same async_eval
+                    // dispatch as the post-cycle token + (optional) MoE
+                    // caches. See the dense site for the full rationale.
+                    eval_step_with_chained_hidden: |token: &MxArray, chained_hidden: &MxArray| {
+                        eval_token_moe_caches_and_chained_hidden(token, chained_hidden);
+                    },
+                    // W6 Bug #2 fix (Option Reset): reset MoE MTP K/V
+                    // and re-anchor MTP offset to the main MoE path's
+                    // current offset before each draft cycle. See the
+                    // dense site for the full rationale.
+                    begin_cycle: |_| unsafe {
+                        let old_mtp_offset = mlx_sys::mlx_qwen35_moe_mtp_get_offset();
+                        let main_offset = mlx_sys::mlx_qwen35_moe_get_cache_offset();
+                        mlx_sys::mlx_qwen35_moe_mtp_compiled_begin_cycle(main_offset);
+                        tracing::debug!(
+                            target: "mlx_core::mtp",
+                            old_mtp_offset,
+                            main_offset,
+                            new_mtp_offset = mlx_sys::mlx_qwen35_moe_mtp_get_offset(),
+                            "MTP begin_cycle: cache re-anchored to main offset"
+                        );
+                    },
+                    // W6 MoE Bug #4 fix — snapshot the main MoE path's
+                    // GDN linear caches + offset BEFORE the verify FFI
+                    // runs its D+1 sequential MoE forwards. Verify
+                    // mutates `g_moe_caches` in place; without restoring
+                    // on rejection the GDN recurrent state stays polluted
+                    // and the next Step A produces wrong logits.
+                    snapshot_main_linear: || unsafe {
+                        mlx_sys::mlx_qwen35_moe_compiled_snapshot_linear_caches();
+                    },
+                    // W6 MoE Bug #4 fix — on rejection: restore linear
+                    // caches + offset, then replay the K accepted drafts
+                    // via `forward_moe_compiled_with_hidden` so the main
+                    // MoE linear state matches the committed token
+                    // stream. Mirrors the dense-path closure.
+                    restore_and_replay_main: |accepted_drafts: &[u32],
+                                              emb: &MxArray|
+                     -> Result<()> {
+                        unsafe {
+                            mlx_sys::mlx_qwen35_moe_compiled_restore_linear_caches();
+                        }
+                        for &tok in accepted_drafts {
+                            let id_arr = MxArray::from_int32(&[tok as i32], &[1, 1])?;
+                            let (logits, _hidden) = forward_moe_compiled_with_hidden(&id_arr, emb)?;
+                            logits.eval();
+                        }
+                        Ok(())
+                    },
+                    // Phase C — committed-history is dense-only at this
+                    // task scope. The MoE path keeps the legacy
+                    // cycle-history policy (its C++ `begin_cycle` still
+                    // zeroes the MTP cache), so its commit hook is a
+                    // no-op.
+                    commit_mtp: |_anchor: chat_common::MtpCommitAnchor,
+                                 _seed_hidden: &MxArray,
+                                 _verify_hiddens: &MxArray,
+                                 _committed_ids: &[u32],
+                                 _k_accepted: usize,
+                                 _emb: &MxArray|
+                     -> Result<()> { Ok(()) },
+                    // Phase C — committed-history is dense-only; the
+                    // MoE path keeps the legacy cycle-history policy.
+                    committed_history_active: false,
+                    rollback_unemitted: |_: usize| {},
+                };
+                chat_common::decode_loop_mtp!(
+                    mtp_ops: mtp_ops,
+                    mtp_depth: p.mtp_depth,
+                    mtp_rng: rng,
+                    y: y,
+                    embedding_weight: embedding_weight,
+                    params: p,
+                    reasoning_tracker: reasoning_tracker,
+                    profiler: profiler,
+                    max_new_tokens: p.max_new_tokens,
+                    eos_id: eos_id,
+                    generated_tokens: generated_tokens,
+                    token_history: token_history,
+                    finish_reason: finish_reason,
+                    first_token_instant: first_token_instant,
+                    report_perf: p.report_performance,
+                    generation_stream: generation_stream,
+                    streaming: {
+                        callback: cb,
+                        cancelled: cancelled,
+                        decode_stream: decode_stream,
+                        tokenizer: tokenizer_for_decode,
+                        streamed_text_len: streamed_text_len,
+                        last_is_reasoning: last_is_reasoning
+                    }
+                );
+                unsafe {
+                    mlx_sys::mlx_qwen35_moe_mtp_compiled_reset();
+                }
+            } else {
+                let mut ops = chat_common::DecodeOps {
+                    forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
+                        Ok((forward_moe_cpp(ids, emb)?, false))
+                    },
+                    eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
+                        eval_token_and_moe_caches(token);
+                        if budget_forced {
+                            logits.eval();
+                        }
+                    },
+                };
+                chat_common::decode_loop!(
+                    ops: ops,
+                    y: y,
+                    embedding_weight: embedding_weight,
+                    params: p,
+                    reasoning_tracker: reasoning_tracker,
+                    profiler: profiler,
+                    max_new_tokens: p.max_new_tokens,
+                    eos_id: eos_id,
+                    generated_tokens: generated_tokens,
+                    token_history: token_history,
+                    finish_reason: finish_reason,
+                    first_token_instant: first_token_instant,
+                    report_perf: p.report_performance,
+                    generation_stream: generation_stream,
+                    streaming: {
+                        callback: cb,
+                        cancelled: cancelled,
+                        decode_stream: decode_stream,
+                        tokenizer: tokenizer_for_decode,
+                        streamed_text_len: streamed_text_len,
+                        last_is_reasoning: last_is_reasoning
+                    }
+                );
+            }
 
             // Export caches from C++ before MoeResetGuard drops
             if reuse_cache {
@@ -5021,7 +5708,11 @@ impl Qwen35MoeInner {
             first_token_instant,
             delta_tokens.len(),
             generated_tokens.len(),
-        );
+        )
+        .map(|mut m| {
+            profiler.fill_mtp_acceptance(&mut m);
+            m
+        });
 
         cb.call(
             Ok(ChatStreamChunk {
@@ -5315,6 +6006,33 @@ impl Qwen35MoeInner {
             params.extend(vision_params);
         }
 
+        // Multi-Token Prediction head. `config.n_mtp_layers` round-trips
+        // through config.json, so a reloaded checkpoint reconstructs the MTP
+        // module from config and expects the `mtp.*` tensors present —
+        // without this block the loader finds them absent, sets
+        // `mtp_weights_loaded = false`, and silently disables speculative
+        // decode. The `mtp_weights_loaded` guard is essential: `mtp.is_some()`
+        // alone would serialize a random-init module (constructed from config
+        // even when no weights were loaded).
+        if self.mtp_weights_loaded
+            && let Some(ref mtp) = self.mtp
+        {
+            // `save_model_sync` is dense/bf16-only. A quantized MTP head's
+            // dense slot is not a faithful bf16 copy of the quantized payload
+            // (packed uint32 for the per-layer linears, a lossy dequant for
+            // `fc`) — emitting it would masquerade as a valid bf16 head on
+            // reload, strictly worse than the clean-drop behavior. Skip + warn.
+            if mtp.has_quantized_weights() {
+                warn!(
+                    "Skipping MTP head serialization: the loaded MTP weights are quantized and \
+                     save_model_sync is dense/bf16-only. The reloaded checkpoint will run \
+                     autoregressive-only (no speculative MTP)."
+                );
+            } else {
+                params.extend(mtp.get_parameters());
+            }
+        }
+
         // Validate all parameters for NaN/Inf before writing to disk
         for (name, param) in params.iter() {
             let data = param.to_float32()?;
@@ -5605,9 +6323,17 @@ impl Qwen35MoeInner {
 
         let input_tokens = input_ids.to_uint32()?;
         let current_ids = input_ids.clone();
-        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
+        // Bounded, floored capacity hint (see `generated_capacity_hint`): this
+        // training-only path takes `max_new_tokens` from training config
+        // (SFT/GRPO) where panics are banned. The helper prevents both the
+        // negative-budget `.. as usize` wrap to `usize::MAX` (which would abort)
+        // and a multi-GiB eager reservation for an absurd budget, without
+        // changing behavior for valid budgets — the buffer still grows to hold
+        // every generated token.
+        let mut generated_tokens: Vec<u32> =
+            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens));
         let mut generated_logprobs: Vec<f32> = if return_logprobs {
-            Vec::with_capacity(max_new_tokens as usize)
+            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens))
         } else {
             Vec::new()
         };
@@ -6699,6 +7425,16 @@ impl Qwen35MoeInner {
 
         Ok(params)
     }
+
+    /// W6 MoE (MTP): true when this checkpoint includes an MTP head
+    /// (W2 module loaded by `persistence::apply_weights_moe_inner`).
+    /// The W6 speculative decode loop gates on this together with the
+    /// per-request `enable_mtp` flag — both must be true for the
+    /// MTP-accelerated path to take over. Mirrors the dense
+    /// `Qwen35Inner::has_mtp_weights`.
+    pub(crate) fn has_mtp_weights(&self) -> bool {
+        self.mtp.is_some() && self.mtp_weights_loaded
+    }
 }
 
 /// Qwen3.5 MoE Model -- hybrid linear/full attention with Mixture-of-Experts.
@@ -6720,6 +7456,13 @@ pub struct Qwen3_5MoeModel {
     /// chat turns are rejected at runtime by the chat-entry sites.
     /// Surfaced through the `hasBlockPagedCache()` NAPI method.
     pub(crate) paged_active: bool,
+    /// W7 (MTP): snapshot of `Qwen35MoeInner::has_mtp_weights()`
+    /// captured at construction time, mirroring `paged_active`.
+    /// Surfaced through the `hasMtpWeights()` NAPI method so the TS
+    /// ChatSession can auto-default `enableMtp = true` for checkpoints
+    /// that ship an MTP head without round-tripping through the model
+    /// thread.
+    pub(crate) mtp_active: bool,
     /// RAII: unregisters this model's baseline from the cache-limit
     /// coordinator on drop.
     pub(crate) _cache_limit_guard: crate::cache_limit::CacheLimitGuard,
@@ -6750,6 +7493,21 @@ impl Qwen3_5MoeModel {
     #[napi]
     pub fn has_block_paged_cache(&self) -> bool {
         self.paged_active
+    }
+
+    /// W7 (MTP): whether this checkpoint shipped an MTP head (W2 module
+    /// loaded by `persistence::apply_weights_moe_inner`). Snapshotted
+    /// at load time from `Qwen35MoeInner::has_mtp_weights()` so the TS
+    /// `ChatSession` can auto-default `enableMtp = true` for
+    /// MTP-capable checkpoints without dispatching a command into the
+    /// model thread. Mirrors `Qwen3_5Model::has_mtp_weights`.
+    ///
+    /// Note: this only reports weight availability. Whether the W6
+    /// speculative-decode path actually runs on a given call also
+    /// requires the per-request `enableMtp` flag.
+    #[napi]
+    pub fn has_mtp_weights(&self) -> bool {
+        self.mtp_active
     }
 
     /// Load a pretrained model from a directory.
@@ -6829,6 +7587,9 @@ impl Qwen3_5MoeModel {
             reasoning_effort: None,
             report_performance: None,
             reuse_cache: None,
+            enable_mtp: None,
+            mtp_depth: None,
+            mtp_adaptive_depth: None,
         });
 
         crate::model_thread::send_and_await(&self.thread, |reply| Qwen35MoeCmd::ChatSessionStart {
@@ -6884,6 +7645,9 @@ impl Qwen3_5MoeModel {
             reasoning_effort: None,
             report_performance: None,
             reuse_cache: None,
+            enable_mtp: None,
+            mtp_depth: None,
+            mtp_adaptive_depth: None,
         });
 
         crate::model_thread::send_and_await(&self.thread, |reply| {
@@ -6946,6 +7710,9 @@ impl Qwen3_5MoeModel {
             reasoning_effort: None,
             report_performance: None,
             reuse_cache: None,
+            enable_mtp: None,
+            mtp_depth: None,
+            mtp_adaptive_depth: None,
         });
 
         crate::model_thread::send_and_await(&self.thread, |reply| {
@@ -6999,6 +7766,9 @@ impl Qwen3_5MoeModel {
             reasoning_effort: None,
             report_performance: None,
             reuse_cache: None,
+            enable_mtp: None,
+            mtp_depth: None,
+            mtp_adaptive_depth: None,
         });
 
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -7068,6 +7838,9 @@ impl Qwen3_5MoeModel {
             reasoning_effort: None,
             report_performance: None,
             reuse_cache: None,
+            enable_mtp: None,
+            mtp_depth: None,
+            mtp_adaptive_depth: None,
         });
 
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -7134,6 +7907,9 @@ impl Qwen3_5MoeModel {
             reasoning_effort: None,
             report_performance: None,
             reuse_cache: None,
+            enable_mtp: None,
+            mtp_depth: None,
+            mtp_adaptive_depth: None,
         });
 
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -7526,6 +8302,428 @@ fn eval_token_and_moe_caches(next_token: &MxArray) {
     unsafe {
         mlx_sys::mlx_qwen35_moe_eval_token_and_caches(next_token.as_raw_ptr());
     }
+}
+
+/// W6.5-resume (MoE twin) — evaluate `next_token`, the chained
+/// `verify_hidden[K]` slice, and (when `MLX_EVAL_ALL_CACHES` is set)
+/// the MoE compiled caches in a SINGLE `async_eval` batch. Mirrors
+/// `eval_token_caches_and_chained_hidden` on the dense side; see the
+/// dense doc comment for the full rationale.
+fn eval_token_moe_caches_and_chained_hidden(next_token: &MxArray, chained_hidden: &MxArray) {
+    unsafe {
+        mlx_sys::mlx_qwen35_moe_eval_token_caches_and_extra(
+            next_token.as_raw_ptr(),
+            chained_hidden.as_raw_ptr(),
+        );
+    }
+}
+
+/// W6 MoE (MTP): one compiled MoE forward step that ALSO exports the
+/// post-final-norm hidden of the decoded token. Calls
+/// `forward_moe_cpp` first, then asks the C++ side for the stashed
+/// hidden from that step.
+///
+/// Returns `(logits, hidden)` where `logits` is `[1, vocab]` and
+/// `hidden` is `[1, hidden_size]` bf16. The hidden state is the
+/// pre-LM-head input — the exact tensor MTP draft's `prev_hidden`
+/// expects, after a `reshape(&[1, 1, hidden])` to match the
+/// `[B, T, hidden]` MTP-draft contract.
+///
+/// Caller MUST hold `MOE_COMPILED_MUTEX` and the
+/// `COMPILED_WEIGHTS_RWLOCK` read guard for the whole call — the
+/// hidden is stashed in a process-wide `g_moe_last_hidden` global on
+/// the C++ side and is only valid until the next main-path forward
+/// or reset. Mirrors `forward_compiled_with_hidden` on the dense side.
+// W6 MoE chat-session integration is the only intended caller.
+fn forward_moe_compiled_with_hidden(
+    input_ids: &MxArray,
+    embedding_weight: &MxArray,
+) -> Result<(MxArray, MxArray)> {
+    use mlx_sys as sys;
+
+    let logits = forward_moe_cpp(input_ids, embedding_weight)?;
+
+    let mut hidden_ptr: *mut sys::mlx_array = std::ptr::null_mut();
+    unsafe { sys::mlx_qwen35_moe_export_last_hidden(&mut hidden_ptr) };
+    if hidden_ptr.is_null() {
+        return Err(Error::from_reason(
+            "forward_moe_compiled_with_hidden: C++ returned null hidden — \
+             check that forward_moe_cpp succeeded and g_moe_inited is true",
+        ));
+    }
+    let hidden = MxArray::from_handle(hidden_ptr, "moe_compiled_forward_last_hidden")?;
+    Ok((logits, hidden))
+}
+
+// ============================================================================
+// W5 — Compiled C++ MTP (Multi-Token Prediction) wrappers (MoE).
+//
+// MoE twin of the dense `init_mtp_compiled_from_main` /
+// `forward_mtp_draft_compiled` / `forward_mtp_verify_compiled` trio
+// (`crates/mlx-core/src/models/qwen3_5/model.rs:7418`). The C++ side
+// lives in `crates/mlx-sys/src/mlx_qwen35_moe_mtp_compiled.cpp` and
+// shares `g_weights()` with the main MoE path.
+//
+// Locking contract:
+//   - Production callers (W6 chat-session loop) MUST hold
+//     `MOE_COMPILED_MUTEX` (NOT `DENSE_COMPILED_MUTEX`!) AND the
+//     `COMPILED_WEIGHTS_RWLOCK` read guard across the entire
+//     draft+verify cycle — the verify FFI loops the main MoE forward
+//     in a single critical section and mutates `g_moe_caches` /
+//     `g_moe_offset_int` in place.
+//   - Tests in `compiled_ffi_tests` (in `mtp.rs`) cannot lock
+//     `MOE_COMPILED_MUTEX` directly because it is `static` (private)
+//     to this module. They instead serialise on `FFI_LOCK`, which is
+//     sufficient in the absence of concurrent main-path forward calls.
+//
+// W6 integration contract:
+//   1. After `mlx_qwen35_moe_init_from_prefill(...)` succeeds for the
+//      current turn, call `init_moe_mtp_compiled_from_main(...)` ONCE
+//      with the same config / max_kv_len.
+//   2. For each draft+verify cycle:
+//      a. Snapshot caches (W3) and main offset.
+//      b. Call `forward_moe_mtp_draft_compiled(...)` D times.
+//      c. Call `forward_moe_mtp_verify_compiled(...)` ONCE.
+//      d. Accept / reject per W4 sampler. On reject, rewind the main
+//         MoE offset via `mlx_qwen35_moe_adjust_offset` AND the MoE MTP
+//         offset via `mlx_qwen35_moe_mtp_compiled_adjust_offset` to
+//         keep the two paths in lock-step.
+//   3. On turn end, call `mlx_qwen35_moe_mtp_compiled_reset()` (FFI).
+// ============================================================================
+
+/// Initialize the MoE MTP compiled path from the main MoE path's
+/// current state.
+///
+/// Must be called AFTER `mlx_qwen35_moe_init_from_prefill`. The MTP
+/// path allocates fresh per-layer KV caches sized to `max_kv_len`
+/// (zeros) — it does NOT seed from the main MoE caches because MTP
+/// draft layers attend to their own draft KV history.
+///
+/// Returns `Ok(())` on success. Returns `Err` on `n_mtp_layers <= 0`,
+/// missing MTP weights, or any C++ exception. On error the MTP state
+/// is left uninitialised and subsequent draft/verify calls become
+/// null-pointer no-ops so the caller can fall back to the eager Rust
+/// MoE MTP forward.
+// W6 (chat-session integration) is the only intended caller.
+pub(super) fn init_moe_mtp_compiled_from_main(
+    config: &Qwen3_5MoeConfig,
+    max_kv_len: i32,
+) -> Result<()> {
+    use mlx_sys as sys;
+
+    let status = unsafe {
+        sys::mlx_qwen35_moe_mtp_compiled_init_from_main(
+            config.num_layers,
+            config.hidden_size,
+            config.num_heads,
+            config.num_kv_heads,
+            config.head_dim,
+            config.rope_theta as f32,
+            config.rope_dims(),
+            config.rms_norm_eps as f32,
+            config.full_attention_interval,
+            config.linear_num_key_heads,
+            config.linear_num_value_heads,
+            config.linear_key_head_dim,
+            config.linear_value_head_dim,
+            config.linear_conv_kernel_dim,
+            if config.tie_word_embeddings { 1 } else { 0 },
+            max_kv_len,
+            1,
+            config.n_mtp_layers,
+            config.num_experts,
+            config.num_experts_per_tok,
+            if config.norm_topk_prob { 1 } else { 0 },
+            config.decoder_sparse_step,
+            // Pass the eager-path MLP flavor so the compiled path honors
+            // `mlp_only_layers` + the sparse-step modulo (which never cross
+            // the FFI boundary) and can never disagree with the loader.
+            mtp_compiled_layer_is_moe_flag(config),
+        )
+    };
+
+    if status != 0 {
+        return Err(Error::from_reason(format!(
+            "init_moe_mtp_compiled_from_main: C++ returned status {status} — \
+             check stderr for diagnostic"
+        )));
+    }
+
+    // W6.7 follow-up — eagerly compile the MoE batched verify graph for
+    // depths {1..5} (no-tape variant only; MoE tape-replay is deferred
+    // per W6.6). Best-effort: failure inside the FFI is logged + swallowed
+    // and the verify path falls back to lazy-at-first-use.
+    unsafe {
+        sys::mlx_qwen35_moe_mtp_compiled_prewarm_verify();
+    }
+
+    Ok(())
+}
+
+/// The `mtp_layer_is_moe` flag passed to the compiled MTP FFI init — the
+/// eager-path flavor decision (`is_moe_layer(fa_idx)` via
+/// [`Qwen3_5MoeMTPModule::mtp_mlp_variant`]), so the compiled dispatch
+/// honors `mlp_only_layers` + the sparse-step modulo identically to the
+/// Rust loader. Returns `1` for a MoE-flavored MTP layer, `0` for dense.
+fn mtp_compiled_layer_is_moe_flag(config: &Qwen3_5MoeConfig) -> i32 {
+    if Qwen3_5MoeMTPModule::mtp_mlp_variant(config)
+        == crate::models::mtp_drafter::DrafterBodyVariant::Moe
+    {
+        1
+    } else {
+        0
+    }
+}
+
+#[cfg(test)]
+mod mtp_compiled_flavor_flag_tests {
+    //! Pure (MLX-free) coverage for the `mtp_layer_is_moe` flag that feeds
+    //! the compiled MoE-MTP FFI init. The flag MUST mirror the eager-path
+    //! `is_moe_layer(fa_idx)` decision so the compiled `mtp.layers.*.mlp.*`
+    //! key dispatch honors `mlp_only_layers` + the sparse-step modulo
+    //! identically — the divergence this fix closes.
+
+    use super::*;
+    use crate::models::qwen3_5_moe::config::Qwen3_5MoeConfig;
+
+    /// Tiny MoE config (fa_idx = 3, full-attention, decoder_sparse_step = 1
+    /// → MoE-flavored MTP layer). `n_mtp_layers = 1` so an MTP head exists.
+    fn tiny_moe_mtp_cfg() -> Qwen3_5MoeConfig {
+        Qwen3_5MoeConfig {
+            vocab_size: 1024,
+            hidden_size: 64,
+            num_layers: 8,
+            num_heads: 4,
+            num_kv_heads: 2,
+            intermediate_size: 128,
+            rms_norm_eps: 1e-6,
+            head_dim: 16,
+            tie_word_embeddings: true,
+            attention_bias: false,
+            max_position_embeddings: 1024,
+            pad_token_id: 0,
+            eos_token_id: 0,
+            bos_token_id: 0,
+            linear_num_value_heads: 4,
+            linear_num_key_heads: 2,
+            linear_key_head_dim: 16,
+            linear_value_head_dim: 16,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 4,
+            partial_rotary_factor: 0.25,
+            rope_theta: 100_000.0,
+            num_experts: 4,
+            num_experts_per_tok: 2,
+            decoder_sparse_step: 1,
+            shared_expert_intermediate_size: None,
+            moe_intermediate_size: None,
+            norm_topk_prob: true,
+            mlp_only_layers: None,
+            paged_cache_memory_mb: Some(64),
+            paged_block_size: Some(16),
+            use_block_paged_cache: None,
+            n_mtp_layers: 1,
+        }
+    }
+
+    #[test]
+    fn flag_is_one_for_moe_flavored_mtp_layer() {
+        let cfg = tiny_moe_mtp_cfg();
+        let fa_idx = (cfg.full_attention_interval - 1).max(0) as usize;
+        // Sanity: the canonical config really resolves to a MoE-flavored
+        // MTP layer (decoder_sparse_step = 1 divides everything).
+        assert!(
+            cfg.is_moe_layer(fa_idx),
+            "tiny config must be MoE-flavored at fa_idx"
+        );
+        assert_eq!(
+            mtp_compiled_layer_is_moe_flag(&cfg),
+            1,
+            "MoE-flavored MTP layer must pass mtp_layer_is_moe = 1 to the FFI"
+        );
+    }
+
+    #[test]
+    fn flag_is_zero_for_dense_flavored_mtp_layer_via_mlp_only_layers() {
+        let mut cfg = tiny_moe_mtp_cfg();
+        let fa_idx = (cfg.full_attention_interval - 1).max(0) as usize;
+        // Force the MTP layer dense by listing fa_idx in mlp_only_layers —
+        // exactly the case the compiled path's old num_experts/sparse-step
+        // check could not see (it stayed MoE → key mismatch).
+        cfg.mlp_only_layers = Some(vec![fa_idx as i32]);
+        assert!(
+            !cfg.is_linear_layer(fa_idx),
+            "fa_idx must stay full-attention so the MTP layer is constructible"
+        );
+        assert!(
+            !cfg.is_moe_layer(fa_idx),
+            "mlp_only_layers override must make fa_idx dense-flavored"
+        );
+        assert_eq!(
+            mtp_compiled_layer_is_moe_flag(&cfg),
+            0,
+            "dense-flavored MTP layer must pass mtp_layer_is_moe = 0 to the FFI"
+        );
+    }
+}
+
+/// One MoE MTP draft step on the compiled path.
+///
+/// Inputs are `[1, 1, hidden]` bf16: `prev_hidden` is the post-norm
+/// hidden state from the previous step (or the committed-prefix
+/// hidden on the first step), and `prev_emb` is the embedding of
+/// the previously-committed-or-drafted token (caller picks).
+///
+/// Returns `(h_next, draft_logits)` where `h_next` is `[1, 1, hidden]`
+/// (feed to next draft step's `prev_hidden`) and `draft_logits` is
+/// `[1, vocab]` (sampler input). Mutates the MoE MTP KV caches in
+/// place and advances the MoE MTP offset by 1.
+///
+/// Returns `Err` if the C++ side returns null pointers (init not
+/// done, exception). On `Err` the MTP state is left as-is — the
+/// caller should fall back to the eager Rust MoE MTP forward.
+// W6 MoE chat-session integration is the only intended caller.
+pub(super) fn forward_moe_mtp_draft_compiled(
+    prev_hidden: &MxArray,
+    prev_emb: &MxArray,
+) -> Result<(MxArray, MxArray)> {
+    use mlx_sys as sys;
+
+    let mut h_next_ptr: *mut sys::mlx_array = std::ptr::null_mut();
+    let mut logits_ptr: *mut sys::mlx_array = std::ptr::null_mut();
+    unsafe {
+        sys::mlx_qwen35_moe_mtp_draft_compiled(
+            prev_hidden.as_raw_ptr(),
+            prev_emb.as_raw_ptr(),
+            &mut h_next_ptr,
+            &mut logits_ptr,
+        );
+    }
+
+    if h_next_ptr.is_null() || logits_ptr.is_null() {
+        if !h_next_ptr.is_null() {
+            unsafe { sys::mlx_array_delete(h_next_ptr) };
+        }
+        if !logits_ptr.is_null() {
+            unsafe { sys::mlx_array_delete(logits_ptr) };
+        }
+        return Err(Error::from_reason(
+            "forward_moe_mtp_draft_compiled: C++ returned null — check stderr",
+        ));
+    }
+
+    let h_next = MxArray::from_handle(h_next_ptr, "moe_mtp_draft_h_next")?;
+    let logits = MxArray::from_handle(logits_ptr, "moe_mtp_draft_logits")?;
+    Ok((h_next, logits))
+}
+
+/// One MoE MTP verify step on the compiled path.
+///
+/// `input_ids` is `[1, depth+1]` int32 — typically
+/// `[last_committed_id, drafted_tok_0, ..., drafted_tok_{depth-1}]`.
+/// `embedding_weight` is the model's embedding table (or LM head if
+/// `tie_word_embeddings=false`). `depth` must be in `[1, 5]`.
+///
+/// Returns logits of shape `[1, depth+1, vocab]`.
+///
+/// SIDE EFFECTS: advances the MAIN MoE compiled path's offset by
+/// `depth + 1` and writes K/V into the main MoE `g_moe_caches[]` at
+/// the corresponding positions. Production callers (W6 chat-session
+/// loop) MUST already hold `MOE_COMPILED_MUTEX` and the
+/// `COMPILED_WEIGHTS_RWLOCK` read guard so no other turn can race the
+/// offset / cache state during the verify. Tests serialise via
+/// `FFI_LOCK` in the absence of concurrent main-path forward calls —
+/// see `compiled_ffi_tests` in `mtp.rs`.
+///
+/// **W6.5 status:** All production MoE callers now use
+/// [`forward_moe_mtp_verify_compiled_with_hidden`] (chained-cycle
+/// path). This logits-only wrapper is kept as the backward-compatible
+/// surface and as the natural fallback when a future env-flag opt-out
+/// is needed; flagged with `#[allow(dead_code)]` so the dead-code
+/// lint doesn't fire while the chained path is the only active caller.
+// W6 MoE chat-session integration is the only intended caller.
+#[allow(dead_code)]
+pub(super) fn forward_moe_mtp_verify_compiled(
+    input_ids: &MxArray,
+    embedding_weight: &MxArray,
+    depth: i32,
+) -> Result<MxArray> {
+    use mlx_sys as sys;
+
+    if !(1..=5).contains(&depth) {
+        return Err(Error::from_reason(format!(
+            "forward_moe_mtp_verify_compiled: depth {depth} outside [1, 5]"
+        )));
+    }
+
+    let mut out_ptr: *mut sys::mlx_array = std::ptr::null_mut();
+    unsafe {
+        sys::mlx_qwen35_moe_mtp_verify_compiled(
+            input_ids.as_raw_ptr(),
+            embedding_weight.as_raw_ptr(),
+            depth,
+            &mut out_ptr,
+        );
+    }
+
+    if out_ptr.is_null() {
+        return Err(Error::from_reason(
+            "forward_moe_mtp_verify_compiled: C++ returned null — check stderr",
+        ));
+    }
+    MxArray::from_handle(out_ptr, "moe_mtp_verify_logits")
+}
+
+/// W6.5 — MoE verify pass that ALSO exports the post-final-norm hidden
+/// state at EVERY verify position. MoE twin of
+/// [`super::super::qwen3_5::model::forward_mtp_verify_compiled_with_hidden`]
+/// — see that function's docstring for the chaining rationale and
+/// slice-K semantics.
+///
+/// Same locking contract as [`forward_moe_mtp_verify_compiled`]:
+/// callers MUST hold `MOE_COMPILED_MUTEX` (NOT the dense one) and a
+/// `COMPILED_WEIGHTS_RWLOCK` read guard for the entire cycle. Returns
+/// `(logits[1, depth+1, vocab], hiddens[1, depth+1, hidden_size])` on
+/// success.
+pub(super) fn forward_moe_mtp_verify_compiled_with_hidden(
+    input_ids: &MxArray,
+    embedding_weight: &MxArray,
+    depth: i32,
+) -> Result<(MxArray, MxArray)> {
+    use mlx_sys as sys;
+
+    if !(1..=5).contains(&depth) {
+        return Err(Error::from_reason(format!(
+            "forward_moe_mtp_verify_compiled_with_hidden: depth {depth} outside [1, 5]"
+        )));
+    }
+
+    let mut out_logits: *mut sys::mlx_array = std::ptr::null_mut();
+    let mut out_hiddens: *mut sys::mlx_array = std::ptr::null_mut();
+    unsafe {
+        sys::mlx_qwen35_moe_mtp_verify_compiled_with_hidden(
+            input_ids.as_raw_ptr(),
+            embedding_weight.as_raw_ptr(),
+            depth,
+            &mut out_logits,
+            &mut out_hiddens,
+        );
+    }
+
+    if out_logits.is_null() {
+        return Err(Error::from_reason(
+            "forward_moe_mtp_verify_compiled_with_hidden: C++ returned null logits — check stderr",
+        ));
+    }
+    if out_hiddens.is_null() {
+        let _ = MxArray::from_handle(out_logits, "moe_mtp_verify_logits_drop_on_hidden_fail")?;
+        return Err(Error::from_reason(
+            "forward_moe_mtp_verify_compiled_with_hidden: C++ returned null hiddens — check stderr",
+        ));
+    }
+    let logits = MxArray::from_handle(out_logits, "moe_mtp_verify_logits")?;
+    let hiddens = MxArray::from_handle(out_hiddens, "moe_mtp_verify_hiddens")?;
+    Ok((logits, hiddens))
 }
 
 /// Block size hard-coded into the compiled C++ paged graph
@@ -8023,6 +9221,7 @@ mod paged_construction_tests {
             paged_cache_memory_mb: Some(64),
             paged_block_size: Some(16),
             use_block_paged_cache: if use_block_paged { Some(true) } else { None },
+            n_mtp_layers: 0,
         }
     }
 

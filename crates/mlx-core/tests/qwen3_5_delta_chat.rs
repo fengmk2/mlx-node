@@ -45,6 +45,9 @@ fn chat_config_default(max_new_tokens: i32) -> ChatConfig {
         include_reasoning: Some(true),
         report_performance: Some(true),
         reuse_cache: Some(true),
+        enable_mtp: None,
+        mtp_depth: None,
+        mtp_adaptive_depth: None,
     }
 }
 
@@ -684,5 +687,229 @@ async fn session_start_accepts_images_for_vlm() {
         result.num_tokens > 0,
         "VLM session-start returned zero generated tokens: {:?}",
         result
+    );
+}
+
+// ---------------------------------------------------------------------
+// Regression: nonpositive `max_new_tokens` budget → 0 generated tokens
+// on the MTP decode path, matching the AR `decode_loop!` semantics.
+// ---------------------------------------------------------------------
+//
+// The MTP decode macro (`decode_loop_mtp!` in `chat_common.rs`) used to
+// UNCONDITIONALLY push the prefill-seed token before its loop's length
+// check, so `maxNewTokens == 0` emitted ONE token where AR's
+// `for step in 0..max` emits ZERO. A NEGATIVE budget additionally wrapped
+// through `as usize` to an effectively unbounded cap, so only EOS /
+// repetition / cancellation could ever stop generation. The fix clamps
+// the budget (`($max).max(0) as usize`) once and guards the initial emit
+// on it, so MTP now matches AR: 0 new tokens for a nonpositive budget.
+//
+// This test exercises BOTH the MTP-enabled config (the regression) and
+// the AR baseline (the parity target).
+//
+// CAVEAT (and why we no longer "stay green either way"): when
+// `enable_mtp = true` but the loaded checkpoint has NO MTP head, the
+// engine's gate (`enable_mtp && has_mtp_weights()`) silently falls back
+// to the AR `decode_loop!`. In that case the "MTP" assertions below would
+// actually re-test the AR path and pass WITHOUT ever entering
+// `decode_loop_mtp!` — a false positive. To prevent that, we first probe
+// the load-time `has_mtp_weights()` signal AND run a small positive-budget
+// MTP generation, confirming via the performance stat
+// (`mtp_mean_accepted_tokens`) that the MTP decode path genuinely ran. If
+// MTP is NOT active (no MTP head in the checkpoint), we print a skip
+// message and `return` rather than running the MTP assertions as if they
+// passed.
+//
+// COVERAGE HONESTY: with an MTP-capable checkpoint this directly catches
+// the 1-vs-0 budget regression in `decode_loop_mtp!`. NOT covered here:
+// (1) the deterministic pre-cancel-flag sub-case (the non-streaming
+//     `chat_session_start` harness can't pre-set a `CancelHandle` before
+//     loop entry — see the note further down; the `max_as_usize == 0`
+//     short-circuit is placed as the loop's first statement, so the
+//     pre-cancelled path is covered by reasoning + statement placement,
+//     not a runtime pre-set); and
+// (2) the MoE call-site (`decode_loop_mtp!` is also expanded for the MoE
+//     model, exercised only by a separate MoE checkpoint).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real Qwen3.5 Dense checkpoint"]
+async fn nonpositive_budget_emits_zero_tokens_mtp_matches_ar() {
+    let Ok(model_path) = std::env::var("MLX_TEST_MODEL_PATH") else {
+        eprintln!(
+            "skipping: MLX_TEST_MODEL_PATH unset (point it at e.g. \
+             ./.cache/models/qwen3.5-0.8b-mlx-bf16 with an MTP head)"
+        );
+        return;
+    };
+    let model_dir = Path::new(&model_path);
+    assert!(
+        model_dir.exists(),
+        "MLX_TEST_MODEL_PATH does not exist: {}",
+        model_path
+    );
+
+    let model = Qwen3_5Model::load(model_path.clone())
+        .await
+        .expect("failed to load Qwen3.5 model");
+
+    // Build a config with an explicit MTP toggle and a given budget.
+    let cfg_with = |max_new_tokens: i32, enable_mtp: bool| ChatConfig {
+        enable_mtp: Some(enable_mtp),
+        ..chat_config_default(max_new_tokens)
+    };
+
+    // 1) AR baseline at budget 0: empty range → 0 tokens (the parity
+    //    target the MTP path must match).
+    let ar_zero = model
+        .chat_session_start(
+            vec![user_message("Say hi in one short word.")],
+            Some(cfg_with(0, false)),
+        )
+        .await
+        .expect("AR max_new_tokens=0 chat_session_start failed");
+    println!(
+        "AR budget=0: num_tokens={} finish_reason={:?}",
+        ar_zero.num_tokens, ar_zero.finish_reason
+    );
+    assert_eq!(
+        ar_zero.num_tokens, 0,
+        "AR baseline must emit 0 tokens at max_new_tokens=0, got {}",
+        ar_zero.num_tokens
+    );
+    // Pin the AR parity target: AR's empty `0..0` range never observes
+    // cancel/EOS/repetition, so finish_reason stays at its "length" init.
+    // The MTP assertions below compare against THIS captured baseline
+    // (not a hardcoded literal) so the "MTP matches AR" claim is airtight.
+    assert_eq!(
+        ar_zero.finish_reason, "length",
+        "AR baseline must report finish_reason=\"length\" at max_new_tokens=0, got {:?}",
+        ar_zero.finish_reason
+    );
+
+    // MTP-active gate: confirm the loaded checkpoint actually has an MTP
+    // head AND that the MTP decode path genuinely runs before asserting
+    // anything about it. Without this, a non-MTP checkpoint would make the
+    // budget-0 / negative assertions below silently re-test the AR path
+    // (the engine falls back to `decode_loop!` when `has_mtp_weights()` is
+    // false) and pass as a FALSE POSITIVE.
+    //
+    // `has_mtp_weights()` is the load-time snapshot the engine itself uses
+    // in its gate (`enable_mtp && has_mtp_weights()`). At a 0 budget no
+    // tokens are generated so MTP acceptance is NOT observable; therefore we
+    // run a SMALL POSITIVE-budget MTP generation and require the runtime
+    // performance stat `mtp_mean_accepted_tokens` to be present — proof the
+    // `decode_loop_mtp!` path executed at least one cycle.
+    if !model.has_mtp_weights() {
+        eprintln!(
+            "skipping MTP assertions: checkpoint at {} has no MTP head \
+             (has_mtp_weights() == false); the budget-0 assertions would \
+             otherwise re-test the AR fallback as a false positive",
+            model_path
+        );
+        return;
+    }
+    let mtp_probe = model
+        .chat_session_start(
+            vec![user_message("Say hi in one short word.")],
+            Some(cfg_with(8, true)),
+        )
+        .await
+        .expect("MTP positive-budget probe chat_session_start failed");
+    let mtp_ran = mtp_probe
+        .performance
+        .as_ref()
+        .and_then(|p| p.mtp_mean_accepted_tokens)
+        .is_some();
+    println!(
+        "MTP probe (budget=8): num_tokens={} mtp_mean_accepted_tokens={:?}",
+        mtp_probe.num_tokens,
+        mtp_probe
+            .performance
+            .as_ref()
+            .and_then(|p| p.mtp_mean_accepted_tokens)
+    );
+    if !mtp_ran {
+        eprintln!(
+            "skipping MTP assertions: has_mtp_weights() is true but a \
+             positive-budget MTP run reported no mtp_mean_accepted_tokens \
+             (MTP decode path did not execute — e.g. compiled-path / paged \
+             gate off); not running the MTP assertions as if they passed"
+        );
+        return;
+    }
+
+    // 2) MTP path at budget 0: this is the regression. Before the fix the
+    //    unconditional prefill-seed push made this 1. It must now be 0.
+    let mtp_zero = model
+        .chat_session_start(
+            vec![user_message("Say hi in one short word.")],
+            Some(cfg_with(0, true)),
+        )
+        .await
+        .expect("MTP max_new_tokens=0 chat_session_start failed");
+    println!(
+        "MTP budget=0: num_tokens={} finish_reason={:?}",
+        mtp_zero.num_tokens, mtp_zero.finish_reason
+    );
+    assert_eq!(
+        mtp_zero.num_tokens, 0,
+        "MTP path must emit 0 tokens at max_new_tokens=0 (matching AR), got {}",
+        mtp_zero.num_tokens
+    );
+    // #3 fix: at a 0 budget the MTP loop must short-circuit to "length"
+    // (AR's empty `0..0` range never observes cancel/EOS/repetition, so its
+    // finish_reason stays at the "length" init). Before this fix the loop
+    // was still entered and the cancelled/EOS checks could run first; with
+    // a pre-set cancel flag that produced "cancelled" where AR reports
+    // "length". The non-streaming harness here can't pre-set the cancel
+    // flag (see the note below), but the non-cancelled finish_reason must
+    // still be "length" — and the new `max_as_usize == 0` short-circuit is
+    // the same code path that the pre-cancelled case takes.
+    assert_eq!(
+        mtp_zero.finish_reason, ar_zero.finish_reason,
+        "MTP finish_reason at max_new_tokens=0 must match the AR baseline \
+         ({:?}), got {:?}",
+        ar_zero.finish_reason, mtp_zero.finish_reason
+    );
+    // Pre-cancelled streaming sub-case (#3): the regression was that a
+    // request whose cancel flag is ALREADY set at loop entry, with a 0
+    // budget under MTP, reported "cancelled" while AR reports "length".
+    // This non-streaming `chat_session_start` harness has no `CancelHandle`
+    // wired before the macro is entered (the streaming path sets the flag
+    // via `handle.cancel()` AFTER dispatch, which races the decode and
+    // cannot be made to land before loop entry deterministically here), so
+    // we cannot pre-set the flag in-test. The `max_as_usize == 0`
+    // short-circuit is placed as the VERY FIRST statement inside `loop {}`,
+    // BEFORE the cancelled check, so a pre-cancelled 0-budget request takes
+    // exactly the branch asserted above and yields "length" too. The
+    // assertion on `mtp_zero.finish_reason` therefore covers the same code
+    // path; the cancel-flag ordering is verified by reasoning + the
+    // statement placement rather than a runtime pre-set.
+
+    // 3) Negative budget on the MTP path: previously wrapped via `as
+    //    usize` to a huge cap → effectively unbounded. Must now clamp to
+    //    0 like AR's empty range.
+    let mtp_neg = model
+        .chat_session_start(
+            vec![user_message("Say hi in one short word.")],
+            Some(cfg_with(-5, true)),
+        )
+        .await
+        .expect("MTP max_new_tokens=-5 chat_session_start failed");
+    println!(
+        "MTP budget=-5: num_tokens={} finish_reason={:?}",
+        mtp_neg.num_tokens, mtp_neg.finish_reason
+    );
+    assert_eq!(
+        mtp_neg.num_tokens, 0,
+        "MTP path must emit 0 tokens at a negative budget, got {}",
+        mtp_neg.num_tokens
+    );
+    // A negative budget clamps to 0, so it takes the same short-circuit as
+    // the 0 case (#3 fix) and must match the same AR baseline.
+    assert_eq!(
+        mtp_neg.finish_reason, ar_zero.finish_reason,
+        "MTP finish_reason at a negative budget (clamped to 0) must match the \
+         AR baseline ({:?}), got {:?}",
+        ar_zero.finish_reason, mtp_neg.finish_reason
     );
 }

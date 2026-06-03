@@ -523,6 +523,25 @@ unsafe extern "C-unwind" {
         top_k: i32,
         top_p: f32,
         min_p: f32,
+        sampler_mode: i32,
+    ) -> *mut mlx_array;
+
+    /// Return the normalized probability distribution the compiled sampler
+    /// (`mlx_compiled_sample_full`) draws from, using the SAME filter chain and
+    /// `sampler_mode`. Output is `softmax(filtered_logits * inv_temp)` over the
+    /// last axis (filtered-out tokens are exactly 0). Stochastic MTP acceptance
+    /// consumes this as the proposal density `q` (draft logits) and target
+    /// density `p` (verify logits) so accept/reject + residual resampling match
+    /// the draw distribution by construction. At temperature == 0 it returns a
+    /// one-hot argmax distribution (callers must not rely on it at T=0 — the
+    /// accept path takes its argmax-only shortcut and ignores q/p).
+    pub fn mlx_compiled_sampling_distribution(
+        logits: *mut mlx_array,
+        temperature: f32,
+        top_k: i32,
+        top_p: f32,
+        min_p: f32,
+        sampler_mode: i32,
     ) -> *mut mlx_array;
 
     /// Compiled sampling using mlx::core::compile for the categorical step
@@ -533,6 +552,7 @@ unsafe extern "C-unwind" {
         top_k: i32,
         top_p: f32,
         min_p: f32,
+        sampler_mode: i32,
         out_token: *mut *mut mlx_array,
         out_logprobs: *mut *mut mlx_array,
     );
@@ -1168,6 +1188,50 @@ unsafe extern "C-unwind" {
     /// `mlx_paged_phase2_stress_mixed_graph_v` with `seq_len=8`. Same
     /// return-code contract.
     pub fn mlx_paged_phase2_stress_mixed_graph(iterations: i32) -> i32;
+
+    /// Compare two `PagedAttentionVarlen` primitives via `is_equivalent`.
+    /// Returns 1 iff equivalent, 0 otherwise.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_paged_attention_varlen_is_equivalent(
+        scale_lhs: f32,
+        softcap_lhs: f32,
+        block_size_lhs: i32,
+        num_q_heads_lhs: i32,
+        num_kv_heads_lhs: i32,
+        head_size_lhs: i32,
+        sliding_window_lhs: i32,
+        kv_dtype_lhs: u8,
+        scale_rhs: f32,
+        softcap_rhs: f32,
+        block_size_rhs: i32,
+        num_q_heads_rhs: i32,
+        num_kv_heads_rhs: i32,
+        head_size_rhs: i32,
+        sliding_window_rhs: i32,
+        kv_dtype_rhs: u8,
+    ) -> i32;
+
+    /// Returns 1 iff `PagedAttentionVarlen::vjp` throws
+    /// `std::runtime_error`.
+    pub fn mlx_paged_attention_varlen_vjp_throws() -> i32;
+
+    /// Returns 1 iff the public `paged_attention_varlen(...)` factory
+    /// accepts well-formed tracer inputs and produces an output array of
+    /// the expected shape. -1 on shape mismatch, 0 on factory exception.
+    pub fn mlx_paged_attention_varlen_factory_accepts_wellformed() -> i32;
+
+    /// Returns 1 iff the factory rejects a `cu_seqlens_q` array whose
+    /// length is not `num_seqs + 1`.
+    pub fn mlx_paged_attention_varlen_factory_rejects_cu_seqlens_len() -> i32;
+
+    /// Returns 1 iff the factory rejects a `cu_seqlens_q` array whose
+    /// dtype is not int32.
+    pub fn mlx_paged_attention_varlen_factory_rejects_cu_seqlens_dtype() -> i32;
+
+    /// Returns 1 iff `paged_attention_varlen(...)` composes inside
+    /// `mlx::core::compile(...)` and returns an output of the expected
+    /// shape. -1 on any thrown exception or shape mismatch.
+    pub fn mlx_paged_attention_varlen_compile_trace_smoke() -> i32;
 }
 
 // ================================================================================
@@ -1453,17 +1517,234 @@ unsafe extern "C-unwind" {
     /// Eval next_token and all compiled cache arrays to prevent graph accumulation.
     pub fn mlx_qwen35_eval_token_and_compiled_caches(next_token: *mut mlx_array);
 
+    /// W6.5-resume — eval `next_token`, an extra array, and all compiled
+    /// cache arrays in ONE `async_eval` batch. Used by the chained-cycles
+    /// MTP path to fuse the `verify_hidden[K]` slice eval with the
+    /// next-cycle first-draft inputs, eliminating the mid-cycle Metal
+    /// command-buffer roundtrip that the Step-A bypass avoids by
+    /// producing `hidden` and `token` as siblings of a single fused eval.
+    ///
+    /// `extra` MAY be null, in which case behaviour is identical to
+    /// `mlx_qwen35_eval_token_and_compiled_caches`.
+    pub fn mlx_qwen35_eval_token_caches_and_extra(
+        next_token: *mut mlx_array,
+        extra: *mut mlx_array,
+    );
+
     /// Adjust the compiled offset by delta (for VLM rope_deltas).
     pub fn mlx_qwen35_compiled_adjust_offset(delta: i32);
 
+    /// W6 (MTP) Bug #4 — snapshot the dense compiled path's GDN
+    /// linear-attention caches (conv_state + recurrent_state) plus
+    /// the decode offset. Called by `decode_loop_mtp!` AFTER Step A
+    /// and BEFORE the verify FFI runs its D+1 sequential forwards.
+    /// The verify loop mutates `g_compiled_caches` in place; on
+    /// rejection we restore the snapshot via
+    /// `mlx_qwen35_compiled_restore_linear_caches` and replay the K
+    /// accepted drafts so the linear state matches the committed
+    /// token stream. Only linear-attention layer slots are snapshotted
+    /// — full-attention K/V slots are handled by the existing
+    /// offset-rewind path.
+    ///
+    /// No-op if `g_compile_inited` is false. Idempotent — overwrites
+    /// any previous snapshot.
+    pub fn mlx_qwen35_compiled_snapshot_linear_caches();
+
+    /// W6 (MTP) Bug #4 — restore the dense compiled path's GDN
+    /// linear-attention caches AND the decode offset from the most
+    /// recent snapshot. Called on verify rejection
+    /// (`accepted_drafts < depth`) BEFORE replaying K accepted drafts
+    /// via `mlx_qwen35_forward_compiled`. No-op if no snapshot has
+    /// been taken since the last reset.
+    pub fn mlx_qwen35_compiled_restore_linear_caches();
+
+    /// Phase 4b — paged-pool sibling of
+    /// `mlx_qwen35_compiled_snapshot_linear_caches`. Snapshots the GDN
+    /// linear-attention recurrent + conv state out of
+    /// `g_dense_paged_linear_caches[]` so a partial-accept rollback in
+    /// the paged MTP verify cycle can restore it before the next
+    /// forward. Full-attention pool slots are NOT snapshotted — the
+    /// Rust paged adapter's `rollback_last_tokens` handles K/V cursor
+    /// bookkeeping.
+    ///
+    /// No-op if `g_dense_paged_inited == false`. Idempotent — overwrites
+    /// any previous snapshot.
+    pub fn mlx_qwen35_compiled_snapshot_paged_linear_caches();
+
+    /// Phase 4b — restore the paged GDN linear caches from the most
+    /// recent snapshot. Called on FULL rollback (zero drafts accepted)
+    /// BEFORE the next forward. For partial-accept (1 <= K < depth) use
+    /// `mlx_qwen35_compiled_replay_paged_linear_caches_for_accept`
+    /// instead. No-op if no snapshot has been taken since the last
+    /// reset.
+    pub fn mlx_qwen35_compiled_restore_paged_linear_caches();
+
+    /// Phase 4b — partial-accept rollback for the paged GDN linear
+    /// caches. Called after the MTP verify loop when
+    /// `accepted_steps == accepted_drafts + 1` (the K accepted drafts
+    /// plus the bonus / residual token) is strictly less than
+    /// `depth + 1`. Currently restores the pre-verify snapshot — the
+    /// tape-replay fast path (mirroring
+    /// `mlx_qwen35_compiled_tape_replay`) becomes a follow-up wiring
+    /// once B3 routes the paged verify's tape outputs into the existing
+    /// `g_gdn_*_tape_acc[]` accumulators.
+    ///
+    /// `accepted_steps == depth + 1` is a no-op (full accept — the
+    /// post-verify state already matches the committed prefix).
+    ///
+    /// Preconditions (else logs to stderr and falls back to a pure
+    /// snapshot restore):
+    ///   - `mlx_qwen35_compiled_snapshot_paged_linear_caches` has been
+    ///     called for this cycle;
+    ///   - `1 <= depth <= 5`;
+    ///   - `0 <= accepted_steps <= depth + 1`.
+    pub fn mlx_qwen35_compiled_replay_paged_linear_caches_for_accept(
+        accepted_steps: i32,
+        depth: i32,
+    );
+
+    /// W6.6 — Arm tape recording for the dense compiled path. After
+    /// this call, every `mlx_qwen35_forward_compiled` routes linear-
+    /// attention layers through a tape-emitting Metal kernel and
+    /// appends the per-step `(tape, k, g, qkv)` tensors into per-layer
+    /// accumulator vectors. The MTP cycle macro calls this BEFORE the
+    /// verify FFI's D+1 sequential forwards so the rollback path can
+    /// replay only the accepted prefix instead of running K+1 main-
+    /// model forwards. Idempotent; no-op if `g_compile_inited` is
+    /// false.
+    pub fn mlx_qwen35_compiled_tape_arm();
+
+    /// W6.6 — Disarm tape recording and drop accumulators. Called on
+    /// full-accept (no replay needed) and after a successful replay.
+    /// Idempotent.
+    pub fn mlx_qwen35_compiled_tape_disarm();
+
+    /// W6.6 — Restore the GDN linear-attention recurrent + conv states
+    /// by applying the first `accepted_steps` recorded innovations to
+    /// the pre-verify snapshot, then advance the decode offset to
+    /// `snapshot_offset + accepted_steps`. Replaces the K+1 main-model
+    /// forwards the old Bug #4 rollback ran. Always disarms recording
+    /// afterward.
+    ///
+    /// Preconditions (else logs to stderr and disarms without applying):
+    ///   - `mlx_qwen35_compiled_snapshot_linear_caches` has been
+    ///     called for this cycle;
+    ///   - `mlx_qwen35_compiled_tape_arm` has been called and the
+    ///     D+1 verify forwards have all recorded into the
+    ///     accumulators;
+    ///   - `1 <= accepted_steps <= recorded_steps` (in MTP cycle
+    ///     terms `accepted_steps = K + 1` where K = number of accepted
+    ///     drafts).
+    pub fn mlx_qwen35_compiled_tape_replay(accepted_steps: i32);
+
+    /// Phase 4b B4 — paged variant of `mlx_qwen35_compiled_tape_arm`.
+    /// `mlx_qwen35_compiled_tape_arm` early-returns when
+    /// `g_compile_inited` is false, which is the case on pure-paged
+    /// turns. This variant arms recording when `g_dense_paged_inited`
+    /// is true; the paged verify graph already emits tape into the
+    /// shared `g_gdn_*_tape_acc[]` accumulators under
+    /// `g_tape_recording_armed`.
+    pub fn mlx_qwen35_compiled_tape_arm_paged();
+
+    /// Phase 4b B4 — paged variant of `mlx_qwen35_compiled_tape_replay`.
+    /// Replays the first `accepted_steps` recorded innovations onto
+    /// `g_dense_paged_linear_snapshot[]` and writes the result back
+    /// into `g_dense_paged_linear_caches[]`. Always disarms recording
+    /// afterward. On any precondition violation, falls back to a pure
+    /// snapshot-restore so the next forward starts from the pre-verify
+    /// state.
+    pub fn mlx_qwen35_compiled_tape_replay_paged(accepted_steps: i32);
+
     /// Reset compiled state (call on model reset / new conversation).
     pub fn mlx_qwen35_compiled_reset();
+
+    /// PR #65 (mtp-reload P1): invalidate the compiled MTP-verify
+    /// dispatch tables so the next verify re-traces against the CURRENT
+    /// weight registry. MUST be called on every model reload, after
+    /// `mlx_clear_weights()` and inside the `COMPILED_WEIGHTS_RWLOCK`
+    /// write critical section. Unlike `mlx_qwen35_compiled_reset`
+    /// (per-turn; keeps the verify tables for cross-turn reuse), this is
+    /// a per-reload invalidation that prevents a second same-shape model
+    /// from verifying with the first model's baked weights.
+    pub fn mlx_qwen35_invalidate_compiled_graphs();
+
+    /// PR #65 (mtp-reload P1): invalidate the compiled MoE dispatch
+    /// graphs (the MTP-verify graph plus the flat + paged AR-decode
+    /// graphs) so the next call re-traces against the CURRENT weight
+    /// registry. These graphs read expert/attention weights inside the
+    /// traced closure, so `compile()` bakes them in. MUST be called on
+    /// every MoE model reload, after `mlx_clear_weights()` and inside the
+    /// `COMPILED_WEIGHTS_RWLOCK` write critical section, alongside the
+    /// dense `mlx_qwen35_invalidate_compiled_graphs` (which only clears
+    /// the dense bucket/paged verify tables the MoE path does not use).
+    /// Prevents a second same-shape MoE model from decoding/verifying
+    /// with the first model's baked weights.
+    pub fn mlx_qwen35_moe_invalidate_compiled_graphs();
 
     /// Export compiled caches for PromptCache reuse.
     pub fn mlx_qwen35_export_caches(out_ptrs: *mut *mut mlx_array, max_count: i32) -> i32;
 
     /// Get current compiled cache offset (tokens processed).
     pub fn mlx_qwen35_get_cache_offset() -> i32;
+
+    /// W6 (MTP): export a heap-allocated deep copy of the
+    /// post-final-norm hidden state of the last decoded token,
+    /// captured by the most recent `mlx_qwen35_forward_compiled`.
+    /// Sets `*out` to a heap-allocated `mlx_array*` of shape
+    /// `[1, hidden_size]` bf16 on success, or `nullptr` if no
+    /// forward has run since the last reset. Caller owns the
+    /// returned handle (use `mlx_array_delete`).
+    pub fn mlx_qwen35_export_last_hidden(out: *mut *mut mlx_array);
+
+    /// Phase 4b — paged-path sibling of
+    /// `mlx_qwen35_export_last_hidden`. Returns the post-final-norm
+    /// hidden captured by the most recent `mlx_qwen35_forward_paged`
+    /// invocation. Sets `*out` to a heap-allocated `mlx_array*` of
+    /// shape `[1, hidden_size]` bf16 on success, or `nullptr` if no
+    /// paged forward has run since the last reset / paged init.
+    /// Caller owns the returned handle (use `mlx_array_delete`).
+    ///
+    /// Lifetime contract: same as `mlx_qwen35_export_last_hidden`. The
+    /// returned handle is a lazy MLX array referencing the paged
+    /// decode's final_norm graph node; caller MUST eval before reading
+    /// scalars and MUST NOT call `mlx_qwen35_compiled_reset` between
+    /// export and eval.
+    pub fn mlx_qwen35_export_last_hidden_paged(out: *mut *mut mlx_array);
+
+    /// Returns 1 if the main dense compiled path has been initialised
+    /// via `mlx_qwen35_compiled_init_from_prefill`, 0 otherwise. Used
+    /// by the W5 MTP init helper to fail loudly when called out of
+    /// order rather than mirroring a phantom offset of 0.
+    pub fn mlx_qwen35_is_compile_inited() -> i32;
+
+    /// Test-only: forcibly mark the main dense compiled path as
+    /// initialised (or not) without standing up a full per-layer KV
+    /// cache. Used by the W5 MTP FFI smoke tests in
+    /// `crates/mlx-core/src/models/qwen3_5/mtp.rs` so they can satisfy
+    /// the `is_compile_inited` precondition. PRODUCTION CODE MUST NOT
+    /// CALL THIS — use `mlx_qwen35_compiled_init_from_prefill`.
+    pub fn mlx_qwen35_compiled_test_force_inited(inited: i32);
+
+    /// Phase 4b test-only: populate
+    /// `g_dense_paged_linear_caches[]` with scalar bf16 markers and set
+    /// `g_dense_paged_inited = true` so the paged snapshot/restore FFIs
+    /// can be exercised without standing up a real paged adapter.
+    /// PRODUCTION CODE MUST NOT CALL THIS — use `mlx_qwen35_init_paged`.
+    pub fn mlx_qwen35_compiled_test_force_paged_linear_caches(
+        num_layers: i32,
+        full_attention_interval: i32,
+    );
+
+    /// Phase 4b test-only: read back the scalar bf16 value at slot
+    /// `slot_idx` of `g_dense_paged_linear_caches`. Returns NaN if out
+    /// of range or the slot isn't a scalar.
+    pub fn mlx_qwen35_compiled_test_read_paged_linear_slot(slot_idx: i32) -> f32;
+
+    /// Phase 4b test-only: replace slot `slot_idx` of
+    /// `g_dense_paged_linear_caches` with a fresh scalar bf16 of
+    /// `value`. Used to simulate the paged-verify FFI's in-place
+    /// linear-cache mutation without a real verify forward.
+    pub fn mlx_qwen35_compiled_test_write_paged_linear_slot(slot_idx: i32, value: f32);
 
     /// Export paged dense linear-attention caches for live-session continuation.
     /// Full-attention K/V stays in the Rust paged adapter pools; this returns
@@ -1553,6 +1834,303 @@ unsafe extern "C-unwind" {
         output_logits: *mut *mut mlx_array,
         cache_offset_out: *mut i32,
     );
+
+    // ============================================
+    // W5 — Qwen3.5 Dense MTP (Multi-Token Prediction) compiled
+    // draft + verify graphs. See
+    // `crates/mlx-sys/src/mlx_qwen35_mtp_compiled.cpp` for
+    // implementation. ALL three FFIs MUST be called inside the
+    // same `DENSE_COMPILED_MUTEX` critical section as the main
+    // flat-path compiled forward — the verify FFI mutates the
+    // main compiled state in place.
+    // ============================================
+
+    /// Initialize the MTP compiled state. MUST be called once per
+    /// turn AFTER `mlx_qwen35_compiled_init_from_prefill`. The
+    /// MTP path allocates its OWN per-layer KV caches sized to
+    /// `max_kv_len`; the main path's caches are left untouched.
+    ///
+    /// Returns `0` on success, `-1` on failure (n_mtp_layers <= 0,
+    /// MTP weights not registered, exception). On `-1` the Rust
+    /// caller MUST skip the compiled draft/verify path and fall
+    /// back to the eager Rust MTP forward.
+    pub fn mlx_qwen35_mtp_compiled_init_from_main(
+        num_layers: i32,
+        hidden_size: i32,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        rope_theta: f32,
+        rope_dims: i32,
+        rms_norm_eps: f32,
+        full_attention_interval: i32,
+        linear_num_k_heads: i32,
+        linear_num_v_heads: i32,
+        linear_key_head_dim: i32,
+        linear_value_head_dim: i32,
+        linear_conv_kernel_dim: i32,
+        tie_word_embeddings: i32,
+        max_kv_len: i32,
+        batch_size: i32,
+        n_mtp_layers: i32,
+    ) -> i32;
+
+    /// One MTP draft step. `prev_hidden` and `prev_emb` are both
+    /// `[1, 1, hidden]` bf16. On success sets `*out_h_next` and
+    /// `*out_logits` to heap-allocated `mlx_array*` (caller owns
+    /// — use `mlx_array_delete`). On failure (init not done,
+    /// exception) both outputs are set to null.
+    ///
+    /// Advances the MTP offset by 1 and mutates MTP KV caches in
+    /// place. Independent of the main path's offset.
+    pub fn mlx_qwen35_mtp_draft_compiled(
+        prev_hidden: *mut mlx_array,
+        prev_emb: *mut mlx_array,
+        out_h_next: *mut *mut mlx_array,
+        out_logits: *mut *mut mlx_array,
+    );
+
+    /// One MTP verify step on `depth + 1` tokens. `input_ids` is
+    /// `[1, depth+1]` int32, `embedding_weight` is the model's
+    /// embedding (or LM head if untied). `depth` MUST be in
+    /// `[1, 5]` — values outside that range are rejected with a
+    /// null-pointer return and stderr diagnostic.
+    ///
+    /// Sets `*out_logits` to a heap-allocated `[1, depth+1, vocab]`
+    /// array (caller owns) on success, null on failure.
+    ///
+    /// SIDE EFFECTS: advances the MAIN compiled path's offset by
+    /// `depth + 1` and writes K/V into `g_compiled_caches[]` at the
+    /// corresponding positions. The caller MUST hold
+    /// `DENSE_COMPILED_MUTEX` for the entire draft+verify cycle to
+    /// prevent another turn from racing the offset / cache state.
+    pub fn mlx_qwen35_mtp_verify_compiled(
+        input_ids: *mut mlx_array,
+        embedding_weight: *mut mlx_array,
+        depth: i32,
+        out_logits: *mut *mut mlx_array,
+    );
+
+    /// W6.5 — verify pass that ALSO exports the post-final-norm hidden
+    /// state at EVERY verify position, so the MTP cycle macro can chain
+    /// into the next cycle's draft from the correct prediction context
+    /// without running a fresh main-model forward at "Step A".
+    ///
+    /// Behaviour is identical to `mlx_qwen35_mtp_verify_compiled` for
+    /// `out_logits` and the main-cache mutation contract. The extra
+    /// `out_hiddens` is a heap-allocated `[1, depth+1, hidden_size]`
+    /// bf16 array (caller owns) on success or null on failure — the
+    /// post-final-norm hidden at EACH of the D+1 verify positions
+    /// stacked along the time axis. The Rust caller slices position
+    /// `K` (= number of accepted drafts) AFTER the accept loop to seed
+    /// the next cycle's first MTP draft — `verify_hidden[K]` is the
+    /// prediction context for the committed token at position K+1
+    /// (bonus on full-accept, residual on rejection), matching the
+    /// MTP head's training contract `MTP(prev_hidden, embed(t)) ->
+    /// next-next logits`.
+    ///
+    /// Failure semantics match the logits-only variant — caller falls
+    /// back to a fresh Step A on the next cycle when either output is
+    /// null.
+    ///
+    /// Same locking contract as the logits-only variant: production
+    /// callers MUST hold `DENSE_COMPILED_MUTEX` for the entire
+    /// draft+verify cycle. The exported hidden is a lazy MLX array
+    /// whose graph references the verify's per-position `final_norm`
+    /// outputs; the caller MUST eval (or slice + eval) it BEFORE the
+    /// surrounding `CompiledResetGuard` drops, otherwise the underlying
+    /// buffer is released.
+    pub fn mlx_qwen35_mtp_verify_compiled_with_hidden(
+        input_ids: *mut mlx_array,
+        embedding_weight: *mut mlx_array,
+        depth: i32,
+        out_logits: *mut *mut mlx_array,
+        out_hiddens: *mut *mut mlx_array,
+    );
+
+    /// Same as `mlx_qwen35_mtp_verify_compiled_with_hidden`, plus
+    /// `out_argmax` as `[1, depth+1]` int32 target top-1 ids from the
+    /// same compiled verify graph for greedy sparse accept.
+    pub fn mlx_qwen35_mtp_verify_compiled_with_hidden_and_argmax(
+        input_ids: *mut mlx_array,
+        embedding_weight: *mut mlx_array,
+        depth: i32,
+        out_logits: *mut *mut mlx_array,
+        out_hiddens: *mut *mut mlx_array,
+        out_argmax: *mut *mut mlx_array,
+    );
+
+    /// Greedy verifier sibling that returns hiddens plus `[1, depth+1]`
+    /// target top-1 ids without surfacing full `[1, depth+1, vocab]`
+    /// verifier logits. Used only when diagnostics/top-1 cross-checks do
+    /// not require full logits.
+    pub fn mlx_qwen35_mtp_verify_compiled_with_hidden_and_argmax_only(
+        input_ids: *mut mlx_array,
+        embedding_weight: *mut mlx_array,
+        depth: i32,
+        out_hiddens: *mut *mut mlx_array,
+        out_argmax: *mut *mut mlx_array,
+    );
+
+    /// Stochastic sparse-target sibling of
+    /// `mlx_qwen35_mtp_verify_compiled_with_hidden_and_argmax`.
+    /// Returns hiddens plus compact `[depth+1, top_k]` target ids/probs
+    /// instead of full verifier logits. Currently supports sampler_mode=1
+    /// (MTPLX temperature-first parity).
+    pub fn mlx_qwen35_mtp_verify_compiled_with_hidden_and_sparse_target(
+        input_ids: *mut mlx_array,
+        embedding_weight: *mut mlx_array,
+        depth: i32,
+        temperature: f32,
+        top_k: i32,
+        top_p: f32,
+        sampler_mode: i32,
+        out_hiddens: *mut *mut mlx_array,
+        out_target_ids: *mut *mut mlx_array,
+        out_target_probs: *mut *mut mlx_array,
+    );
+
+    /// Phase 4b — paged-pool sibling of the batched MTP verify forward.
+    /// Reads K/V from `g_dense_k_pools[]` / `g_dense_v_pools[]` (set up
+    /// via `mlx_qwen35_init_paged`) instead of the BHTD
+    /// `g_compiled_caches[]`. Linear-attention layers source state from
+    /// `g_dense_paged_linear_caches[]`.
+    ///
+    /// Caller MUST construct:
+    ///   - `offset_arr`:   `[1]` int32 — RoPE start position.
+    ///   - `block_table`:  `[1, max_blocks_per_seq]` int32.
+    ///   - `slot_mapping`: `[depth + 1]` int64 — EXACT length required.
+    ///     The kernel reshapes new K/V to `B*T = depth+1` rows and calls
+    ///     `paged_kv_write`, which asserts
+    ///     `slot_mapping.shape(0) == new_k.shape(0)`. Callers using
+    ///     `PagedKVCacheAdapter::build_paged_attention_inputs` (which
+    ///     returns a `chunk_size_max`-padded array) MUST slice down to
+    ///     `[depth + 1]` before passing it in.
+    ///   - `seq_lens`:     `[1]` int32 — post-write context length.
+    ///   - `cu_seqlens_q`: `[2]` int32 = `[0, depth+1]`.
+    ///
+    /// Output: `*out_logits` ← `[1, depth+1, vocab]`, `*out_hiddens`
+    /// ← `[1, depth+1, hidden]`, `*out_argmax` ← `[1, depth+1]`.
+    /// All three are heap-allocated; caller owns. On error all pointers
+    /// are set to nullptr and a stderr diagnostic is emitted; global
+    /// state (pool / linear / BHTD) is unchanged.
+    ///
+    /// Preconditions: `g_compile_inited == true` AND
+    /// `g_dense_paged_inited == true`. The Rust dispatcher must keep
+    /// the BHTD verify path live as the fallback when either gate is
+    /// false.
+    ///
+    /// LOCKING: this FFI lazily writes to the process-global
+    /// `g_verify_compiled_paged[]` compile-cache table AND mutates
+    /// `g_dense_k_pools[]` / `g_dense_v_pools[]` /
+    /// `g_dense_paged_linear_caches[]` per call. Production callers MUST
+    /// hold `DENSE_COMPILED_MUTEX` AND a `COMPILED_WEIGHTS_RWLOCK` read
+    /// guard for the entire draft+verify cycle so no other turn can
+    /// race the pool / linear-cache mutation. Tests in
+    /// `compiled_ffi_tests` (see `mtp.rs`) serialise via `FFI_LOCK` in
+    /// the absence of concurrent main-path forward calls.
+    pub fn mlx_qwen35_forward_batched_verify_paged(
+        input_ids: *mut mlx_array,
+        embedding_weight: *mut mlx_array,
+        depth: i32,
+        offset_arr: *mut mlx_array,
+        block_table: *mut mlx_array,
+        slot_mapping: *mut mlx_array,
+        seq_lens: *mut mlx_array,
+        cu_seqlens_q: *mut mlx_array,
+        out_logits: *mut *mut mlx_array,
+        out_hiddens: *mut *mut mlx_array,
+        out_argmax: *mut *mut mlx_array,
+    );
+
+    /// W6.7 follow-up — Eagerly compile the batched verify graphs for
+    /// both `WithTape=false` and `WithTape=true` over depths {1..5}.
+    ///
+    /// Wire this immediately after a successful
+    /// `mlx_qwen35_mtp_compiled_init_from_main` so the first verify
+    /// cycle of each prompt no longer pays the MLX trace+compile cost.
+    /// Best-effort: failures are logged to stderr and swallowed —
+    /// callers MUST NOT check a return code, and the verify path will
+    /// fall back to its prior lazy-at-first-use behavior.
+    ///
+    /// Internally: populates the per-depth dispatch closures AND runs
+    /// one dummy `mlx_qwen35_forward_batched_verify` per (depth ∈ {1..5},
+    /// with_tape ∈ {false, true}) pair to force `mlx::core::eval` of
+    /// the compiled-graph outputs. Snapshots/restores the main path's
+    /// `g_compiled_caches` and `g_offset_int` so the prewarm leaves the
+    /// real decode state untouched.
+    pub fn mlx_qwen35_mtp_compiled_prewarm_verify();
+
+    /// Tear down MTP compiled state. Idempotent. Does NOT reset
+    /// the main path — call `mlx_qwen35_compiled_reset` separately.
+    pub fn mlx_qwen35_mtp_compiled_reset();
+
+    /// Adjust the MTP offset by `delta` (e.g. to rewind after a
+    /// verify-reject rolled back the main path). Mirrors
+    /// `mlx_qwen35_compiled_adjust_offset`.
+    pub fn mlx_qwen35_mtp_compiled_adjust_offset(delta: i32);
+
+    /// W6 Bug #2 fix (Option Reset): begin a fresh MTP draft cycle
+    /// aligned to the main path's current offset. Zeroes the MTP K/V
+    /// caches and sets the MTP offset to `main_offset`. Must be called
+    /// at the start of every MTP cycle inside `decode_loop_mtp!` —
+    /// without it the MTP offset drifts behind the main offset by 2
+    /// per cycle (1 Step-A forward + 1 verify[0] forward that the MTP
+    /// path doesn't see), producing wrong RoPE positions and gibberish.
+    pub fn mlx_qwen35_mtp_compiled_begin_cycle(main_offset: i32);
+
+    /// Chained committed-history variant. Starts the draft offset at
+    /// `g_mtp_committed_len - 1` so the first chained draft overwrites
+    /// the already-committed anchor token instead of appending a
+    /// duplicate anchor slot.
+    pub fn mlx_qwen35_mtp_compiled_begin_chained_cycle(main_offset: i32);
+
+    /// Read the current MTP offset (for debugging / tests).
+    pub fn mlx_qwen35_mtp_get_offset() -> i32;
+
+    /// Read the current persistent MTP committed-history prefix length.
+    pub fn mlx_qwen35_mtp_get_committed_len() -> i32;
+
+    /// Set/read the absolute sequence position of local MTP cache slot 0.
+    /// Used by MTPLX-style last-window prompt history.
+    pub fn mlx_qwen35_mtp_set_position_base(position_base: i32);
+    pub fn mlx_qwen35_mtp_get_position_base() -> i32;
+
+    /// Phase C — committed-history MTP cache policy: append exact
+    /// committed K/V to the persistent MTP cache.
+    ///
+    /// Called once per draft cycle, AFTER the accept loop computes the
+    /// accepted-draft count K and BEFORE rollback. Computes the MTP
+    /// layer-0 attention K/V for `M` committed tokens from their hidden
+    /// / embedding rows (assembled Rust-side), writes them into
+    /// the persistent MTP KV cache at absolute positions
+    /// `[g_mtp_committed_len .. g_mtp_committed_len+M)`, and advances
+    /// the committed-prefix counter by exactly `M` — so the MTP prefix
+    /// length stays equal to the real decode sequence length and RoPE
+    /// positions never drift.
+    ///
+    /// `hidden_seq` and `gathered_embs` are both `[1, M, hidden]` bf16,
+    /// pre-assembled Rust-side: `hidden_seq[i]` = hidden of the token
+    /// BEFORE committed token `i` (the MTP `MTP(h(t), emb(t+1))`
+    /// contract), `gathered_embs[i]` = input embedding of committed
+    /// token `i`. `m` is in `[1, 7]`; the one-token case is required by
+    /// chained all-reject cycles.
+    ///
+    /// SIDE EFFECTS: mutates `g_mtp_compiled_caches[]` and advances
+    /// `g_mtp_committed_len` / `g_mtp_offset_int` by `m`. Same locking
+    /// contract as the other MTP FFIs — the caller MUST hold
+    /// `DENSE_COMPILED_MUTEX` for the cycle.
+    ///
+    /// Returns `0` on success (committed exactly `m` slots). Returns a
+    /// distinct non-zero code on any failure (1 = not-inited/null arg,
+    /// 2 = bad `m`, 3 = capacity overflow, 4 = std exception,
+    /// 5 = unknown exception). On every non-zero return
+    /// `g_mtp_committed_len` is left UNCHANGED.
+    pub fn mlx_qwen35_mtp_compiled_commit(
+        hidden_seq: *mut mlx_array,
+        gathered_embs: *mut mlx_array,
+        m: i32,
+    ) -> i32;
 
     // ============================================
     // Qwen3.5 VLM Prefill
@@ -1668,6 +2246,18 @@ unsafe extern "C-unwind" {
     /// Eval next_token and all MoE cache arrays to prevent graph accumulation.
     pub fn mlx_qwen35_moe_eval_token_and_caches(next_token: *mut mlx_array);
 
+    /// W6.5-resume — MoE twin of `mlx_qwen35_eval_token_caches_and_extra`.
+    /// Folds an extra array into the same `async_eval` dispatch as the
+    /// next token (and, when `MLX_EVAL_ALL_CACHES` is set, the full MoE
+    /// cache vector). Used by the chained-cycles MTP path to fuse the
+    /// `verify_hidden[K]` slice with the next-cycle draft eval.
+    ///
+    /// `extra` MAY be null.
+    pub fn mlx_qwen35_moe_eval_token_caches_and_extra(
+        next_token: *mut mlx_array,
+        extra: *mut mlx_array,
+    );
+
     /// Reset MoE state.
     pub fn mlx_qwen35_moe_reset();
 
@@ -1696,6 +2286,174 @@ unsafe extern "C-unwind" {
 
     /// Adjust MoE cache offset by delta (for VLM M-RoPE position correction).
     pub fn mlx_qwen35_moe_adjust_offset(delta: i32);
+
+    /// W6 MoE (MTP) Bug #4 — snapshot the MoE compiled path's GDN
+    /// linear-attention caches plus the decode offset. Mirrors the
+    /// dense-path `mlx_qwen35_compiled_snapshot_linear_caches`.
+    pub fn mlx_qwen35_moe_compiled_snapshot_linear_caches();
+
+    /// W6 MoE (MTP) Bug #4 — restore the MoE compiled path's GDN
+    /// linear-attention caches AND the decode offset from the most
+    /// recent snapshot. Mirrors the dense-path
+    /// `mlx_qwen35_compiled_restore_linear_caches`.
+    pub fn mlx_qwen35_moe_compiled_restore_linear_caches();
+
+    /// Whether the main MoE compiled path is initialised. Returns 1 if
+    /// `mlx_qwen35_moe_init_from_prefill` has successfully run since the
+    /// last `mlx_qwen35_moe_reset`, 0 otherwise. Used by
+    /// `mlx_qwen35_moe_mtp_compiled_init_from_main` as a precondition.
+    pub fn mlx_qwen35_moe_is_compile_inited() -> i32;
+
+    /// W6 MoE (MTP): export a heap-allocated deep copy of the
+    /// post-final-norm hidden state of the last decoded token,
+    /// captured by the most recent `mlx_qwen35_moe_forward`. Sets
+    /// `*out` to a heap-allocated `mlx_array*` of shape
+    /// `[1, hidden_size]` bf16 on success, or `nullptr` if no
+    /// forward has run since the last reset. Caller owns the
+    /// returned handle (use `mlx_array_delete`). Mirrors the dense
+    /// `mlx_qwen35_export_last_hidden` contract.
+    pub fn mlx_qwen35_moe_export_last_hidden(out: *mut *mut mlx_array);
+
+    /// Test-only: forcibly mark the main MoE compiled path as initialised
+    /// (or not) without going through `init_from_prefill`. Production code
+    /// MUST NOT call this — the W5 MoE MTP smoke tests use it to satisfy
+    /// the `is_compile_inited` precondition without standing up a full
+    /// MoE decoder cache.
+    pub fn mlx_qwen35_moe_compiled_test_force_inited(inited: i32);
+
+    // ============================================
+    // W5 — Qwen3.5 MoE MTP (Multi-Token Prediction) compiled
+    // draft + verify graphs. See
+    // `crates/mlx-sys/src/mlx_qwen35_moe_mtp_compiled.cpp` for
+    // implementation. ALL three FFIs MUST be called inside the
+    // same `MOE_COMPILED_MUTEX` critical section as the main MoE
+    // compiled forward — the verify FFI loops the main MoE forward
+    // and mutates `g_moe_caches` / `g_moe_offset_int` in place.
+    // ============================================
+
+    /// Initialize the MoE MTP compiled state. MUST be called once per
+    /// turn AFTER `mlx_qwen35_moe_init_from_prefill`. The MTP path
+    /// allocates its OWN per-layer KV caches sized to `max_kv_len`;
+    /// the main MoE caches are left untouched.
+    ///
+    /// Returns `0` on success, `-1` on failure (n_mtp_layers <= 0,
+    /// main MoE path not inited, MTP weights not registered, exception).
+    /// On `-1` the Rust caller MUST skip the compiled draft/verify path
+    /// and fall back to the eager Rust MoE MTP forward.
+    pub fn mlx_qwen35_moe_mtp_compiled_init_from_main(
+        num_layers: i32,
+        hidden_size: i32,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        rope_theta: f32,
+        rope_dims: i32,
+        rms_norm_eps: f32,
+        full_attention_interval: i32,
+        linear_num_k_heads: i32,
+        linear_num_v_heads: i32,
+        linear_key_head_dim: i32,
+        linear_value_head_dim: i32,
+        linear_conv_kernel_dim: i32,
+        tie_word_embeddings: i32,
+        max_kv_len: i32,
+        batch_size: i32,
+        n_mtp_layers: i32,
+        num_experts: i32,
+        num_experts_per_tok: i32,
+        norm_topk_prob: i32,
+        decoder_sparse_step: i32,
+        // Precomputed eager-path MLP flavor for the MTP layer
+        // (`is_moe_layer(fa_idx)` → 1 MoE / 0 dense). Honors
+        // `mlp_only_layers` + the sparse-step modulo, which the FFI side
+        // cannot reconstruct — keeps the compiled `mtp.layers.*.mlp.*`
+        // dispatch in lock-step with the Rust loader.
+        mtp_layer_is_moe: i32,
+    ) -> i32;
+
+    /// One MoE MTP draft step. `prev_hidden` and `prev_emb` are both
+    /// `[1, 1, hidden]` bf16. On success sets `*out_h_next` and
+    /// `*out_logits` to heap-allocated `mlx_array*` (caller owns
+    /// — use `mlx_array_delete`). On failure (init not done, exception)
+    /// both outputs are set to null.
+    ///
+    /// Advances the MoE MTP offset by 1 and mutates the MoE MTP KV
+    /// caches in place. Independent of the main MoE path's offset.
+    pub fn mlx_qwen35_moe_mtp_draft_compiled(
+        prev_hidden: *mut mlx_array,
+        prev_emb: *mut mlx_array,
+        out_h_next: *mut *mut mlx_array,
+        out_logits: *mut *mut mlx_array,
+    );
+
+    /// One MoE MTP verify step on `depth + 1` tokens. `input_ids` is
+    /// `[1, depth+1]` int32, `embedding_weight` is the model's
+    /// embedding (or LM head if untied). `depth` MUST be in `[1, 5]`
+    /// — values outside that range are rejected with a null-pointer
+    /// return and stderr diagnostic.
+    ///
+    /// Sets `*out_logits` to a heap-allocated `[1, depth+1, vocab]`
+    /// array (caller owns) on success, null on failure.
+    ///
+    /// SIDE EFFECTS: advances the MAIN MoE compiled path's offset by
+    /// `depth + 1` and writes K/V into `g_moe_caches[]` at the
+    /// corresponding positions. The caller MUST hold `MOE_COMPILED_MUTEX`
+    /// (NOT `DENSE_COMPILED_MUTEX`) for the entire draft+verify cycle
+    /// to prevent another turn from racing the offset / cache state.
+    pub fn mlx_qwen35_moe_mtp_verify_compiled(
+        input_ids: *mut mlx_array,
+        embedding_weight: *mut mlx_array,
+        depth: i32,
+        out_logits: *mut *mut mlx_array,
+    );
+
+    /// W6.5 — MoE verify pass that ALSO exports the post-final-norm
+    /// hidden state at EVERY verify position. MoE twin of
+    /// `mlx_qwen35_mtp_verify_compiled_with_hidden` — see that FFI's
+    /// docstring for the chaining rationale, slice-K semantics, and
+    /// lifetime contract.
+    ///
+    /// Same locking contract: production callers MUST hold
+    /// `MOE_COMPILED_MUTEX` (NOT the dense one) for the entire
+    /// draft+verify cycle. `out_hiddens` is a heap-allocated
+    /// `[1, depth+1, hidden_size]` bf16 array on success, null on
+    /// failure; lifetime mirrors the dense variant.
+    pub fn mlx_qwen35_moe_mtp_verify_compiled_with_hidden(
+        input_ids: *mut mlx_array,
+        embedding_weight: *mut mlx_array,
+        depth: i32,
+        out_logits: *mut *mut mlx_array,
+        out_hiddens: *mut *mut mlx_array,
+    );
+
+    /// W6.7 follow-up — Eagerly compile the MoE batched verify graph for
+    /// depths {1..5}. MoE has only the no-tape variant (W6.6 tape-replay
+    /// is deferred for MoE), so this prewarms 5 shapes total.
+    ///
+    /// Wire this immediately after a successful
+    /// `mlx_qwen35_moe_mtp_compiled_init_from_main`. Best-effort:
+    /// failures are logged to stderr and swallowed — callers MUST NOT
+    /// check a return code, and the verify path will fall back to its
+    /// prior lazy-at-first-use behavior.
+    pub fn mlx_qwen35_moe_mtp_compiled_prewarm_verify();
+
+    /// Tear down MoE MTP compiled state. Idempotent. Does NOT reset
+    /// the main MoE path — call `mlx_qwen35_moe_reset` separately.
+    pub fn mlx_qwen35_moe_mtp_compiled_reset();
+
+    /// Adjust the MoE MTP offset by `delta` (e.g. to rewind after a
+    /// verify-reject rolled back the main MoE path). Mirrors
+    /// `mlx_qwen35_mtp_compiled_adjust_offset` on the dense side.
+    pub fn mlx_qwen35_moe_mtp_compiled_adjust_offset(delta: i32);
+
+    /// W6 Bug #2 fix (Option Reset): begin a fresh MoE MTP draft cycle
+    /// aligned to the main MoE path's current offset. See dense
+    /// `mlx_qwen35_mtp_compiled_begin_cycle` for the full rationale —
+    /// the divergence and fix are identical.
+    pub fn mlx_qwen35_moe_mtp_compiled_begin_cycle(main_offset: i32);
+
+    /// Read the current MoE MTP offset (for debugging / tests).
+    pub fn mlx_qwen35_moe_mtp_get_offset() -> i32;
 
     // ============================================
     // Phase 4 piece 1: paged MoE forward (coexists with the flat path).

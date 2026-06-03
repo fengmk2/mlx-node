@@ -14,14 +14,54 @@
 #include "mlx_paged_ops.h"
 
 #include <atomic>
+#include <cctype>
 #include <cstdio>
+#include <cstdlib>
+#include <functional>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
+
+// Cross-TU reload-invalidation hooks for the MTP compiled draft/commit graphs.
+// Defined in mlx_qwen35_mtp_compiled.cpp / mlx_qwen35_moe_mtp_compiled.cpp;
+// called transitively from the dense / MoE main `*_invalidate_compiled_graphs`
+// reload entry points so a model reload re-traces every weight-baking graph.
+extern "C" void mlx_qwen35_mtp_invalidate_compiled_graphs();
+extern "C" void mlx_qwen35_moe_mtp_invalidate_compiled_graphs();
 
 namespace qwen35_common {
+
+// =====================================================================
+// MTP control-flow tracing (W6.34)
+// =====================================================================
+//
+// Gated by `MLX_MTP_TRACE`: set to `1` / `true` / `on` (case-insensitive,
+// surrounding whitespace ignored) to emit C++-side ENTER/EXIT traces for
+// the MTP draft / verify entrypoints. Default OFF so production decode is
+// not flooded. Truthy parsing mirrors the Rust `MLX_MTP_*` readers in
+// `crates/mlx-core/src/models/qwen3_5/chat_common.rs` and the C++
+// `bucketed_verify_disabled()` reader so the convention is uniform.
+inline bool mtp_trace_enabled() {
+  static const bool enabled = []() {
+    const char* raw = std::getenv("MLX_MTP_TRACE");
+    if (!raw) return false;
+    std::string v(raw);
+    size_t s = 0;
+    while (s < v.size() && std::isspace(static_cast<unsigned char>(v[s]))) s++;
+    size_t e = v.size();
+    while (e > s && std::isspace(static_cast<unsigned char>(v[e - 1]))) e--;
+    std::string trimmed = v.substr(s, e - s);
+    for (char& c : trimmed) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return trimmed == "1" || trimmed == "true" || trimmed == "on";
+  }();
+  return enabled;
+}
 
 // =====================================================================
 // Global weight storage (shared between dense and MoE)
@@ -135,9 +175,24 @@ inline int infer_affine_bits(const array& w, const array& scales, int group_size
 //      so it's visible when the registry path is unexpectedly bypassed.
 //   3. If no `.scales` companion exists at all, the weight is bf16/f16
 //      and we use plain matmul against the pre-transposed weight.
+// Set + mutex tracking which `linear_proj` prefixes have already
+// emitted a one-shot dispatch trace. Lazily initialised so the linker
+// instantiates a single shared copy across all TUs that include this
+// header.
+inline std::unordered_set<std::string>& g_linear_proj_logged_prefixes() {
+  static std::unordered_set<std::string> instance;
+  return instance;
+}
+
+inline std::mutex& g_linear_proj_logged_mutex() {
+  static std::mutex instance;
+  return instance;
+}
+
 inline array linear_proj(const array& x, const std::string& prefix) {
   std::string scales_key = prefix + ".scales";
-  if (has_weight(scales_key)) {
+  bool scales_present = has_weight(scales_key);
+  if (scales_present) {
     auto w = get_weight(prefix + ".weight");
     auto scales = get_weight(scales_key);
     std::string biases_key = prefix + ".biases";
@@ -148,6 +203,19 @@ inline array linear_proj(const array& x, const std::string& prefix) {
 
     // Registry-first dispatch.
     if (auto info = lookup_quant_info(prefix)) {
+      // One-shot dispatch trace per NEW prefix. Gated because this fires
+      // once per projection and otherwise floods benchmark worker stderr.
+      if (mtp_trace_enabled()) {
+        std::lock_guard<std::mutex> lk(g_linear_proj_logged_mutex());
+        if (g_linear_proj_logged_prefixes().insert(prefix).second) {
+          fprintf(stderr,
+                  "[MLX] linear_proj dispatch: prefix='%s' scales_present=1 "
+                  "registered_quant_mode='%s' bits=%d group_size=%d "
+                  "fallback_used=0\n",
+                  prefix.c_str(), info->mode.c_str(), info->bits,
+                  info->group_size);
+        }
+      }
       return mlx::core::quantized_matmul(
           x, w, scales, biases, /*transpose=*/true,
           info->group_size, info->bits, info->mode);
@@ -167,11 +235,33 @@ inline array linear_proj(const array& x, const std::string& prefix) {
               "back to companion-tensor heuristic.\n",
               prefix.c_str());
     }
+    // One-shot dispatch trace per NEW prefix (fallback branch).
+    if (mtp_trace_enabled()) {
+      std::lock_guard<std::mutex> lk(g_linear_proj_logged_mutex());
+      if (g_linear_proj_logged_prefixes().insert(prefix).second) {
+        const char* mode = biases.has_value() ? "affine(infer)" : "mxfp8(heuristic)";
+        fprintf(stderr,
+                "[MLX] linear_proj dispatch: prefix='%s' scales_present=1 "
+                "registered_quant_mode=NONE fallback_used=1 fallback_mode='%s'\n",
+                prefix.c_str(), mode);
+      }
+    }
     if (!biases.has_value()) {
       return mlx::core::quantized_matmul(x, w, scales, biases, true, 32, 8, "mxfp8");
     } else {
       int bits = infer_affine_bits(w, scales, 64);
       return mlx::core::quantized_matmul(x, w, scales, biases, true, 64, bits, "affine");
+    }
+  }
+  // One-shot dispatch trace per NEW prefix (plain matmul branch).
+  if (mtp_trace_enabled()) {
+    std::lock_guard<std::mutex> lk(g_linear_proj_logged_mutex());
+    if (g_linear_proj_logged_prefixes().insert(prefix).second) {
+      fprintf(stderr,
+              "[MLX] linear_proj dispatch: prefix='%s' scales_present=0 "
+              "registered_quant_mode=NONE fallback_used=0 "
+              "fallback_mode='bf16_matmul'\n",
+              prefix.c_str());
     }
   }
   return matmul(x, get_weight_t(prefix + ".weight"));
@@ -249,6 +339,24 @@ struct BaseConfig {
 // =====================================================================
 // Compiled helper functions
 // =====================================================================
+
+// Wrap a weight-baking compiled-graph function so MLX assigns it a UNIQUE,
+// erasable compile-cache identity. The graph reads model weights via
+// get_weight() at trace time, so the weights are baked into the cached tape.
+// MLX keys its compile cache on a fun_id: a free function (or captureless
+// lambda) yields a STABLE code-address fun_id with NO eviction hook, so
+// assigning {} to the std::function does NOT erase the tape — a reloaded model
+// silently replays the previous model's baked weights. Capturing `fn` makes the
+// closure non-convertible to a function pointer, routing through
+// compile(std::function) -> get_function_address()==0 -> a heap shared_ptr
+// fun_id whose deleter calls compile_erase(): assigning {} frees the tape and
+// the next compile re-traces against the live weights. See compile.cpp:1205-1241.
+inline std::function<std::vector<array>(const std::vector<array>&)>
+compile_resettable_weight_graph(
+    std::vector<array> (*fn)(const std::vector<array>&)) {
+  return mlx::core::compile(
+      [fn](const std::vector<array>& inputs) { return fn(inputs); });
+}
 
 inline array rms_norm_no_weight(const array& x, float eps) {
   return fast::rms_norm(x, std::nullopt, eps);
@@ -473,12 +581,163 @@ inline std::pair<array, array> gated_delta_kernel_call(
 }
 
 // =====================================================================
+// W6.6 — Tape-emitting GDN kernel for MTP rollback. Mirrors the standard
+// gated-delta kernel but emits the per-step innovation `delta` as a
+// third output (`tape`, fp32, shape `[B, T, Hv, Dv]`). The MTP verify
+// path records `(tape, k, g, qkv)` per layer during the D+1 verify
+// forward; on rollback the tape-replay kernel applies the first
+// `accepted_steps` innovations to the pre-verify snapshot state without
+// re-running the main model forward.
+//
+// See `metal/gated_delta_step_tape.metal.inc` for the kernel source
+// (ported verbatim from DFlash `_gated_delta_tape_kernel`).
+// =====================================================================
+
+inline std::unique_ptr<mlx::core::fast::CustomKernelFunction>& qwen35_gd_tape_kernel() {
+  static std::unique_ptr<mlx::core::fast::CustomKernelFunction> instance;
+  return instance;
+}
+
+inline void ensure_gated_delta_tape_kernel() {
+  std::lock_guard<std::mutex> lock(qwen35_kernel_mutex());
+  if (qwen35_gd_tape_kernel()) return;
+
+  static const char* source =
+    #include "metal/gated_delta_step_tape.metal.inc"
+  ;
+
+  auto kernel = fast::metal_kernel(
+      "gated_delta_step_tape",
+      {"q", "k", "v", "g", "beta", "state_in", "T"},
+      {"y", "state_out", "innovation_tape"},
+      source
+  );
+  qwen35_gd_tape_kernel() = std::make_unique<mlx::core::fast::CustomKernelFunction>(std::move(kernel));
+}
+
+// Returns (y, state_out, tape). `tape` is fp32, shape `[B, T, Hv, Dv]`.
+inline std::tuple<array, array, array> gated_delta_kernel_with_tape_call(
+    const array& q, const array& k, const array& v,
+    const array& g, const array& beta_arr,
+    const array& state) {
+  ensure_gated_delta_tape_kernel();
+
+  int B = q.shape(0);
+  int T = q.shape(1);
+  int Hk = q.shape(2);
+  int Dk = q.shape(3);
+  int Hv = v.shape(2);
+  int Dv = v.shape(3);
+  auto input_type = q.dtype();
+  auto T_arr = array(T, mlx::core::int32);
+
+  auto results = (*qwen35_gd_tape_kernel())(
+      {q, k, v, g, beta_arr, state, T_arr},
+      {Shape{B, T, Hv, Dv}, state.shape(), Shape{B, T, Hv, Dv}},
+      {input_type, input_type, mlx::core::float32},
+      std::make_tuple(32, Dv, B * Hv),
+      std::make_tuple(32, 4, 1),
+      {{"InT", input_type}, {"Dk", Dk}, {"Dv", Dv}, {"Hk", Hk}, {"Hv", Hv}},
+      std::nullopt, false,
+      mlx::core::default_stream(mlx::core::Device::gpu)
+  );
+
+  return std::tuple<array, array, array>(
+      std::move(results[0]), std::move(results[1]), std::move(results[2]));
+}
+
+// =====================================================================
+// W6.6 — Tape-replay kernel. Takes a snapshot `state`, plus per-step
+// `(tape, k, g)` recorded by the tape-emitting forward kernel, and
+// returns a new state advanced by `T` steps. The recurrent_state output
+// matches what `T` calls to `gated_delta_kernel_call` with the same
+// per-step inputs would have produced (modulo the per-step InT
+// round-trip the forward path takes between FFI calls in our verify
+// loop — see `metal/tape_replay.metal.inc` header for details).
+//
+// `tape.shape == [B, T, Hv, Dv]` (fp32)
+// `k.shape    == [B, T, Hk, Dk]` (model dtype)
+// `g.shape    == [B, T, Hv]` (fp32)
+// `state.shape == [B, Hv, Dv, Dk]` (model dtype)
+// =====================================================================
+
+inline std::unique_ptr<mlx::core::fast::CustomKernelFunction>& qwen35_tape_replay_kernel() {
+  static std::unique_ptr<mlx::core::fast::CustomKernelFunction> instance;
+  return instance;
+}
+
+inline void ensure_tape_replay_kernel() {
+  std::lock_guard<std::mutex> lock(qwen35_kernel_mutex());
+  if (qwen35_tape_replay_kernel()) return;
+
+  static const char* source =
+    #include "metal/tape_replay.metal.inc"
+  ;
+
+  auto kernel = fast::metal_kernel(
+      "tape_replay",
+      {"tape", "k", "g", "state_in", "T"},
+      {"state_out"},
+      source
+  );
+  qwen35_tape_replay_kernel() = std::make_unique<mlx::core::fast::CustomKernelFunction>(std::move(kernel));
+}
+
+inline array tape_replay_kernel_call(
+    const array& tape, const array& k, const array& g,
+    const array& state) {
+  ensure_tape_replay_kernel();
+
+  int B = k.shape(0);
+  int T = k.shape(1);
+  int Hk = k.shape(2);
+  int Dk = k.shape(3);
+  int Hv = tape.shape(2);
+  int Dv = tape.shape(3);
+  auto input_type = state.dtype();
+  auto T_arr = array(T, mlx::core::int32);
+
+  auto results = (*qwen35_tape_replay_kernel())(
+      {tape, k, g, state, T_arr},
+      {state.shape()},
+      {input_type},
+      std::make_tuple(32, Dv, B * Hv),
+      std::make_tuple(32, 4, 1),
+      {{"InT", input_type}, {"Dk", Dk}, {"Dv", Dv}, {"Hk", Hk}, {"Hv", Hv}},
+      std::nullopt, false,
+      mlx::core::default_stream(mlx::core::Device::gpu)
+  );
+
+  return std::move(results[0]);
+}
+
+// =====================================================================
 // Pure GDN forward (shared between dense compiled and MoE non-compiled)
 // =====================================================================
 
 struct GDNPureResult { array output, conv_state, recurrent_state; };
 
-inline GDNPureResult gdn_pure_fn(
+// W6.6 — extended GDN result that also returns the per-step `(tape, k, g,
+// qkv)` tensors needed by the rollback tape-replay path. `tape` is fp32
+// `[B, 1, Hv, Dv]`, `k` is `[B, 1, Hk, Dk]` (model dtype), `g` is
+// `[B, 1, Hv]` (fp32), `qkv` is `[B, 1, conv_dim]` (model dtype — the
+// pre-conv qkv projection before the depthwise-conv state advance).
+struct GDNPureResultWithTape {
+  array output, conv_state, recurrent_state;
+  array tape, k_tape, g_tape, qkv_tape;
+};
+
+// Unified `gdn_pure_fn` templated on `WithTape`. When `WithTape=false`
+// returns `GDNPureResult`; when `WithTape=true` returns the extended
+// `GDNPureResultWithTape` that also carries the per-step `(tape, k, g,
+// qkv)` tensors consumed by the rollback tape-replay path. Both
+// instantiations are math-identical to the legacy
+// `gdn_pure_fn` / `gdn_pure_fn_with_tape` pair — only the underlying
+// Metal kernel differs (`gated_delta_kernel_call` vs
+// `gated_delta_kernel_with_tape_call`).
+template <bool WithTape>
+inline std::conditional_t<WithTape, GDNPureResultWithTape, GDNPureResult>
+gdn_pure_fn_impl(
     const array& x,              // [B, hidden] — 2D
     int layer_idx,
     const array& conv_state,      // [B, kernel-1, conv_dim]
@@ -515,7 +774,8 @@ inline GDNPureResult gdn_pure_fn(
             linear_proj(x, pfx + "in_proj_a")};
   }();
 
-  // Reshape qkv to 3D for conv1d
+  // Reshape qkv to 3D for conv1d — when WithTape this is also the tensor
+  // we record for conv-state replay.
   auto qkv_3d = reshape(qkv, {B, 1, conv_dim});
 
   auto conv_input = concatenate({conv_state, qkv_3d}, 1);
@@ -552,8 +812,22 @@ inline GDNPureResult gdn_pure_fn(
   auto dt_b   = get_weight(pfx + "dt_bias");
   auto g_3d = reshape(fused_compute_g(a_log, a, dt_b), {B, 1, cfg.linear_num_v_heads});
 
-  // Metal kernel
-  auto [y, new_recurrent_state] = gated_delta_kernel_call(q, k, v, g_3d, beta_3d, recurrent_state);
+  // Metal kernel — non-tape returns (y, recurrent_state); tape variant
+  // additionally returns the per-step delta `tape` [B, 1, Hv, Dv] fp32.
+  // `array` has no default ctor, so we emit the kernel call inside a
+  // lambda whose return type encodes both variants. Downstream graph
+  // (rmsnorm + out_proj) is shared.
+  auto kernel_out = [&] {
+    if constexpr (WithTape) {
+      return gated_delta_kernel_with_tape_call(q, k, v, g_3d, beta_3d, recurrent_state);
+    } else {
+      return gated_delta_kernel_call(q, k, v, g_3d, beta_3d, recurrent_state);
+    }
+  }();
+  // `kernel_out` is `tuple` (tape) or `pair` (non-tape); `std::get<0/1>`
+  // works for both.
+  auto& y                   = std::get<0>(kernel_out);
+  auto& new_recurrent_state = std::get<1>(kernel_out);
 
   // RMSNorm gating
   auto z_h = reshape(z, {B, 1, cfg.linear_num_v_heads, cfg.linear_value_head_dim});
@@ -565,7 +839,41 @@ inline GDNPureResult gdn_pure_fn(
   auto y_flat = reshape(y_normed, {B, value_dim});
   auto output = linear_proj(y_flat, pfx + "out_proj");
 
-  return {output, new_conv_state, new_recurrent_state};
+  if constexpr (WithTape) {
+    // k after rmsnorm+scale, g fp32 — captured before the kernel call.
+    return GDNPureResultWithTape{
+        std::move(output), std::move(new_conv_state), std::move(new_recurrent_state),
+        std::move(std::get<2>(kernel_out)), std::move(k), std::move(g_3d), std::move(qkv_3d)};
+  } else {
+    return GDNPureResult{std::move(output), std::move(new_conv_state),
+                         std::move(new_recurrent_state)};
+  }
+}
+
+// Backwards-compatible thin wrappers. Callers continue to use
+// `gdn_pure_fn(...)` / `gdn_pure_fn_with_tape(...)` exactly as before;
+// the actual body lives in the templated `gdn_pure_fn_impl`.
+inline GDNPureResult gdn_pure_fn(
+    const array& x,
+    int layer_idx,
+    const array& conv_state,
+    const array& recurrent_state,
+    const BaseConfig& cfg) {
+  return gdn_pure_fn_impl<false>(x, layer_idx, conv_state, recurrent_state, cfg);
+}
+
+// W6.6 — Tape-recording variant of `gdn_pure_fn`. Identical math; the
+// only difference is the underlying Metal kernel call returns the
+// per-step `tape` innovation, and we also surface `(k, g, qkv)` for the
+// tape-replay rollback to consume. Used by the dense and MoE main
+// forwards during MTP verify cycles when tape-replay is enabled.
+inline GDNPureResultWithTape gdn_pure_fn_with_tape(
+    const array& x,
+    int layer_idx,
+    const array& conv_state,
+    const array& recurrent_state,
+    const BaseConfig& cfg) {
+  return gdn_pure_fn_impl<true>(x, layer_idx, conv_state, recurrent_state, cfg);
 }
 
 // =====================================================================
@@ -582,7 +890,7 @@ inline AttnPureResult attn_pure_fn(
     const array& attn_mask,  // [1, 1, 1, max_kv_len] additive mask (ignored when dynamic_kv=true)
     int offset,
     const BaseConfig& cfg,
-    bool dynamic_kv = false) {  // true = slice KV to valid range, skip mask (MoE path)
+    bool dynamic_kv = false) {  // true = slice KV to valid range, skip mask (W6.21 T=1 decode)
   int B = x.shape(0);
   std::string pfx = "layers." + std::to_string(layer_idx) + ".self_attn.";
 
@@ -626,14 +934,22 @@ inline AttnPureResult attn_pure_fn(
   float scale = std::pow((float)cfg.head_dim, -0.5f);
   auto attn_out = [&]() -> array {
     if (dynamic_kv) {
-      // MoE path: slice KV cache to valid range [0..offset+1], pass no mask → faster SDPA kernel
+      // W6.21 — slice KV cache to valid range [0..offset+1], pass no mask
+      // → faster SDPA kernel. Mirrors upstream mlx-lm's
+      // `create_attention_mask(N=1) → None` + `cache.state` slicing
+      // pattern (see ./mlx-lm/mlx_lm/models/base.py:51-52 and
+      // ./mlx-lm/mlx_lm/models/cache.py:362-368). Only safe when the
+      // caller is NOT inside `mlx::core::compile` — the slice length
+      // depends on the C++ `offset` int which changes per decode step,
+      // so a compiled graph would mis-cache. Currently used by the
+      // dense flat decode path (`qwen35_decode_fn` in mlx_qwen35.cpp).
       int valid_len = offset + 1;
       auto valid_keys   = slice(new_kv_keys,   {0, 0, 0, 0}, {B, cfg.num_kv_heads, valid_len, cfg.head_dim});
       auto valid_values = slice(new_kv_values, {0, 0, 0, 0}, {B, cfg.num_kv_heads, valid_len, cfg.head_dim});
       return fast::scaled_dot_product_attention(
           queries, valid_keys, valid_values, scale, "", std::nullopt, {});
     } else {
-      // Dense compiled path: fixed shapes + additive mask (required for mlx::core::compile)
+      // Compiled / verify paths: fixed shapes + additive mask (required for mlx::core::compile)
       return fast::scaled_dot_product_attention(
           queries, new_kv_keys, new_kv_values, scale, "", attn_mask, {});
     }
@@ -651,6 +967,98 @@ inline AttnPureResult attn_pure_fn(
   if (has_weight(pfx + "o_proj.bias")) output = output + get_weight(pfx + "o_proj.bias");
 
   return {output, new_kv_keys, new_kv_values};
+}
+
+// =====================================================================
+// W5 (MTP) helper: attention forward with array-valued RoPE offset and
+// parameterised weight prefix.
+//
+// Mirrors `attn_pure_fn` but:
+//   - Reads weights from `<prefix>.self_attn.*` (NOT hard-coded
+//     `layers.{i}.self_attn.*`), so the MTP compiled draft graph
+//     (`mtp.layers.{j}.self_attn.*`) and the per-depth verify graph
+//     (`layers.{i}.self_attn.*`) can both share this helper without
+//     duplicating the attention body.
+//   - Takes the cache write offset as a `[1] int32` array so the closure
+//     can be cached by `mlx::core::compile(...)`. The flat-path
+//     `attn_pure_fn` captures a C++ `int` which invalidates the compile
+//     cache every step; this variant threads the offset through the
+//     graph instead.
+//
+// Behavior, shapes and weight-key conventions otherwise match
+// `attn_pure_fn(dynamic_kv=false)` exactly. The function intentionally
+// does NOT support `dynamic_kv` — the verify / MTP draft graphs always
+// rely on the additive `attn_mask` (compile requires fixed shapes).
+// =====================================================================
+inline AttnPureResult attn_pure_fn_arr_rope_write_offset(
+    const array& x,             // [B, hidden] — 2D
+    const std::string& layer_prefix,  // e.g. "layers.3" or "mtp.layers.0"
+    const array& kv_keys,       // [B, Hkv, max_kv_len, D]
+    const array& kv_values,     // [B, Hkv, max_kv_len, D]
+    const array& attn_mask,     // [1, 1, 1, max_kv_len] additive bf16 mask
+    const array& rope_offset_arr,   // [1] int32 — RoPE absolute position
+    const array& write_offset_arr,  // [1] int32 — local slice_update slot
+    const BaseConfig& cfg) {
+  int B = x.shape(0);
+  std::string pfx = layer_prefix + ".self_attn.";
+
+  auto q_proj = linear_proj(x, pfx + "q_proj");
+  if (has_weight(pfx + "q_proj.bias")) q_proj = q_proj + get_weight(pfx + "q_proj.bias");
+
+  auto qph    = reshape(q_proj, {B, 1, cfg.num_heads, cfg.head_dim * 2});
+  auto queries = slice(qph, {0, 0, 0, 0},            {B, 1, cfg.num_heads, cfg.head_dim});
+  auto gate    = slice(qph, {0, 0, 0, cfg.head_dim}, {B, 1, cfg.num_heads, cfg.head_dim * 2});
+  gate = reshape(gate, {B, cfg.num_heads * cfg.head_dim});
+
+  auto keys   = linear_proj(x, pfx + "k_proj");
+  auto values = linear_proj(x, pfx + "v_proj");
+  if (has_weight(pfx + "k_proj.bias")) keys   = keys   + get_weight(pfx + "k_proj.bias");
+  if (has_weight(pfx + "v_proj.bias")) values = values + get_weight(pfx + "v_proj.bias");
+
+  keys   = reshape(keys,   {B, 1, cfg.num_kv_heads, cfg.head_dim});
+  values = reshape(values, {B, 1, cfg.num_kv_heads, cfg.head_dim});
+
+  queries = fast::rms_norm(queries, get_weight(pfx + "q_norm.weight"), cfg.rms_norm_eps);
+  keys    = fast::rms_norm(keys,    get_weight(pfx + "k_norm.weight"), cfg.rms_norm_eps);
+
+  // Array-valued RoPE offset — graph-stable across decode steps.
+  queries = fast::rope(queries, cfg.rope_dims, false, cfg.rope_theta, 1.0f, rope_offset_arr);
+  keys    = fast::rope(keys,    cfg.rope_dims, false, cfg.rope_theta, 1.0f, rope_offset_arr);
+
+  queries = transpose(queries, {0, 2, 1, 3});
+  keys    = transpose(keys,    {0, 2, 1, 3});
+  values  = transpose(values,  {0, 2, 1, 3});
+
+  // slice_update with array start so the verify graph can advance the
+  // KV-cache write offset by 0,1,...,depth without re-tracing.
+  auto new_kv_keys   = mlx::core::slice_update(kv_keys,   keys,   write_offset_arr, {2});
+  auto new_kv_values = mlx::core::slice_update(kv_values, values, write_offset_arr, {2});
+
+  float scale = std::pow((float)cfg.head_dim, -0.5f);
+  auto attn_out = fast::scaled_dot_product_attention(
+      queries, new_kv_keys, new_kv_values, scale, "", attn_mask, {});
+
+  attn_out = transpose(attn_out, {0, 2, 1, 3});
+  attn_out = reshape(attn_out, {B, cfg.num_heads * cfg.head_dim});
+
+  attn_out = compiled_attn_gate()({attn_out, gate})[0];
+
+  auto output = linear_proj(attn_out, pfx + "o_proj");
+  if (has_weight(pfx + "o_proj.bias")) output = output + get_weight(pfx + "o_proj.bias");
+
+  return {output, new_kv_keys, new_kv_values};
+}
+
+inline AttnPureResult attn_pure_fn_arr_offset(
+    const array& x,             // [B, hidden] — 2D
+    const std::string& layer_prefix,
+    const array& kv_keys,
+    const array& kv_values,
+    const array& attn_mask,
+    const array& offset_arr,    // [1] int32 — RoPE + slice_update start
+    const BaseConfig& cfg) {
+  return attn_pure_fn_arr_rope_write_offset(
+      x, layer_prefix, kv_keys, kv_values, attn_mask, offset_arr, offset_arr, cfg);
 }
 
 // =====================================================================
@@ -1075,6 +1483,438 @@ inline AttnPureResult attn_for_compile_paged(
   // We re-purpose AttnPureResult.{keys,values} as the post-write pool
   // tensors so the caller can stash them back into the global pool slot.
   return {output, new_k_pool, new_v_pool};
+}
+
+// =====================================================================
+// W6.7 — Batched attention forward for the MTP verify graph.
+//
+// Processes a contiguous chunk of `T` decode tokens in ONE forward (vs the
+// flat-path `attn_pure_fn` / `attn_for_compile` helpers which both
+// hard-wire T = 1). Used exclusively by the per-depth batched verify
+// graph in `mlx_qwen35.cpp` / `mlx_qwen35_moe.cpp` to replace the prior
+// D+1 sequential single-token forwards with one launch.
+//
+// Inputs:
+//   - x:                 `[B, T, hidden]` 3D activation (T = depth + 1).
+//   - layer_idx:         transformer layer index — picks weight prefix.
+//   - kv_keys/values:    flat-path KV caches `[B, Hkv, max_kv_len, D]`.
+//                        T new K/V slots will be written at positions
+//                        `[offset, offset+1, ..., offset+T-1]`.
+//   - tail_mask:         additive bf16 mask of shape `[1, 1, T, max_kv_len]`
+//                        — built once at graph entry so all layers reuse it.
+//                        Position `i` (0..T-1) is valid for keys
+//                        `[0..offset+i]` and masked out elsewhere.
+//   - offset_arr:        `[1]` int32 — first new-slot position. Threaded
+//                        through `fast::rope` so the RoPE position vector
+//                        is `[offset, offset+1, ..., offset+T-1]`
+//                        (intrinsic to RoPE's per-axis advance).
+//
+// Output:
+//   - output:            `[B, T, hidden]` (3D).
+//   - keys/values:       new KV caches with T slots written (same dtype
+//                        and shape as inputs; only positions
+//                        `[offset, offset+T)` have changed).
+//
+// Mirrors `attn_for_compile` (which the dense flat path also uses for
+// T=1) with three changes:
+//   1. Input is 3D `[B, T, hidden]` so the linear projections are batched
+//      across both `B` and `T`. The reshape uses `T` explicitly.
+//   2. `slice_update(kv, keys, offset_arr, {2})` writes T contiguous
+//      slots at axis 2 starting at `offset_arr[0]` — the slice-update
+//      kernel infers the slot count from `keys.shape(2)`.
+//   3. The additive `tail_mask` is per-position (shape `[1, 1, T, B])
+//      where B ≤ max_kv_len is the SDPA "bucket" — see `bucket_kv_len`.
+//
+// W6.29 — `bucket_kv_len` is the static SDPA key-column count baked into
+// the compile trace. If `bucket_kv_len < max_kv_len`, the writeback
+// still operates on the full `[B, Hkv, max_kv_len, D]` cache (so the
+// returned `new_kv_keys/values` are full-size and the caller's
+// `g_compiled_caches[]` mutation contract is unchanged), but the K/V
+// view fed to SDPA is a static prefix `slice` of length `bucket_kv_len`.
+// The bucket dispatcher (in `mlx_qwen35.cpp`) picks the smallest bucket
+// ≥ `offset + T`, so all VALID key columns are inside the slice — the
+// columns past offset+T-1 inside the slice are still zero-init and
+// masked off by the tail mask.
+//
+// Passing `bucket_kv_len == 0` (default) preserves legacy behavior:
+// SDPA sees the full max_kv_len cache. This keeps the legacy/fallback
+// graph entry compilable without a separate code path.
+//
+// Weight keys read: `layers.{layer_idx}.self_attn.{q,k,v,o}_proj{.weight,
+// .bias?}`, `.q_norm.weight`, `.k_norm.weight`. Same set as the per-step
+// helpers; the batched path doesn't introduce new weights.
+// =====================================================================
+inline AttnPureResult attn_batched_verify_fn(
+    const array& x,            // [B, T, hidden] — 3D
+    int layer_idx,
+    const array& kv_keys,      // [B, Hkv, max_kv_len, D]
+    const array& kv_values,    // [B, Hkv, max_kv_len, D]
+    const array& tail_mask,    // [1, 1, T, bucket_kv_len] additive bf16 mask
+    const array& offset_arr,   // [1] int32
+    const BaseConfig& cfg,
+    int bucket_kv_len = 0) {
+  int B = x.shape(0);
+  int T = x.shape(1);
+  int hidden = x.shape(2);
+  std::string pfx = "layers." + std::to_string(layer_idx) + ".self_attn.";
+
+  // Project on flat 2D (matmul broadcasts cleanly across batch+time).
+  auto x_flat = reshape(x, {B * T, hidden});
+
+  auto q_proj = linear_proj(x_flat, pfx + "q_proj");
+  if (has_weight(pfx + "q_proj.bias")) q_proj = q_proj + get_weight(pfx + "q_proj.bias");
+
+  // Q has 2x width (per-head gating).
+  auto qph     = reshape(q_proj, {B, T, cfg.num_heads, cfg.head_dim * 2});
+  auto queries = slice(qph, {0, 0, 0, 0},            {B, T, cfg.num_heads, cfg.head_dim});
+  auto gate    = slice(qph, {0, 0, 0, cfg.head_dim}, {B, T, cfg.num_heads, cfg.head_dim * 2});
+  // gate is consumed by `compiled_attn_gate` which expects 2D `[BT, H*D]`.
+  gate = reshape(gate, {B * T, cfg.num_heads * cfg.head_dim});
+
+  auto keys   = linear_proj(x_flat, pfx + "k_proj");
+  auto values = linear_proj(x_flat, pfx + "v_proj");
+  if (has_weight(pfx + "k_proj.bias")) keys   = keys   + get_weight(pfx + "k_proj.bias");
+  if (has_weight(pfx + "v_proj.bias")) values = values + get_weight(pfx + "v_proj.bias");
+
+  keys   = reshape(keys,   {B, T, cfg.num_kv_heads, cfg.head_dim});
+  values = reshape(values, {B, T, cfg.num_kv_heads, cfg.head_dim});
+
+  // QK norm (per-head; shape preserved).
+  queries = fast::rms_norm(queries, get_weight(pfx + "q_norm.weight"), cfg.rms_norm_eps);
+  keys    = fast::rms_norm(keys,    get_weight(pfx + "k_norm.weight"), cfg.rms_norm_eps);
+
+  // RoPE: array offset; queries/keys at axis 1 (time) get positions
+  // [offset, offset+1, ..., offset+T-1]. Confirmed against mlx-lm's
+  // `Qwen3NextAttention.__call__` (qwen3_next.py:146-147) — the same
+  // single-scalar `cache.offset` is used for prefill (T>1) decode batches.
+  queries = fast::rope(queries, cfg.rope_dims, false, cfg.rope_theta, 1.0f, offset_arr);
+  keys    = fast::rope(keys,    cfg.rope_dims, false, cfg.rope_theta, 1.0f, offset_arr);
+
+  // Transpose for SDPA: [B, T, H, D] -> [B, H, T, D].
+  queries = transpose(queries, {0, 2, 1, 3});
+  auto keys_for_write   = transpose(keys,   {0, 2, 1, 3});  // [B, Hkv, T, D]
+  auto values_for_write = transpose(values, {0, 2, 1, 3});
+
+  // slice_update with array start: writes T contiguous K/V slots at
+  // axis 2 starting at `offset_arr[0]`. The kernel infers the slot
+  // count from the update tensor's axis-2 length (= T).
+  auto new_kv_keys   = mlx::core::slice_update(kv_keys,   keys_for_write,   offset_arr, {2});
+  auto new_kv_values = mlx::core::slice_update(kv_values, values_for_write, offset_arr, {2});
+
+  // W6.29 — Bucketed SDPA view. The caller supplies a bucket size that's
+  // (a) ≥ `offset + T` (so every valid key column is inside the slice)
+  // and (b) a static integer baked into the compile trace (so SDPA sees
+  // a smaller, fixed `[B, Hkv, bucket, D]` key tensor). `bucket_kv_len==0`
+  // means "no bucketing" — SDPA reads the full max_kv_len cache (legacy).
+  int Hkv = cfg.num_kv_heads;
+  int max_kv_len = kv_keys.shape(2);
+  array sdpa_keys   = new_kv_keys;
+  array sdpa_values = new_kv_values;
+  if (bucket_kv_len > 0 && bucket_kv_len < max_kv_len) {
+    sdpa_keys   = slice(new_kv_keys,   {0, 0, 0, 0}, {B, Hkv, bucket_kv_len, cfg.head_dim});
+    sdpa_values = slice(new_kv_values, {0, 0, 0, 0}, {B, Hkv, bucket_kv_len, cfg.head_dim});
+  }
+
+  // SDPA over the bucketed kv view with a `[1, 1, T, bucket]` (or
+  // `[1, 1, T, max_kv_len]` in the legacy path) tail mask. Position-`t`
+  // queries see keys `[0..offset+t]`; the mask construction in the caller
+  // graph zeros that range and `-inf`s the rest.
+  float scale = std::pow((float)cfg.head_dim, -0.5f);
+  auto attn_out = fast::scaled_dot_product_attention(
+      queries, sdpa_keys, sdpa_values, scale, "", tail_mask, {});
+
+  // Transpose back to [B, T, H, D] -> [B*T, H*D].
+  attn_out = transpose(attn_out, {0, 2, 1, 3});
+  attn_out = reshape(attn_out, {B * T, cfg.num_heads * cfg.head_dim});
+
+  // Gate (compiled silu*gate kernel; same kernel as per-step path).
+  attn_out = compiled_attn_gate()({attn_out, gate})[0];
+
+  // Output projection -> reshape back to 3D for the residual add upstream.
+  auto out_flat = linear_proj(attn_out, pfx + "o_proj");
+  if (has_weight(pfx + "o_proj.bias")) out_flat = out_flat + get_weight(pfx + "o_proj.bias");
+  auto output = reshape(out_flat, {B, T, hidden});
+
+  return {output, new_kv_keys, new_kv_values};
+}
+
+// Phase 4b — paged sibling of `attn_batched_verify_fn`. Replaces
+// `slice_update` + SDPA over a BHTD cache with `paged_kv_write` +
+// `paged_attention_varlen` over the vLLM-style pool. Q/K/V projection,
+// QK norm, and RoPE are identical so kernel parity with the BHTD path
+// holds up to the attention math itself (varlen kernel reduces softmax
+// per query row independently of context length, so values can differ
+// within bf16 noise vs. SDPA bucketed verify). The pool tensors
+// returned in `keys` / `values` of `AttnPureResult` are the post-write
+// handles produced by `paged_kv_write`; the caller stashes them back
+// into the global pool slot for the next forward.
+inline AttnPureResult attn_batched_verify_fn_paged(
+    const array& x,                  // [B, T, hidden]
+    int layer_idx,
+    const array& k_pool,             // [num_blocks, num_kv_heads, head_size/x_pack, block_size, x_pack]
+    const array& v_pool,             // [num_blocks, num_kv_heads, head_size, block_size]
+    const array& k_scale,            // [1] f32
+    const array& v_scale,            // [1] f32
+    const array& offset_arr,         // [1] int32 — RoPE start position
+    const array& block_table,        // [1, max_blocks_per_seq] int32
+    const array& slot_mapping,       // [T = depth+1] int64 — exact length
+                                     // required by paged_kv_write (its
+                                     // shape(0) MUST equal new_k.shape(0)
+                                     // = B*T). Caller slices any
+                                     // chunk_size_max-padded array down
+                                     // before passing it in.
+    const array& seq_lens,           // [1] int32 — post-write context
+    const array& cu_seqlens_q,       // [2] int32 — [0, T]
+    int block_size,
+    const BaseConfig& cfg) {
+  int B = x.shape(0);
+  int T = x.shape(1);
+  int hidden = x.shape(2);
+  std::string pfx = "layers." + std::to_string(layer_idx) + ".self_attn.";
+
+  auto x_flat = reshape(x, {B * T, hidden});
+
+  auto q_proj = linear_proj(x_flat, pfx + "q_proj");
+  if (has_weight(pfx + "q_proj.bias")) q_proj = q_proj + get_weight(pfx + "q_proj.bias");
+
+  auto qph     = reshape(q_proj, {B, T, cfg.num_heads, cfg.head_dim * 2});
+  auto queries = slice(qph, {0, 0, 0, 0},            {B, T, cfg.num_heads, cfg.head_dim});
+  auto gate    = slice(qph, {0, 0, 0, cfg.head_dim}, {B, T, cfg.num_heads, cfg.head_dim * 2});
+  gate = reshape(gate, {B * T, cfg.num_heads * cfg.head_dim});
+
+  auto keys   = linear_proj(x_flat, pfx + "k_proj");
+  auto values = linear_proj(x_flat, pfx + "v_proj");
+  if (has_weight(pfx + "k_proj.bias")) keys   = keys   + get_weight(pfx + "k_proj.bias");
+  if (has_weight(pfx + "v_proj.bias")) values = values + get_weight(pfx + "v_proj.bias");
+
+  keys   = reshape(keys,   {B, T, cfg.num_kv_heads, cfg.head_dim});
+  values = reshape(values, {B, T, cfg.num_kv_heads, cfg.head_dim});
+
+  queries = fast::rms_norm(queries, get_weight(pfx + "q_norm.weight"), cfg.rms_norm_eps);
+  keys    = fast::rms_norm(keys,    get_weight(pfx + "k_norm.weight"), cfg.rms_norm_eps);
+
+  queries = fast::rope(queries, cfg.rope_dims, false, cfg.rope_theta, 1.0f, offset_arr);
+  keys    = fast::rope(keys,    cfg.rope_dims, false, cfg.rope_theta, 1.0f, offset_arr);
+
+  auto new_k_flat = reshape(keys,    {B * T, cfg.num_kv_heads, cfg.head_dim});
+  auto new_v_flat = reshape(values,  {B * T, cfg.num_kv_heads, cfg.head_dim});
+  auto q_flat     = reshape(queries, {B * T, cfg.num_heads,    cfg.head_dim});
+
+  constexpr int X_PACK = 8;
+  constexpr int SLIDING_WINDOW = 0;
+  const auto kv_dtype = mlx::core::fast::KvDtype::Bf16;
+
+  auto write_pair = mlx::core::fast::paged_kv_write(
+      k_pool, v_pool,
+      new_k_flat, new_v_flat,
+      slot_mapping,
+      k_scale, v_scale,
+      block_size,
+      cfg.num_kv_heads,
+      cfg.head_dim,
+      X_PACK,
+      kv_dtype);
+  auto new_k_pool = std::move(write_pair.first);
+  auto new_v_pool = std::move(write_pair.second);
+
+  float scale = std::pow((float)cfg.head_dim, -0.5f);
+  auto attn_out = mlx::core::fast::paged_attention_varlen(
+      q_flat,
+      new_k_pool, new_v_pool,
+      block_table, seq_lens, cu_seqlens_q,
+      k_scale, v_scale,
+      scale,
+      /*softcap=*/0.0f,
+      SLIDING_WINDOW,
+      block_size,
+      cfg.num_heads,
+      cfg.num_kv_heads,
+      cfg.head_dim,
+      kv_dtype);
+
+  attn_out = reshape(attn_out, {B * T, cfg.num_heads * cfg.head_dim});
+
+  attn_out = compiled_attn_gate()({attn_out, gate})[0];
+
+  auto out_flat = linear_proj(attn_out, pfx + "o_proj");
+  if (has_weight(pfx + "o_proj.bias")) out_flat = out_flat + get_weight(pfx + "o_proj.bias");
+  auto output = reshape(out_flat, {B, T, hidden});
+
+  return {output, new_k_pool, new_v_pool};
+}
+
+// =====================================================================
+// W6.7 — Batched GDN forward for the MTP verify graph.
+//
+// Processes `T` decode tokens in ONE Metal kernel call starting from the
+// CURRENT recurrent + conv state (not zeros). Equivalent to looping
+// `gdn_pure_fn` T times — the gated-delta Metal kernel already handles
+// T > 1 internally and advances the recurrent state T steps in a single
+// dispatch. Same kernel mlx-lm uses for prefill.
+//
+// Inputs:
+//   - x:                 `[B, T, hidden]` 3D activation.
+//   - layer_idx:         linear-attention layer index.
+//   - conv_state:        `[B, kernel_dim-1, conv_dim]` — pre-verify state.
+//   - recurrent_state:   `[B, Hv, Dv, Dk]` — pre-verify state.
+//
+// Outputs:
+//   - output:            `[B, T, hidden]`.
+//   - conv_state:        last `kernel_dim-1` conv-input rows after the T
+//                        new qkv rows were appended.
+//   - recurrent_state:   state after T recurrent advances.
+// =====================================================================
+// Unified `gdn_batched_verify_fn` templated on `WithTape`. When
+// `WithTape=false` returns `GDNPureResult`; when `WithTape=true` returns
+// `GDNPureResultWithTape` carrying the per-step `(tape, k, g, qkv)` of
+// shape `[B, T, ...]`. Mirrors `gdn_pure_fn_impl` but operates on T>=1
+// tokens in a single kernel dispatch.
+template <bool WithTape>
+inline std::conditional_t<WithTape, GDNPureResultWithTape, GDNPureResult>
+gdn_batched_verify_fn_impl(
+    const array& x,                  // [B, T, hidden] — 3D
+    int layer_idx,
+    const array& conv_state,         // [B, kernel-1, conv_dim]
+    const array& recurrent_state,    // [B, Hv, Dv, Dk]
+    const BaseConfig& cfg) {
+  int B = x.shape(0);
+  int T = x.shape(1);
+  int hidden = x.shape(2);
+  int key_dim = cfg.linear_num_k_heads * cfg.linear_key_head_dim;
+  int value_dim = cfg.linear_num_v_heads * cfg.linear_value_head_dim;
+  int conv_dim = key_dim * 2 + value_dim;
+
+  std::string pfx = "layers." + std::to_string(layer_idx) + ".linear_attn.";
+
+  // Project on flat 2D — auto-detect merged-vs-split projection layout.
+  auto x_flat = reshape(x, {B * T, hidden});
+  struct QkvzResult { array qkv, z; };
+  auto [qkv, z] = [&]() -> QkvzResult {
+    if (has_weight(pfx + "in_proj_qkvz.weight")) {
+      auto qkvz = linear_proj(x_flat, pfx + "in_proj_qkvz");
+      return {slice(qkvz, {0, 0}, {B * T, conv_dim}),
+              slice(qkvz, {0, conv_dim}, {B * T, key_dim * 2 + value_dim * 2})};
+    }
+    return {linear_proj(x_flat, pfx + "in_proj_qkv"),
+            linear_proj(x_flat, pfx + "in_proj_z")};
+  }();
+  struct BaResult { array b, a; };
+  auto [b, a] = [&]() -> BaResult {
+    if (has_weight(pfx + "in_proj_ba.weight")) {
+      auto ba = linear_proj(x_flat, pfx + "in_proj_ba");
+      return {slice(ba, {0, 0}, {B * T, cfg.linear_num_v_heads}),
+              slice(ba, {0, cfg.linear_num_v_heads}, {B * T, cfg.linear_num_v_heads * 2})};
+    }
+    return {linear_proj(x_flat, pfx + "in_proj_b"),
+            linear_proj(x_flat, pfx + "in_proj_a")};
+  }();
+
+  // Re-3D the qkv for conv1d: `[B, T, conv_dim]`. When WithTape, this is
+  // also the tensor recorded for conv-state replay (qkv_tape).
+  auto qkv_3d = reshape(qkv, {B, T, conv_dim});
+
+  // Conv1d: prepend the pre-verify conv_state, slide the kernel across
+  // (kernel_dim-1 + T) inputs, take T outputs.
+  auto conv_input = concatenate({conv_state, qkv_3d}, 1);
+  // new_conv_state: last (kernel_dim-1) rows after the T new qkv rows.
+  int keep = cfg.linear_conv_kernel_dim - 1;
+  int total = keep + T;
+  auto new_conv_state = slice(conv_input, {0, total - keep, 0}, {B, total, conv_dim});
+
+  auto conv_w = get_weight(pfx + "conv1d.weight");
+  auto conv_out = mlx::core::conv1d(conv_input, conv_w, 1, 0, 1, conv_dim);  // [B, T, conv_dim]
+
+  // SiLU — compiled
+  conv_out = compiled_silu()({conv_out})[0];
+
+  // Split into q, k, v
+  auto q = slice(conv_out, {0, 0, 0},              {B, T, key_dim});
+  auto k = slice(conv_out, {0, 0, key_dim},        {B, T, key_dim * 2});
+  auto v = slice(conv_out, {0, 0, key_dim * 2},    {B, T, conv_dim});
+
+  // Reshape to heads: [B, T, H, D]
+  q = reshape(q, {B, T, cfg.linear_num_k_heads, cfg.linear_key_head_dim});
+  k = reshape(k, {B, T, cfg.linear_num_k_heads, cfg.linear_key_head_dim});
+  v = reshape(v, {B, T, cfg.linear_num_v_heads, cfg.linear_value_head_dim});
+
+  // RMS norm + scaling (same constants as gdn_pure_fn / gdn_prefill_fn).
+  float inv_s = std::pow((float)cfg.linear_key_head_dim, -0.5f);
+  auto q_dt = q.dtype();
+  q = rms_norm_no_weight(q, 1e-6f) * array(inv_s * inv_s, q_dt);
+  k = rms_norm_no_weight(k, 1e-6f) * array(inv_s, q_dt);
+
+  // Beta, g — reshape b/a from [B*T, Hv] to [B, T, Hv]
+  auto beta_3d = reshape(sigmoid(b), {B, T, cfg.linear_num_v_heads});
+  auto a_log = get_weight(pfx + "A_log");
+  auto dt_b  = get_weight(pfx + "dt_bias");
+  auto g_flat = fused_compute_g(a_log, a, dt_b);
+  auto g_3d = reshape(g_flat, {B, T, cfg.linear_num_v_heads});
+
+  // Metal kernel — T advances starting from the CURRENT recurrent state.
+  // Non-tape variant returns (y, recurrent_state); tape variant also
+  // returns `[B, T, Hv, Dv]` fp32 per-step delta tape. `array` has no
+  // default ctor — emit the call inside a constexpr lambda so the
+  // downstream rmsnorm+out_proj graph can be shared.
+  auto kernel_out = [&] {
+    if constexpr (WithTape) {
+      return gated_delta_kernel_with_tape_call(q, k, v, g_3d, beta_3d, recurrent_state);
+    } else {
+      return gated_delta_kernel_call(q, k, v, g_3d, beta_3d, recurrent_state);
+    }
+  }();
+  auto& y                   = std::get<0>(kernel_out);
+  auto& new_recurrent_state = std::get<1>(kernel_out);
+
+  // RMSNorm gating — z is [B*T, value_dim], reshape to [B, T, Hv, Dv]
+  auto z_h = reshape(z, {B, T, cfg.linear_num_v_heads, cfg.linear_value_head_dim});
+  auto nw = get_weight(pfx + "norm.weight");
+  auto y_normed = fast::rms_norm(y, nw, cfg.rms_norm_eps);
+  y_normed = compiled_silu_mul()({z_h, y_normed})[0];
+
+  // Output projection
+  auto y_flat = reshape(y_normed, {B * T, value_dim});
+  auto out_flat = linear_proj(y_flat, pfx + "out_proj");
+  auto output = reshape(out_flat, {B, T, hidden});
+
+  if constexpr (WithTape) {
+    // k after rmsnorm+scale, g fp32 — captured before the kernel call.
+    return GDNPureResultWithTape{
+        std::move(output), std::move(new_conv_state), std::move(new_recurrent_state),
+        std::move(std::get<2>(kernel_out)), std::move(k), std::move(g_3d), std::move(qkv_3d)};
+  } else {
+    return GDNPureResult{std::move(output), std::move(new_conv_state),
+                         std::move(new_recurrent_state)};
+  }
+}
+
+// Backwards-compatible thin wrappers. Callers continue to use
+// `gdn_batched_verify_fn(...)` / `gdn_batched_verify_fn_with_tape(...)`
+// exactly as before; the actual body lives in
+// `gdn_batched_verify_fn_impl`.
+inline GDNPureResult gdn_batched_verify_fn(
+    const array& x,
+    int layer_idx,
+    const array& conv_state,
+    const array& recurrent_state,
+    const BaseConfig& cfg) {
+  return gdn_batched_verify_fn_impl<false>(x, layer_idx, conv_state, recurrent_state, cfg);
+}
+
+// W6.7 — Tape-recording variant of `gdn_batched_verify_fn`. Identical
+// math; emits per-step `(tape, k, g, qkv)` tensors of shape `[B, T, ...]`
+// directly (no concatenation needed — the Metal tape kernel naturally
+// emits the T-wide tape in one dispatch). The dense main path stashes
+// these into the `g_gdn_*_tape_acc` accumulators in ONE assignment
+// (replacing the prior D+1 `concatenate` appends), and the tape-replay
+// rollback path consumes a `slice([:, 0..accepted_steps, ...])` exactly
+// like before.
+inline GDNPureResultWithTape gdn_batched_verify_fn_with_tape(
+    const array& x,
+    int layer_idx,
+    const array& conv_state,
+    const array& recurrent_state,
+    const BaseConfig& cfg) {
+  return gdn_batched_verify_fn_impl<true>(x, layer_idx, conv_state, recurrent_state, cfg);
 }
 
 }  // namespace qwen35_common

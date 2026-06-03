@@ -775,7 +775,12 @@ impl Qwen3Inner {
         let lm_head = &self.lm_head;
         let model_config = &self.config;
 
-        let max_new_tokens = gen_config.max_new_tokens.unwrap_or(2048);
+        // Clamp a nonpositive budget to 0 (AR-equivalent empty completion):
+        // plain Qwen3 chat does NOT route through `extract_chat_params`, so
+        // without this a negative `i32` reaches `Vec::with_capacity(.. as
+        // usize)` below (`-1i32 as usize == usize::MAX` → OOM panic). At 0
+        // the `0..max_new_tokens` decode loop emits nothing, matching AR.
+        let max_new_tokens = gen_config.max_new_tokens.unwrap_or(2048).max(0);
         let temperature = gen_config.temperature.unwrap_or(0.7);
         let top_k = gen_config.top_k.unwrap_or(0);
         let top_p = gen_config.top_p.unwrap_or(0.9);
@@ -802,9 +807,10 @@ impl Qwen3Inner {
         let mut rope_offsets = MxArray::from_int32(&[cache_idx], &[1])?;
         let left_padding = MxArray::from_int32(&[0], &[1])?;
 
-        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
+        let mut generated_tokens: Vec<u32> =
+            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens));
         let mut generated_logprobs: Vec<f32> = if return_logprobs {
-            Vec::with_capacity(max_new_tokens as usize)
+            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens))
         } else {
             Vec::new()
         };
@@ -1138,6 +1144,13 @@ impl Qwen3Inner {
                 } else {
                     0.0
                 },
+                // Qwen3 has no MTP heads — acceptance fields stay None.
+                mtp_mean_accepted_tokens: None,
+                mtp_mean_accepted_tokens_total: None,
+                mtp_acceptance_by_position: None,
+                mtp_cycles: None,
+                mtp_mean_depth: None,
+                profile_phases: None,
             })
         } else {
             None
@@ -1513,6 +1526,13 @@ impl Qwen3Inner {
                 } else {
                     0.0
                 },
+                // Qwen3 has no MTP heads — acceptance fields stay None.
+                mtp_mean_accepted_tokens: None,
+                mtp_mean_accepted_tokens_total: None,
+                mtp_acceptance_by_position: None,
+                mtp_cycles: None,
+                mtp_mean_depth: None,
+                profile_phases: None,
             })
         } else {
             None
@@ -1649,9 +1669,10 @@ impl Qwen3Inner {
         synchronize_and_clear_cache();
 
         // === DECODE LOOP ===
-        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens.max(0) as usize);
+        let mut generated_tokens: Vec<u32> =
+            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens));
         let mut generated_logprobs: Vec<f32> = if return_logprobs {
-            Vec::with_capacity(max_new_tokens.max(0) as usize)
+            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens))
         } else {
             Vec::new()
         };
@@ -3329,7 +3350,7 @@ impl Qwen3Inner {
 
             // Budget force for reasoning.
             let next_token = if reasoning_tracker.should_force_think_end() {
-                let forced_id = reasoning_tracker.forced_token_id() as i32;
+                let forced_id = reasoning_tracker.forced_token_id()? as i32;
                 MxArray::from_int32(&[forced_id], &[1])?
             } else {
                 step_logits = chat_common::apply_all_penalties(step_logits, &token_history, &p)?;
@@ -4049,6 +4070,16 @@ impl Qwen3Inner {
         // But since we're on the model thread, we do a direct implementation here.
         let config = config.unwrap_or_default();
         let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
+        // Reject a nonpositive budget on the public `generate()` API (parity
+        // with qwen3_5's `generate` guard): without this a negative `i32`
+        // reaches `Vec::with_capacity(.. as usize)` below
+        // (`-1i32 as usize == usize::MAX` → capacity-overflow abort).
+        if max_new_tokens <= 0 {
+            return Err(Error::from_reason(format!(
+                "max_new_tokens must be > 0, got {}",
+                max_new_tokens
+            )));
+        }
         let temperature = config.temperature.unwrap_or(1.0);
         let top_k = config.top_k.unwrap_or(0);
         let top_p = config.top_p.unwrap_or(1.0);
@@ -4084,9 +4115,10 @@ impl Qwen3Inner {
 
         let input_tokens = input_ids.to_uint32()?;
         let current_ids = input_ids;
-        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
+        let mut generated_tokens: Vec<u32> =
+            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens));
         let mut generated_logprobs: Vec<f32> = if return_logprobs {
-            Vec::with_capacity(max_new_tokens as usize)
+            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens))
         } else {
             Vec::new()
         };
@@ -4785,9 +4817,16 @@ impl Qwen3Inner {
 
         let input_tokens = input_ids.to_uint32()?;
         let current_ids = input_ids.clone();
-        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
+        // Clamp the capacity hint to 0: this training-only path takes
+        // `max_new_tokens` from training config (SFT/GRPO) where panics are
+        // banned; a negative value would make `.. as usize` wrap to
+        // `usize::MAX` and abort. The `0..max_new_tokens` loop below already
+        // yields nothing for a nonpositive budget, so this only prevents the
+        // abort without changing behavior for valid budgets.
+        let mut generated_tokens: Vec<u32> =
+            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens));
         let mut generated_logprobs: Vec<f32> = if return_logprobs {
-            Vec::with_capacity(max_new_tokens as usize)
+            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens))
         } else {
             Vec::new()
         };

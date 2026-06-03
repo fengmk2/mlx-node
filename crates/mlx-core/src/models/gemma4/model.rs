@@ -2120,6 +2120,13 @@ impl Gemma4Inner {
             } else {
                 0.0
             },
+            // Gemma4 has no MTP heads — acceptance fields stay None.
+            mtp_mean_accepted_tokens: None,
+            mtp_mean_accepted_tokens_total: None,
+            mtp_acceptance_by_position: None,
+            mtp_cycles: None,
+            mtp_mean_depth: None,
+            profile_phases: None,
         });
 
         let mut parsed = super::output_parser::parse_gemma4_output(&raw_text);
@@ -2573,6 +2580,13 @@ impl Gemma4Inner {
             } else {
                 0.0
             },
+            // Gemma4 has no MTP heads — acceptance fields stay None.
+            mtp_mean_accepted_tokens: None,
+            mtp_mean_accepted_tokens_total: None,
+            mtp_acceptance_by_position: None,
+            mtp_cycles: None,
+            mtp_mean_depth: None,
+            profile_phases: None,
         });
 
         let parsed_tool_calls = stream_parser.tool_calls();
@@ -2971,6 +2985,13 @@ impl Gemma4Inner {
             } else {
                 0.0
             },
+            // Gemma4 has no MTP heads — acceptance fields stay None.
+            mtp_mean_accepted_tokens: None,
+            mtp_mean_accepted_tokens_total: None,
+            mtp_acceptance_by_position: None,
+            mtp_cycles: None,
+            mtp_mean_depth: None,
+            profile_phases: None,
         });
 
         let mut parsed = super::output_parser::parse_gemma4_output(&raw_text);
@@ -3040,7 +3061,8 @@ impl Gemma4Inner {
         let first_token_instant = Some(std::time::Instant::now());
 
         // === DECODE LOOP ===
-        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens.max(0) as usize);
+        let mut generated_tokens: Vec<u32> =
+            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens));
         let mut finish_reason = String::from("length");
 
         for step in 0..max_new_tokens {
@@ -3275,6 +3297,13 @@ impl Gemma4Inner {
             } else {
                 0.0
             },
+            // Gemma4 has no MTP heads — acceptance fields stay None.
+            mtp_mean_accepted_tokens: None,
+            mtp_mean_accepted_tokens_total: None,
+            mtp_acceptance_by_position: None,
+            mtp_cycles: None,
+            mtp_mean_depth: None,
+            profile_phases: None,
         });
 
         cb.call(
@@ -3359,7 +3388,8 @@ impl Gemma4Inner {
         let mut stream_parser = super::output_parser::Gemma4StreamParser::new();
         let mut stream_dispatch = Gemma4StreamDispatchState::default();
 
-        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens.max(0) as usize);
+        let mut generated_tokens: Vec<u32> =
+            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens));
         let mut finish_reason = String::from("length");
         let decode_trace_start = trace_enabled.then(std::time::Instant::now);
 
@@ -5052,6 +5082,13 @@ impl Gemma4Inner {
             } else {
                 0.0
             },
+            // Gemma4 has no MTP heads — acceptance fields stay None.
+            mtp_mean_accepted_tokens: None,
+            mtp_mean_accepted_tokens_total: None,
+            mtp_acceptance_by_position: None,
+            mtp_cycles: None,
+            mtp_mean_depth: None,
+            profile_phases: None,
         });
 
         let mut parsed = super::output_parser::parse_gemma4_output(&raw_text);
@@ -5507,6 +5544,13 @@ impl Gemma4Inner {
             } else {
                 0.0
             },
+            // Gemma4 has no MTP heads — acceptance fields stay None.
+            mtp_mean_accepted_tokens: None,
+            mtp_mean_accepted_tokens_total: None,
+            mtp_acceptance_by_position: None,
+            mtp_cycles: None,
+            mtp_mean_depth: None,
+            profile_phases: None,
         });
 
         let parsed_tool_calls = stream_parser.tool_calls();

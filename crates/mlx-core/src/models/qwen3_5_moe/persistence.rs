@@ -9,10 +9,14 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
+use crate::models::mtp_drafter::{DrafterBodyVariant, MTP_MOE_LAYER_LINEAR_SUFFIXES};
 use crate::models::quant_dispatch::{
     default_per_layer_quant, effective_plq_for, parse_quant_block, resolve_default_mode,
 };
-use crate::models::qwen3_5::persistence::{load_vision_weights, parse_vision_config};
+use crate::models::qwen3_5::persistence::{
+    MTP_LAYER_LINEAR_SUFFIXES, augment_mtplx_mtp_quantization_with_suffixes, load_vision_weights,
+    parse_vision_config,
+};
 use crate::models::qwen3_5::persistence_common::{
     dequant_fp8_weights, get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
 };
@@ -53,7 +57,21 @@ fn sanitize_weights(
             }
         }
     });
-    let needs_norm_fix = has_mtp_weights || has_unsanitized_conv1d;
+    // MoE twin of the dense fix: use only `has_unsanitized_conv1d` as the
+    // discriminator. `has_mtp_weights` is NOT a reliable signal for "needs
+    // norm shift" — our convert pipeline ships MTP heads alongside
+    // already-shifted norms, so re-shifting at load doubles the value and
+    // produces garbage. See dense `persistence.rs::sanitize_weights` for
+    // the full rationale and empirical evidence.
+    let needs_norm_fix = has_unsanitized_conv1d;
+
+    if has_mtp_weights {
+        info!(
+            "Qwen3.5-MoE: MTP weights detected in checkpoint (config.n_mtp_layers={}). \
+             Retaining mtp.* keys for the speculative-decode MTP head.",
+            config.n_mtp_layers
+        );
+    }
 
     // Detect FP8 source checkpoint before dequantization removes scale_inv keys
     let had_fp8 = params.keys().any(|k| k.ends_with("weight_scale_inv"));
@@ -83,21 +101,64 @@ fn sanitize_weights(
         // Only standard layer/attention norms need the +1.0 shift for MTP checkpoints.
     ];
 
-    for (name, array) in params.drain() {
-        if name.contains("mtp.") {
-            continue;
+    // MTP-norm robustness probe. The `mtp.*` bypass below keeps MTP norms in
+    // final (already +1.0-shifted) form, on the assumption that `mlx convert`
+    // applied that shift. A RAW (unconverted) HF checkpoint never went through
+    // convert, so its MTP norms are still in deviation-from-1 form (~0); loading
+    // it directly leaves them un-shifted → the draft head sees ~0 RMSNorm
+    // weights → garbage logits → 0 accepted tokens. Because `enableMtp`
+    // auto-defaults ON for any checkpoint with MTP heads, that turns into a
+    // silent *slowdown* (draft cost with no accepts). Replicate convert's
+    // independent MTP-norm probe (`convert.rs` `is_mtp_norm` /
+    // `mtp_norms_need_shift`): if the sampled MTP norm sits near 0, shift the
+    // seven MTP norm tensors by +1.0 at load. A converted checkpoint reads
+    // near 1 → no shift → byte-identical to today. Note `mtp.norm` and the two
+    // `pre_fc_norm_*` tensors match none of `norm_suffixes`, so they need this
+    // dedicated set.
+    let mtp_norm_suffixes = [
+        ".input_layernorm.weight",
+        ".post_attention_layernorm.weight",
+        ".q_norm.weight",
+        ".k_norm.weight",
+        ".pre_fc_norm_hidden.weight",
+        ".pre_fc_norm_embedding.weight",
+    ];
+    let is_mtp_norm = |k: &str| {
+        k.starts_with("mtp.")
+            && (k == "mtp.norm.weight" || mtp_norm_suffixes.iter().any(|s| k.ends_with(s)))
+    };
+    let mtp_norms_need_shift = match params
+        .iter()
+        .find(|(k, _)| k.ends_with("mtp.layers.0.input_layernorm.weight"))
+    {
+        Some((_, v)) => {
+            let f32_v = v.astype(DType::Float32)?;
+            let m = f32_v.mean(None, None)?;
+            m.eval();
+            let mean = m.item_at_float32(0).unwrap_or(1.0);
+            let need = mean < 0.5;
+            if need {
+                warn!(
+                    "Qwen3.5-MoE: raw (unconverted) MTP norms detected (mean={:.4} ≈ 0); \
+                     applying +1.0 shift at load so the MTP draft head functions. \
+                     Prefer running `mlx convert` on the checkpoint.",
+                    mean
+                );
+            }
+            need
         }
+        None => false,
+    };
+
+    for (name, array) in params.drain() {
         if name.contains("model.visual") || name.contains("visual_encoder") {
             continue;
         }
 
-        let name = name
-            .strip_prefix("model.language_model.")
-            .or_else(|| name.strip_prefix("language_model.model."))
-            .or_else(|| name.strip_prefix("language_model."))
-            .or_else(|| name.strip_prefix("model."))
-            .unwrap_or(&name)
-            .to_string();
+        // Shared longest-first chain so raw VLM-wrapped
+        // `model.language_model.model.mtp.*` keys are not silently dropped —
+        // see `mtp_drafter::strip_wrapper_prefix`.
+        let name = crate::models::mtp_drafter::strip_wrapper_prefix(&name).to_string();
 
         // Rename special keys (including quantization metadata .scales/.biases)
         let name = if let Some(suffix) = name.strip_prefix("embed_tokens.") {
@@ -112,19 +173,100 @@ fn sanitize_weights(
             continue;
         }
 
-        // Handle individually-listed expert weights
-        if has_individual_experts && name.contains(".mlp.experts.") {
-            let parts: Vec<&str> = name.split('.').collect();
-            if parts.len() >= 7 {
-                let layer = parts[1];
-                let expert_idx: usize = parts[4].parse().map_err(|e| {
+        // MTP *non-expert* weights bypass the +1.0 norm shift and stay in final
+        // MTPLX form (norms, fc, attn, shared-expert, router gate are consumed
+        // as-is by both the W2 MTP module and the compiled MTP graph). MTP
+        // *expert* weights (`mtp.*.mlp.experts.*`), however, must be normalized
+        // identically to the main namespace — fused gate_up split, experts ->
+        // switch_mlp rename, per-expert stacking — so the compiled MoE-MTP path's
+        // `switch_mlp.*` 3D-transpose lookups resolve (they otherwise throw
+        // "MTP 3D transpose not found"). Those weights fall through to the shared
+        // expert-normalization paths below, which are prefix-safe. Only the
+        // conv1d transpose still applies to the bypassed weights — defensive,
+        // MTP layers reuse the main DecoderLayer architecture which includes
+        // conv1d.
+        //
+        // MoE-MTP IS functional once the MTP norms are in final (+1.0-shifted)
+        // form: on a `mlx convert`-ed checkpoint the compiled draft head drafts
+        // ~2-2.25 tokens/cycle and is a ~1.25x win at the default depth 1 (proven
+        // 2026-06-01, byte-identical to AR). The earlier "0-accept draft-head bug"
+        // was REFUTED — it was a raw-checkpoint artifact: the loader shifts MAIN
+        // norms by +1.0 (HF stores RMSNorm weights in deviation-from-1 form) but
+        // this `mtp.*` bypass keeps them as-is, assuming convert already shifted
+        // them. A raw (unconverted) checkpoint therefore loaded its MTP norms
+        // un-shifted (≈0) → corrupted RMSNorm → garbage draft logits → 0 accept.
+        // The `mtp_norms_need_shift` branch below closes that gap: when the probe
+        // detects raw MTP norms it applies the same +1.0 shift convert would have,
+        // so a raw checkpoint now drafts correctly instead of silently slowing
+        // down. (Converted checkpoints are already ≈1 → probe is false → no shift
+        // → byte-identical, zero regression.)
+        //
+        // MTP still ships dense-only (qwen3.6-27b) for a PERF reason, not a
+        // correctness one: the per-cycle 256-expert MoE verify is costly enough
+        // relative to a single-token AR step that MoE has a structurally worse
+        // speculative-decode ratio than dense. The WIP single-kernel GDN
+        // tape-replay rollback on the MoE path is also ~12x slower than per-cycle
+        // rewind. Both are tracked as follow-ups.
+        if name.starts_with("mtp.") && !name.contains(".mlp.experts.") {
+            let array = if name.contains("conv1d.weight") {
+                let shape = array.shape()?;
+                if shape.len() == 3 && shape[2] != 1 {
+                    array.transpose(Some(&[0, 2, 1]))?
+                } else {
+                    array
+                }
+            } else if mtp_norms_need_shift && is_mtp_norm(&name) {
+                // Raw-checkpoint MTP norm: apply the +1.0 shift convert would
+                // have applied (see the `mtp_norms_need_shift` probe above).
+                let ndim = array.ndim()?;
+                if ndim == 1 {
+                    let one = MxArray::scalar_float(1.0)?.astype(array.dtype()?)?;
+                    array.add(&one)?
+                } else {
+                    array
+                }
+            } else {
+                array
+            };
+            result.insert(name, array);
+            continue;
+        }
+
+        // Handle individually-listed expert weights (main or `mtp.` namespace).
+        // Split on `.mlp.experts.` so the switch_mlp key preserves the FULL
+        // prefix (e.g. `layers.0` or `mtp.layers.0`) rather than a positional
+        // token — positional indexing breaks for the `mtp.`-prefixed names.
+        // The `.filter` folds the `has_individual_experts` guard into the
+        // Option so this stays a single (non-collapsible) `if let`.
+        if let Some((prefix, rest)) = name
+            .split_once(".mlp.experts.")
+            .filter(|_| has_individual_experts)
+        {
+            // rest == "<idx>.<proj>.<suffix>"
+            let rest_parts: Vec<&str> = rest.split('.').collect();
+            if rest_parts.len() >= 3 {
+                let expert_idx: usize = rest_parts[0].parse().map_err(|e| {
                     Error::from_reason(format!(
                         "Failed to parse expert index from weight '{}': {}",
                         name, e
                     ))
                 })?;
-                let proj_name = parts[5];
-                let key = format!("layers.{}.mlp.switch_mlp.{}.weight", layer, proj_name);
+                let proj_name = rest_parts[1];
+                // Preserve the tensor suffix so quantized per-expert checkpoints
+                // keep their `.scales` / `.biases` companions as SEPARATE stacked
+                // keys (mirrors the fused gate_up_proj split below). Hardcoding
+                // `.weight` would merge scales/biases into the weight group, trip
+                // the per-key `experts.len() != num_experts` check, and drop the
+                // quant metadata the switch_mlp builder needs. For unquantized
+                // checkpoints only `.weight` exists, so the key is unchanged.
+                let suffix = if name.ends_with(".scales") {
+                    "scales"
+                } else if name.ends_with(".biases") {
+                    "biases"
+                } else {
+                    "weight"
+                };
+                let key = format!("{}.mlp.switch_mlp.{}.{}", prefix, proj_name, suffix);
                 expert_weights
                     .entry(key)
                     .or_default()
@@ -718,6 +860,55 @@ fn apply_weights_moe_inner(
         }
     }
 
+    // MTP head — present only when the checkpoint shipped `mtp.*`
+    // weights and the inner was constructed with `n_mtp_layers > 0`.
+    // The module's `apply_weights` consumes the same per-layer
+    // quantization plumbing as the main MoE loader, including the
+    // gate-prefix routing through `default_gate_plq` (router gates
+    // are 8-bit affine for canonical recipes even when the global
+    // default is 4-bit affine).
+    // Gate the MTP head on a COMPLETE required-weight set before loading,
+    // mirroring the dense loader (`qwen3_5/persistence.rs`). The module is
+    // constructed purely from `config.n_mtp_layers > 0`, so an incomplete inline
+    // checkpoint (a wrong-variant or partial drafter is already rejected at merge
+    // time) would otherwise leave the head default-initialized while
+    // `has_mtp_weights()` still reported active — silently corrupting speculative
+    // decode. On an incomplete set, warn + disable MTP (leave
+    // `mtp_weights_loaded = false`) rather than feeding garbage to the head.
+    if inner.mtp.is_some() {
+        // Derive the expected MLP-key schema from the SAME flavor decision
+        // `Qwen3_5MoeMTPModule::new` uses (`is_moe_layer(fa_idx)`), NOT a
+        // hardcoded `Moe`. The MTP layer mirrors the main decoder at
+        // `fa_idx = full_attention_interval - 1`, so a dense-flavored MoE-MTP
+        // layer (sparse step not dividing the interval, or `fa_idx ∈
+        // mlp_only_layers`) emits dense `mlp.{gate,up,down}_proj` keys via
+        // `get_parameters`/`apply_weights`. Hardcoding `Moe` would demand
+        // `switch_mlp.* + mlp.gate`, flag the complete dense-flavored
+        // checkpoint as incomplete, and silently disable speculative MTP even
+        // though the flavor-aware `apply_weights` would have loaded it fine.
+        let body = super::mtp::Qwen3_5MoeMTPModule::mtp_mlp_variant(config);
+        let missing = crate::models::mtp_drafter::missing_required_mtp_keys(
+            params,
+            body,
+            config.n_mtp_layers,
+        );
+        if missing.is_empty() {
+            if let Some(mtp) = inner.mtp.as_mut() {
+                mtp.apply_weights(params, default_plq, default_gate_plq, per_layer_quant)?;
+            }
+            inner.mtp_weights_loaded = true;
+        } else {
+            inner.mtp_weights_loaded = false;
+            warn!(
+                "Qwen3.5-MoE config declares {} MTP layer(s), but MTP weights are incomplete; \
+                 disabling speculative MTP. Missing first entries: {:?} ({} total)",
+                config.n_mtp_layers,
+                &missing[..missing.len().min(12)],
+                missing.len()
+            );
+        }
+    }
+
     // Verify mandatory weights
     let mut missing_mandatory = Vec::new();
     if !params.contains_key("embedding.weight") {
@@ -847,7 +1038,49 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                     );
 
                     // Load all weights
-                    let raw_params = load_all_safetensors(path, false)?;
+                    let mut raw_params = load_all_safetensors(path, false)?;
+                    // MTP head discovery precedence (backward-compat mandatory):
+                    //   1. inline `mtp.*` tensors in the body shards (existing
+                    //      MoE-MTP checkpoints — kept as-is by sanitize);
+                    //   2. mlx-vlm split `mtp-drafter/` directory (Phase 1 convert).
+                    // MoE has no legacy `mtp.safetensors` sidecar path; the
+                    // drafter merge only fires when the body carries NO inline
+                    // `mtp.*` tensors so inline always wins. The re-prefixed
+                    // `mtp.layers.{i}.mlp.switch_mlp.*` + `...gate.weight` keys
+                    // feed the existing sanitize + head module unchanged
+                    // (the drafter already ships experts STACKED into
+                    // switch_mlp.*, not per-expert `experts.*`).
+                    let has_inline_mtp = raw_params.keys().any(|name| name.contains("mtp."));
+                    if has_inline_mtp {
+                        info!(
+                            "Using inline mtp.* tensors from body shards (drafter merge skipped)"
+                        );
+                    } else if let Some(drafter_path) =
+                        crate::models::mtp_drafter::detect_drafter_safetensors(path)
+                        && let Some(drafter_params) =
+                            crate::models::mtp_drafter::load_drafter_tensors(
+                                &drafter_path,
+                                // Backbone is MoE (gates the drafter's
+                                // text_config), but the structural key gate
+                                // must use the per-layer MLP flavor: a
+                                // dense-flavored MoE-MTP layer ships dense
+                                // `mlp.*_proj` keys, not `switch_mlp.* +
+                                // mlp.gate`. Mirror `Qwen3_5MoeMTPModule::new`'s
+                                // `is_moe_layer(fa_idx)` so this drafter-merge
+                                // gate agrees with the inline gate + the head's
+                                // own flavor-aware apply_weights.
+                                crate::models::mtp_drafter::DrafterBodyVariant::Moe,
+                                super::mtp::Qwen3_5MoeMTPModule::mtp_mlp_variant(&config),
+                                config.n_mtp_layers,
+                            )?
+                    {
+                        let drafter_count = drafter_params.len();
+                        raw_params.extend(drafter_params);
+                        info!(
+                            "Merged split MTP drafter tensors: added={} (re-prefixed mtp.*)",
+                            drafter_count
+                        );
+                    }
                     info!("Loaded {} raw tensors", raw_params.len());
 
                     // Split vision/text weights
@@ -901,8 +1134,37 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                         .and_then(|q| q["group_size"].as_i64())
                         .unwrap_or(DEFAULT_QUANT_GROUP_SIZE as i64)
                         as i32;
-                    let (top_level_mode, per_layer_quant) =
+                    let (top_level_mode, mut per_layer_quant) =
                         parse_quant_block(quant_cfg, quant_group_size);
+
+                    // PR #65 (Task 36) — augment the per-layer-quant table with
+                    // the MTP head's quantization metadata derived from the
+                    // `mtplx_mtp_quantization` config block, mirroring the dense
+                    // loader (`qwen3_5/persistence.rs`). Without this, a
+                    // `--q-mtp {cyankiwi,all}` MoE checkpoint reloads its
+                    // quantized MTP linears (router gate, switch_mlp experts,
+                    // shared expert + gate, attention) with the WRONG PLQ — the
+                    // gate-prefix would fall back to the 8-bit `default_gate_plq`
+                    // while convert packed them at the uniform 4-bit/gs32 affine
+                    // PLQ (Option A), corrupting the head. The suffix set is
+                    // flavor-derived from the SAME `mtp_mlp_variant` decision the
+                    // load-completeness gate uses (a dense-flavored MoE MTP layer
+                    // emits dense `mlp.{gate,up,down}_proj` keys, so it must use
+                    // the dense suffix list). Injected BEFORE both
+                    // `apply_weights_moe_inner` (eager) and
+                    // `register_moe_weights_with_cpp` (compiled) so both MoE MTP
+                    // paths resolve the correct PLQ.
+                    let mtp_linear_suffixes: &[&str] =
+                        match super::mtp::Qwen3_5MoeMTPModule::mtp_mlp_variant(&config) {
+                            DrafterBodyVariant::Moe => &MTP_MOE_LAYER_LINEAR_SUFFIXES,
+                            DrafterBodyVariant::Dense => &MTP_LAYER_LINEAR_SUFFIXES,
+                        };
+                    augment_mtplx_mtp_quantization_with_suffixes(
+                        &raw,
+                        config.n_mtp_layers,
+                        mtp_linear_suffixes,
+                        &mut per_layer_quant,
+                    );
 
                     if quant_cfg.is_some() {
                         info!(
@@ -1022,6 +1284,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
             let image_processor = inner.image_processor.as_ref().map(Arc::clone);
             let tokenizer_out = inner.tokenizer.clone();
             let paged_active = inner.paged_adapter.is_some();
+            let mtp_active = inner.has_mtp_weights();
 
             Ok((
                 inner,
@@ -1032,21 +1295,30 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                     tokenizer_out,
                     cache_limit_guard,
                     paged_active,
+                    mtp_active,
                 ),
             ))
         },
         handle_qwen35_moe_cmd,
     );
 
-    let (config, _model_id, _image_processor, _tokenizer, cache_limit_guard, paged_active) =
-        init_rx
-            .await
-            .map_err(|_| Error::from_reason("Model thread exited during load"))??;
+    let (
+        config,
+        _model_id,
+        _image_processor,
+        _tokenizer,
+        cache_limit_guard,
+        paged_active,
+        mtp_active,
+    ) = init_rx
+        .await
+        .map_err(|_| Error::from_reason("Model thread exited during load"))??;
 
     Ok(Qwen3_5MoeModel {
         thread,
         config,
         paged_active,
+        mtp_active,
         _cache_limit_guard: cache_limit_guard,
     })
 }
@@ -1172,6 +1444,7 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
             .and_then(|v| v.as_u64())
             .map(|v| v as u32),
         use_block_paged_cache: raw.get("use_block_paged_cache").and_then(|v| v.as_bool()),
+        n_mtp_layers: gi(&["mtp_num_hidden_layers", "num_nextn_predict_layers"], 0),
     })
 }
 
@@ -1203,6 +1476,22 @@ fn register_moe_weights_with_cpp(
     // Clear weights (shared map). `mlx_clear_weights` also clears the
     // per-projection quant-info registry, so we re-populate both below.
     unsafe { sys::mlx_clear_weights() };
+
+    // PR #65 (mtp-reload P1) — invalidate the compiled MTP-verify dispatch
+    // tables (shared with the dense Qwen3.5 path) in the SAME write-lock
+    // critical section as the weight clear, so the next verify re-traces
+    // against the weights we store just below instead of reusing the
+    // previous model's baked compile cache. See the dense loader
+    // (`register_weights_with_cpp`) for the full rationale.
+    unsafe { sys::mlx_qwen35_invalidate_compiled_graphs() };
+
+    // PR #65 (mtp-reload P1) — also invalidate the MoE-specific compiled
+    // graphs (the MTP-verify graph plus the flat + paged AR-decode graphs
+    // in `mlx_qwen35_moe.cpp`), which bake expert/attention weights inside
+    // their traced closures and are NOT touched by the dense invalidation
+    // above. Same write-lock critical section so no in-flight compiled read
+    // overlaps.
+    unsafe { sys::mlx_qwen35_moe_invalidate_compiled_graphs() };
 
     let store = |name: &str, array: &MxArray| {
         let c_name = CString::new(name).expect("Weight name contains null byte");
@@ -1307,4 +1596,23 @@ pub fn create_random_qwen35_moe_checkpoint<'env>(
         drop(thread);
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::models::mtp_drafter::strip_wrapper_prefix;
+
+    /// T7 regression: the MoE body strip (`sanitize_weights`) delegates to the
+    /// shared longest-first `strip_wrapper_prefix`, so a raw, un-converted HF
+    /// VLM-wrapped checkpoint's triple-prefixed inline-MTP key is normalized to
+    /// the canonical `mtp.*` form instead of being silently dropped (the
+    /// shorter `model.language_model.` strip would have left
+    /// `model.mtp.layers.0...`).
+    #[test]
+    fn moe_body_strip_survives_triple_wrapped_mtp_key() {
+        assert_eq!(
+            strip_wrapper_prefix("model.language_model.model.mtp.layers.0.input_layernorm.weight"),
+            "mtp.layers.0.input_layernorm.weight"
+        );
+    }
 }

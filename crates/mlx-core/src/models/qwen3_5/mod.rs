@@ -1,3 +1,4 @@
+pub(crate) mod adaptive_depth;
 pub mod arrays_cache;
 pub mod attention;
 pub(crate) mod chat_common;
@@ -7,6 +8,7 @@ pub mod gated_delta;
 pub mod gated_delta_net;
 pub mod layer_cache;
 pub mod model;
+pub mod mtp;
 pub(crate) mod paged_forward;
 pub mod persistence;
 pub(crate) mod persistence_common;

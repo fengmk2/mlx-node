@@ -1240,6 +1240,19 @@ export declare class Qwen35Model {
    */
   hasBlockPagedCache(): boolean;
   /**
+   * W7 (MTP): whether this checkpoint shipped an MTP head (W2 module
+   * loaded by `persistence::apply_weights_inner`). Snapshotted at
+   * load time from `Qwen35Inner::has_mtp_weights()` so the TS
+   * `ChatSession` can auto-default `enableMtp = true` for
+   * MTP-capable checkpoints without dispatching a command into the
+   * model thread.
+   *
+   * Note: this only reports weight availability. Whether the W6
+   * speculative-decode path actually runs on a given call also
+   * requires the per-request `enableMtp` flag.
+   */
+  hasMtpWeights(): boolean;
+  /**
    * Load a pretrained model from a directory.
    *
    * Expects the directory to contain:
@@ -1416,6 +1429,19 @@ export declare class Qwen35MoeModel {
    * the model thread.
    */
   hasBlockPagedCache(): boolean;
+  /**
+   * W7 (MTP): whether this checkpoint shipped an MTP head (W2 module
+   * loaded by `persistence::apply_weights_moe_inner`). Snapshotted
+   * at load time from `Qwen35MoeInner::has_mtp_weights()` so the TS
+   * `ChatSession` can auto-default `enableMtp = true` for
+   * MTP-capable checkpoints without dispatching a command into the
+   * model thread. Mirrors `Qwen3_5Model::has_mtp_weights`.
+   *
+   * Note: this only reports weight availability. Whether the W6
+   * speculative-decode path actually runs on a given call also
+   * requires the per-request `enableMtp` flag.
+   */
+  hasMtpWeights(): boolean;
   /** Load a pretrained model from a directory. */
   static load(path: string): Promise<Qwen35MoeModel>;
   /** Generate text from a prompt token sequence. */
@@ -2431,6 +2457,36 @@ export interface ChatConfig {
    * avoiding redundant computation for multi-turn conversations.
    */
   reuseCache?: boolean | undefined;
+  /**
+   * W6 (MTP): opt-in flag enabling the Multi-Token Prediction
+   * speculative decode loop on the dense compiled path. Requires
+   * the model checkpoint to carry an MTP head (otherwise
+   * silently ignored). Default: `false`.
+   */
+  enableMtp?: boolean | undefined;
+  /**
+   * W6 (MTP): number of draft tokens per speculative cycle. Clamped
+   * to `[1, 5]` by the W5 verify FFI contract. Default: 1.
+   *
+   * W6.8: when `mtpAdaptiveDepth` is `true`, this value is used as
+   * the throughput-policy seed and the expected-value policy's max
+   * depth. Adaptive depth is opt-in; set
+   * `mtpAdaptiveDepth: true` explicitly to enable it.
+   */
+  mtpDepth?: number | undefined;
+  /**
+   * W6.8 (MTP): when true, the decode loop runs the W6.8 adaptive
+   * depth policy. Default mode is a per-depth EMA hill-climb plus
+   * DFlash-style 3-state machine `full | reduced | probe`.
+   * `MLX_MTP_ADAPTIVE_DEPTH_MODE=expected-value` instead uses the
+   * MTPLX-style intra-cycle expected-value gate, which deepens toward
+   * `mtpDepth` by default (T=0 byte-parity verified); set
+   * `MLX_MTP_EV_ALLOW_DEEPEN=0` to pin the base depth.
+   * When false, the loop pins `mtpDepth` for every cycle.
+   *
+   * Default: false. An explicit value always wins over the default.
+   */
+  mtpAdaptiveDepth?: boolean | undefined;
 }
 
 /** Chat message with tool calling support */
@@ -2616,6 +2672,24 @@ export interface ConversionOptions {
    * Forces `group_size = 32` for upgraded layers.
    */
   quantMxfp?: boolean;
+  /**
+   * Optional Qwen MTP quantization policy: "off" (default), "cyankiwi", "all",
+   * or "split" (alias "drafter").
+   * "cyankiwi" keeps mtp.fc dense and quantizes only the MTP layer linears as
+   * 4-bit affine group_size=32. For dense `qwen3_5` the quantized linears are
+   * emitted into an MTPLX-compatible mtp.safetensors sidecar; for MoE
+   * (`qwen3_5_moe`) there is no sidecar — they are quantized in place and stored
+   * inline in the main safetensors shards.
+   * "all" additionally quantizes mtp.fc. For dense `qwen3_5` the quantized MTP
+   * linears land in the mtp.safetensors sidecar; for MoE (`qwen3_5_moe`) there
+   * is no sidecar — they are quantized in place and stored inline in the main
+   * safetensors shards.
+   * "split"/"drafter" emits a body checkpoint with NO mtp.* tensors plus a
+   * separate `mtp-drafter/` directory in mlx-vlm's `qwen3_5_mtp` format
+   * (bare-keyed MTP head, format:mlx). It does NOT require --quantize/--q-recipe;
+   * the body may be bf16 or already-quantized and the MTP head stays bf16.
+   */
+  quantMtp?: string;
 }
 
 export interface ConversionResult {
@@ -3043,6 +3117,24 @@ export interface GenerationProfile {
   timeToFirstTokenMs: number;
   /** Per-phase breakdown. */
   phases: Array<PhaseProfile>;
+  /**
+   * MTP speculative decode: mean accepted *draft* tokens per cycle
+   * (excludes the always-verified token). Historical drafts-only metric.
+   */
+  mtpMeanAcceptedTokens?: number;
+  /**
+   * MTP speculative decode: mean *committed* tokens per cycle, INCLUDING
+   * the always-verified token (`mtp_accepted_drafts_total / mtp_cycles
+   * + 1.0`). mlx-vlm-comparable headline; equals mlx-vlm's
+   * `(accepted_drafts + rounds) / rounds` (`common.py:247`).
+   */
+  mtpMeanAcceptedTokensTotal?: number;
+  /** MTP speculative decode: per-draft-position acceptance rate. */
+  mtpAcceptanceByPosition?: Array<number>;
+  /** MTP speculative decode: number of draft+verify cycles executed. */
+  mtpCycles?: number;
+  /** MTP speculative decode: mean attempted draft depth per cycle. */
+  mtpMeanDepth?: number;
   /** Memory snapshot before generation. */
   memoryBefore?: MemorySnapshot;
   /** Memory snapshot after generation. */
@@ -3643,6 +3735,52 @@ export interface PerformanceMetrics {
    * Excludes the first token (counted as prefill).
    */
   decodeTokensPerSecond: number;
+  /**
+   * MTP speculative decode: mean accepted *draft* tokens per cycle
+   * (range `[0, depth]`). EXCLUDES the always-verified token each cycle
+   * commits. `None` on plain autoregressive runs where no MTP cycle
+   * executed. This is the historical drafts-only metric; for the
+   * mlx-vlm-comparable headline see [`Self::mtp_mean_accepted_tokens_total`].
+   */
+  mtpMeanAcceptedTokens?: number;
+  /**
+   * MTP speculative decode: mean *committed* tokens per cycle, INCLUDING
+   * the single always-verified token each cycle emits — i.e.
+   * `mtp_accepted_drafts_total / mtp_cycles + 1.0`. This is the
+   * mlx-vlm-comparable headline accept rate: it equals mlx-vlm's
+   * `mean_accepted_tokens = (accepted_drafts + rounds) / rounds`
+   * (`mlx-vlm/mlx_vlm/speculative/common.py:247`), where our
+   * `mtp_cycles` is the 1:1 analog of mlx-vlm's `rounds` (one
+   * draft+verify iteration; `record_mtp_cycle` is called exactly once
+   * per cycle). The per-cycle `+1.0` matches mlx-vlm's `+rounds`
+   * assumption — every round commits exactly one verified token
+   * (the residual on partial-accept, the bonus on full-accept), even
+   * when the final cycle's tail is EOS/length-truncated downstream
+   * (mlx-vlm makes the same assumption: it appends to `accept_lens`
+   * once per round regardless of truncation). `None` on plain
+   * autoregressive runs.
+   */
+  mtpMeanAcceptedTokensTotal?: number;
+  /**
+   * MTP speculative decode: per-draft-position acceptance rate
+   * (index = draft position). `None` on plain autoregressive runs.
+   */
+  mtpAcceptanceByPosition?: Array<number>;
+  /**
+   * MTP speculative decode: number of draft+verify cycles executed.
+   * `None` on plain autoregressive runs.
+   */
+  mtpCycles?: number;
+  /**
+   * MTP speculative decode: mean attempted draft depth per cycle.
+   * `None` on plain autoregressive runs.
+   */
+  mtpMeanDepth?: number;
+  /**
+   * Optional decode phase breakdown. Present when decode profiling
+   * is enabled via `MLX_PROFILE_DECODE=1` or `setProfilingEnabled(true)`.
+   */
+  profilePhases?: Array<PhaseProfile>;
 }
 
 export interface PhaseProfile {
@@ -3773,6 +3911,32 @@ export interface QianfanOcrConfig {
   minDynamicPatch: number;
 }
 
+/** Microbench result for the production quantized qmv dispatch path. */
+export interface QmvQuantizedMicrobenchResult {
+  /** Median `quantized_matmul` wall-clock per call, in nanoseconds. */
+  medianNs: number;
+  /** A tiny materialized checksum of the final output, used to keep the call live. */
+  checksum: number;
+}
+
+/**
+ * Run the production quantized-qmv microbench in the current process.
+ *
+ * To compare `MLX_MTP_SMALL_M_QMV=0` versus `1`, call this from separate
+ * processes. MLX caches the env-backed dispatch predicate statically.
+ */
+export declare function quantizedQmvMicrobench(
+  k: number,
+  n: number,
+  m: number,
+  groupSize: number,
+  bits: number,
+  mode: string,
+  dtype: DType,
+  warmup?: number | undefined | null,
+  iters?: number | undefined | null,
+): QmvQuantizedMicrobenchResult;
+
 /**
  * Qwen3.5 model configuration (dense variant).
  *
@@ -3844,6 +4008,14 @@ export interface Qwen35Config {
    * weights parity verification.
    */
   useBlockPagedCache?: boolean | undefined;
+  /**
+   * Number of MTP (Multi-Token Prediction) head layers shipped with the
+   * checkpoint. Populated from `mtp_num_hidden_layers` /
+   * `num_nextn_predict_layers` in `config.json`. `0` means the
+   * checkpoint has no MTP heads and the speculative-decode path is
+   * unavailable.
+   */
+  nMtpLayers: number;
 }
 
 /** Generation configuration for Qwen3.5 */
@@ -3927,6 +4099,14 @@ export interface Qwen35MoeConfig {
    * Default: `None` / `false`.
    */
   useBlockPagedCache?: boolean | undefined;
+  /**
+   * Number of MTP (Multi-Token Prediction) head layers shipped with
+   * the checkpoint. Populated from `mtp_num_hidden_layers` /
+   * `num_nextn_predict_layers` in `config.json`. `0` means the
+   * checkpoint has no MTP heads and the speculative-decode path is
+   * unavailable.
+   */
+  nMtpLayers: number;
 }
 
 /** Generation configuration for Qwen3.5 MoE */

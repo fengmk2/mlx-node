@@ -39,6 +39,40 @@ pub struct PerformanceMetrics {
     /// Decode throughput: (generated_tokens - 1) / decode_time.
     /// Excludes the first token (counted as prefill).
     pub decode_tokens_per_second: f64,
+    /// MTP speculative decode: mean accepted *draft* tokens per cycle
+    /// (range `[0, depth]`). EXCLUDES the always-verified token each cycle
+    /// commits. `None` on plain autoregressive runs where no MTP cycle
+    /// executed. This is the historical drafts-only metric; for the
+    /// mlx-vlm-comparable headline see [`Self::mtp_mean_accepted_tokens_total`].
+    pub mtp_mean_accepted_tokens: Option<f64>,
+    /// MTP speculative decode: mean *committed* tokens per cycle, INCLUDING
+    /// the single always-verified token each cycle emits — i.e.
+    /// `mtp_accepted_drafts_total / mtp_cycles + 1.0`. This is the
+    /// mlx-vlm-comparable headline accept rate: it equals mlx-vlm's
+    /// `mean_accepted_tokens = (accepted_drafts + rounds) / rounds`
+    /// (`mlx-vlm/mlx_vlm/speculative/common.py:247`), where our
+    /// `mtp_cycles` is the 1:1 analog of mlx-vlm's `rounds` (one
+    /// draft+verify iteration; `record_mtp_cycle` is called exactly once
+    /// per cycle). The per-cycle `+1.0` matches mlx-vlm's `+rounds`
+    /// assumption — every round commits exactly one verified token
+    /// (the residual on partial-accept, the bonus on full-accept), even
+    /// when the final cycle's tail is EOS/length-truncated downstream
+    /// (mlx-vlm makes the same assumption: it appends to `accept_lens`
+    /// once per round regardless of truncation). `None` on plain
+    /// autoregressive runs.
+    pub mtp_mean_accepted_tokens_total: Option<f64>,
+    /// MTP speculative decode: per-draft-position acceptance rate
+    /// (index = draft position). `None` on plain autoregressive runs.
+    pub mtp_acceptance_by_position: Option<Vec<f64>>,
+    /// MTP speculative decode: number of draft+verify cycles executed.
+    /// `None` on plain autoregressive runs.
+    pub mtp_cycles: Option<u32>,
+    /// MTP speculative decode: mean attempted draft depth per cycle.
+    /// `None` on plain autoregressive runs.
+    pub mtp_mean_depth: Option<f64>,
+    /// Optional decode phase breakdown. Present when decode profiling
+    /// is enabled via `MLX_PROFILE_DECODE=1` or `setProfilingEnabled(true)`.
+    pub profile_phases: Option<Vec<PhaseProfile>>,
 }
 
 #[napi(object)]
@@ -88,6 +122,20 @@ pub struct GenerationProfile {
     pub time_to_first_token_ms: f64,
     /// Per-phase breakdown.
     pub phases: Vec<PhaseProfile>,
+    /// MTP speculative decode: mean accepted *draft* tokens per cycle
+    /// (excludes the always-verified token). Historical drafts-only metric.
+    pub mtp_mean_accepted_tokens: Option<f64>,
+    /// MTP speculative decode: mean *committed* tokens per cycle, INCLUDING
+    /// the always-verified token (`mtp_accepted_drafts_total / mtp_cycles
+    /// + 1.0`). mlx-vlm-comparable headline; equals mlx-vlm's
+    /// `(accepted_drafts + rounds) / rounds` (`common.py:247`).
+    pub mtp_mean_accepted_tokens_total: Option<f64>,
+    /// MTP speculative decode: per-draft-position acceptance rate.
+    pub mtp_acceptance_by_position: Option<Vec<f64>>,
+    /// MTP speculative decode: number of draft+verify cycles executed.
+    pub mtp_cycles: Option<u32>,
+    /// MTP speculative decode: mean attempted draft depth per cycle.
+    pub mtp_mean_depth: Option<f64>,
     /// Memory snapshot before generation.
     pub memory_before: Option<MemorySnapshot>,
     /// Memory snapshot after generation.
@@ -312,6 +360,11 @@ mod tests {
             tokens_per_second: tps,
             time_to_first_token_ms: ttft_ms,
             phases: vec![],
+            mtp_mean_accepted_tokens: None,
+            mtp_mean_accepted_tokens_total: None,
+            mtp_acceptance_by_position: None,
+            mtp_cycles: None,
+            mtp_mean_depth: None,
             memory_before: None,
             memory_after: None,
         }
@@ -448,6 +501,11 @@ mod tests {
                     count: 50,
                 },
             ],
+            mtp_mean_accepted_tokens: Some(1.5),
+            mtp_mean_accepted_tokens_total: Some(2.5),
+            mtp_acceptance_by_position: Some(vec![0.9, 0.5]),
+            mtp_cycles: Some(10),
+            mtp_mean_depth: Some(2.0),
             memory_before: Some(MemorySnapshot {
                 active_bytes: 1e9,
                 peak_bytes: 1.5e9,
@@ -463,6 +521,12 @@ mod tests {
         assert_eq!(profile.phases.len(), 3);
         assert_eq!(profile.phases[0].name, "forward");
         assert_eq!(profile.phases[0].count, 50);
+        assert_eq!(profile.mtp_cycles, Some(10));
+        assert_eq!(profile.mtp_mean_depth, Some(2.0));
+        assert_eq!(
+            profile.mtp_acceptance_by_position.as_ref().unwrap(),
+            &vec![0.9, 0.5]
+        );
         assert!(profile.memory_before.is_some());
         assert!(profile.memory_after.is_some());
         assert_eq!(profile.memory_after.as_ref().unwrap().cache_bytes, 5e8);

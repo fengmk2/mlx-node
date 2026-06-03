@@ -7,11 +7,13 @@
 // - Top-p (nucleus) sampling
 // - Min-p sampling
 
-use crate::array::MxArray;
+use crate::array::{DType, MxArray};
 use crate::nn::Activations;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
+use rand::{Rng, RngExt};
+use std::sync::OnceLock;
 
 /// Configuration for sampling strategies
 /// ⚡ PERFORMANCE: Made Copy to avoid cloning on every token
@@ -37,6 +39,383 @@ impl Default for SamplingConfig {
             min_p: Some(0.0),
         }
     }
+}
+
+const SPARSE_DISTRIBUTION_MAX_TOP_K: i32 = 256;
+
+/// f32 epsilon at or below which a `temperature` selects the greedy (argmax)
+/// sampler path. MUST equal the C++ `GREEDY_TEMPERATURE_EPS` (`1e-6f`) in
+/// `crates/mlx-sys/src/mlx_misc_ops.cpp`.
+pub(crate) const GREEDY_TEMPERATURE_EPS: f32 = 1e-6;
+
+/// Whether `temperature` selects the greedy (argmax) sampler path.
+///
+/// CRITICAL — this MUST reproduce the C++ greedy guard BIT-FOR-BIT. The
+/// sampler FFIs (`mlx_compiled_sample_full`, `mlx_compiled_sampling_distribution`,
+/// `mlx_compiled_sample_and_logprobs`) take `temperature` as `f32`, and C++
+/// compares `(f32)temperature <= GREEDY_TEMPERATURE_EPS` (`1e-6f`). If the Rust
+/// accept/sparse gates compared the *f64* temperature against an f64 `1e-6`
+/// instead, a value in the narrow window `(1e-6_f64, 1e-6f-as-real ≈ 1.0000000117e-6]`
+/// would be stochastic to Rust but greedy to C++ — reintroducing the
+/// draw-vs-accept distribution mismatch the q/p (proposal/target) path exists to
+/// prevent. Casting to f32 BEFORE the comparison reproduces the C++ decision
+/// exactly (same IEEE round-to-nearest cast, same `1e-6f` threshold bit pattern,
+/// same `<=`).
+pub(crate) fn is_greedy_temperature(temperature: f64) -> bool {
+    (temperature as f32) <= GREEDY_TEMPERATURE_EPS
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SamplerParityMode {
+    Current,
+    Mtplx,
+}
+
+impl SamplerParityMode {
+    fn ffi_code(self) -> i32 {
+        match self {
+            Self::Current => 0,
+            Self::Mtplx => 1,
+        }
+    }
+}
+
+fn sampler_parity_mode() -> SamplerParityMode {
+    static CACHE: OnceLock<SamplerParityMode> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let raw = std::env::var("MLX_MTP_SAMPLER_PARITY")
+            .or_else(|_| std::env::var("MLX_SAMPLER_PARITY"))
+            .unwrap_or_default();
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "mtplx" | "mlx-lm" | "mlx_lm" | "temperature-first" | "temperature_first" => {
+                SamplerParityMode::Mtplx
+            }
+            _ => SamplerParityMode::Current,
+        }
+    })
+}
+
+pub(crate) fn sampler_parity_ffi_code() -> i32 {
+    sampler_parity_mode().ffi_code()
+}
+
+pub(crate) fn sampler_parity_is_mtplx() -> bool {
+    sampler_parity_mode() == SamplerParityMode::Mtplx
+}
+
+/// Owned sparse probability distribution used by stochastic MTP acceptance.
+///
+/// The support is intentionally tiny (`top_k`, typically 20), so linear scans
+/// are faster and simpler than allocating a hash table per draft position.
+#[derive(Clone, Debug)]
+pub(crate) struct SparseDistribution {
+    token_ids: Vec<i32>,
+    probs: Vec<f64>,
+    vocab_size: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SparseDistributionRef<'a> {
+    token_ids: &'a [i32],
+    probs: &'a [f64],
+    vocab_size: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SparseDistributionRows {
+    token_ids: Vec<i32>,
+    probs: Vec<f64>,
+    rows: usize,
+    width: usize,
+    vocab_size: usize,
+}
+
+impl SparseDistribution {
+    pub(crate) fn as_row(&self) -> SparseDistributionRef<'_> {
+        SparseDistributionRef {
+            token_ids: &self.token_ids,
+            probs: &self.probs,
+            vocab_size: self.vocab_size,
+        }
+    }
+}
+
+impl SparseDistributionRows {
+    pub(crate) fn from_precomputed(
+        token_ids: Vec<i32>,
+        probs: Vec<f64>,
+        rows: usize,
+        width: usize,
+        vocab_size: usize,
+        context: &str,
+    ) -> Result<Self> {
+        let len = rows.checked_mul(width).ok_or_else(|| {
+            Error::new(
+                Status::InvalidArg,
+                format!("{context}: sparse row shape overflows rows={rows} width={width}"),
+            )
+        })?;
+        if rows == 0 || width == 0 || vocab_size == 0 {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "{context}: rows, width, and vocab_size must be positive (rows={rows}, width={width}, vocab={vocab_size})"
+                ),
+            ));
+        }
+        if token_ids.len() != len || probs.len() != len {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "{context}: token/prob length mismatch ids={} probs={} expected={len}",
+                    token_ids.len(),
+                    probs.len()
+                ),
+            ));
+        }
+
+        let mut normalized = vec![0.0f64; len];
+        for row in 0..rows {
+            let start = row * width;
+            let end = start + width;
+            let mut total = 0.0f64;
+            for (&token_id, &prob) in token_ids[start..end].iter().zip(probs[start..end].iter()) {
+                if token_id < 0 || token_id as usize >= vocab_size {
+                    return Err(Error::new(
+                        Status::InvalidArg,
+                        format!(
+                            "{context}: token id {token_id} in row {row} outside vocab {vocab_size}"
+                        ),
+                    ));
+                }
+                if !prob.is_finite() || prob < 0.0 {
+                    return Err(Error::new(
+                        Status::InvalidArg,
+                        format!("{context}: invalid probability {prob} in row {row}"),
+                    ));
+                }
+                total += prob;
+            }
+            if !total.is_finite() || total <= 0.0 {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    format!("{context}: row {row} has no positive probability mass"),
+                ));
+            }
+            for j in start..end {
+                normalized[j] = probs[j] / total;
+            }
+        }
+
+        Ok(Self {
+            token_ids,
+            probs: normalized,
+            rows,
+            width,
+            vocab_size,
+        })
+    }
+
+    pub(crate) fn from_precomputed_arrays(
+        token_ids: &MxArray,
+        probs: &MxArray,
+        vocab_size: usize,
+        expected_rows: usize,
+        expected_width: usize,
+        context: &str,
+    ) -> Result<Self> {
+        let ids_shape = token_ids.shape()?;
+        let ids_shape: Vec<i64> = ids_shape.as_ref().to_vec();
+        let probs_shape = probs.shape()?;
+        let probs_shape: Vec<i64> = probs_shape.as_ref().to_vec();
+        let expected = vec![expected_rows as i64, expected_width as i64];
+        if ids_shape != expected || probs_shape != expected {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "{context}: expected ids/probs shape {:?}, got ids={:?} probs={:?}",
+                    expected, ids_shape, probs_shape
+                ),
+            ));
+        }
+
+        MxArray::eval_arrays(&[token_ids, probs])?;
+        let token_ids: Vec<i32> = token_ids.to_int32()?.to_vec();
+        let probs: Vec<f32> = probs.to_float32()?.to_vec();
+        let probs = probs.into_iter().map(f64::from).collect();
+        Self::from_precomputed(
+            token_ids,
+            probs,
+            expected_rows,
+            expected_width,
+            vocab_size,
+            context,
+        )
+    }
+
+    pub(crate) fn validate_for_accept(
+        &self,
+        expected_rows: usize,
+        expected_vocab_size: usize,
+        config: &SamplingConfig,
+    ) -> Result<()> {
+        let top_k = config.top_k.unwrap_or(0);
+        let expected_width = usize::min(top_k.max(0) as usize, expected_vocab_size);
+        if self.rows < expected_rows
+            || self.width != expected_width
+            || self.vocab_size != expected_vocab_size
+        {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "precomputed sparse target rows mismatch: rows={} width={} vocab={} expected rows>={} width={} vocab={}",
+                    self.rows,
+                    self.width,
+                    self.vocab_size,
+                    expected_rows,
+                    expected_width,
+                    expected_vocab_size
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+
+    pub(crate) fn row(&self, row: usize) -> Result<SparseDistributionRef<'_>> {
+        if row >= self.rows {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "sparse distribution row {} out of bounds for {} rows",
+                    row, self.rows
+                ),
+            ));
+        }
+        let start = row * self.width;
+        let end = start + self.width;
+        Ok(SparseDistributionRef {
+            token_ids: &self.token_ids[start..end],
+            probs: &self.probs[start..end],
+            vocab_size: self.vocab_size,
+        })
+    }
+
+    pub(crate) fn row_owned(&self, row: usize) -> Result<SparseDistribution> {
+        let row_ref = self.row(row)?;
+        Ok(SparseDistribution {
+            token_ids: row_ref.token_ids.to_vec(),
+            probs: row_ref.probs.to_vec(),
+            vocab_size: row_ref.vocab_size,
+        })
+    }
+}
+
+impl SparseDistributionRef<'_> {
+    pub(crate) fn probability(&self, token_id: i32) -> f64 {
+        self.token_ids
+            .iter()
+            .zip(self.probs.iter())
+            .find_map(|(&id, &prob)| {
+                if id == token_id && prob > 0.0 {
+                    Some(prob)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0.0)
+    }
+
+    pub(crate) fn positive_rank(&self, token_id: i32) -> Option<usize> {
+        let mut rank = 0usize;
+        for (&id, &prob) in self.token_ids.iter().zip(self.probs.iter()) {
+            if !prob.is_finite() || prob <= 0.0 {
+                continue;
+            }
+            rank += 1;
+            if id == token_id {
+                return Some(rank);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn top_entry(&self) -> Option<(i32, f64)> {
+        let mut best: Option<(i32, f64)> = None;
+        for (&id, &prob) in self.token_ids.iter().zip(self.probs.iter()) {
+            if !prob.is_finite() || prob <= 0.0 {
+                continue;
+            }
+            match best {
+                Some((_, best_prob)) if prob <= best_prob => {}
+                _ => best = Some((id, prob)),
+            }
+        }
+        best
+    }
+
+    pub(crate) fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> Result<i32> {
+        sample_sparse_slices(self.token_ids, self.probs, rng)
+    }
+}
+
+fn sample_sparse_slices<R: Rng + ?Sized>(
+    token_ids: &[i32],
+    probs: &[f64],
+    rng: &mut R,
+) -> Result<i32> {
+    if token_ids.len() != probs.len() || token_ids.is_empty() {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "sparse distribution token/probability shape mismatch".to_string(),
+        ));
+    }
+
+    let total: f64 = probs
+        .iter()
+        .copied()
+        .filter(|p| p.is_finite() && *p > 0.0)
+        .sum();
+    if !total.is_finite() || total <= 0.0 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "sparse distribution has no positive probability mass".to_string(),
+        ));
+    }
+
+    let u: f64 = rng.random::<f64>() * total;
+    let mut cumulative = 0.0f64;
+    let mut last_positive: Option<i32> = None;
+    for (&token_id, &prob) in token_ids.iter().zip(probs.iter()) {
+        if !prob.is_finite() || prob <= 0.0 {
+            continue;
+        }
+        cumulative += prob;
+        last_positive = Some(token_id);
+        if u < cumulative {
+            return Ok(token_id);
+        }
+    }
+
+    last_positive.ok_or_else(|| {
+        Error::new(
+            Status::InvalidArg,
+            "sparse distribution has no sampleable token".to_string(),
+        )
+    })
+}
+
+pub(crate) fn sparse_distribution_supported(config: &SamplingConfig) -> bool {
+    let temperature = config.temperature.unwrap_or(1.0);
+    let top_k = config.top_k.unwrap_or(0);
+    let min_p = config.min_p.unwrap_or(0.0);
+    !is_greedy_temperature(temperature)
+        && top_k > 0
+        && top_k <= SPARSE_DISTRIBUTION_MAX_TOP_K
+        && min_p <= 0.0
 }
 
 /// Apply temperature scaling to logits
@@ -353,9 +732,52 @@ pub(crate) fn sample_compiled(logits: &MxArray, config: Option<SamplingConfig>) 
             top_k,
             top_p as f32,
             min_p as f32,
+            sampler_parity_mode().ffi_code(),
         )
     };
     MxArray::from_handle(handle, "compiled_sample_full")
+}
+
+/// Build the normalized probability distribution that `sample`/`sample_compiled`
+/// draws from, using the EXACT same compiled filter chain (`top_k`, `top_p`,
+/// `min_p`) and active `sampler_parity_mode()`.
+///
+/// The returned array is `softmax(filtered_logits * inv_temp)` over the last
+/// axis (filtered-out tokens are exactly 0). `inv_temp` is `1/temperature` in
+/// the default mode and `1.0` in MTPLX parity mode (where temperature is folded
+/// into `filtered_logits` upstream), matching the compiled sampler exactly. Use
+/// it for stochastic MTP
+/// acceptance so the proposal density `q` (draft logits) and target density `p`
+/// (verify logits) match the distribution the token was actually drawn from —
+/// preserving Leviathan-Chen exactness for arbitrary temperature/top_k/top_p/
+/// min_p and both parity modes.
+///
+/// NOTE: at `temperature <= 1e-6` the sampler is argmax-only and the acceptance
+/// path ignores `q`/`p`. This wrapper forwards `temperature == 0.0` to the C++
+/// argmax one-hot path; callers on the greedy accept shortcut should simply not
+/// call this. Shape and dtype mirror `logits` (last-axis softmax); cast to f32
+/// for the accept math.
+pub(crate) fn sampling_distribution(
+    logits: &MxArray,
+    config: Option<SamplingConfig>,
+) -> Result<MxArray> {
+    let cfg = config.unwrap_or_default();
+    let temperature = cfg.temperature.unwrap_or(1.0);
+    let top_k = cfg.top_k.unwrap_or(0);
+    let top_p = cfg.top_p.unwrap_or(1.0);
+    let min_p = cfg.min_p.unwrap_or(0.0);
+
+    let handle = unsafe {
+        sys::mlx_compiled_sampling_distribution(
+            logits.handle.0,
+            temperature as f32,
+            top_k,
+            top_p as f32,
+            min_p as f32,
+            sampler_parity_mode().ffi_code(),
+        )
+    };
+    MxArray::from_handle(handle, "compiled_sampling_distribution")
 }
 
 /// Sample and return both token and logprobs (eliminates redundant computation)
@@ -391,6 +813,7 @@ pub(crate) fn sample_and_logprobs(
             top_k,
             top_p as f32,
             min_p as f32,
+            sampler_parity_mode().ffi_code(),
             &mut token_handle,
             &mut logprobs_handle,
         );
@@ -400,6 +823,467 @@ pub(crate) fn sample_and_logprobs(
     let logprobs = MxArray::from_handle(logprobs_handle, "sample_logprobs")?;
 
     Ok((token, logprobs))
+}
+
+/// Build sparse probability rows that match `sample_compiled` for supported
+/// stochastic top-k samplers.
+///
+/// This is the MTPLX-style fast path for MTP acceptance: do the full-vocab
+/// work on-device (`top_k` + logsumexp), copy only `[rows, top_k]` token IDs
+/// and weights to CPU, then run probability-ratio acceptance on those tiny
+/// distributions.
+///
+/// Default semantics intentionally mirror `mlx_compiled_sample_full`:
+///   1. pick top-k support from unscaled logits/logprobs,
+///   2. apply top-p on that support using the unscaled probability tail,
+///   3. sample from `softmax(logits / temperature)` over the kept support.
+///
+/// With `MLX_MTP_SAMPLER_PARITY=mtplx`, the support probabilities are computed
+/// from `softmax(logits / temperature)` before top-p filtering, matching MTPLX's
+/// fast sparse sampler for its public `temp=0.6` path.
+pub(crate) fn sparse_distributions_from_logits(
+    logits: &MxArray,
+    config: &SamplingConfig,
+) -> Result<Option<SparseDistributionRows>> {
+    sparse_distributions_from_logits_with_mode(logits, config, sampler_parity_mode())
+}
+
+fn sparse_distributions_from_logits_with_mode(
+    logits: &MxArray,
+    config: &SamplingConfig,
+    mode: SamplerParityMode,
+) -> Result<Option<SparseDistributionRows>> {
+    if !sparse_distribution_supported(config) {
+        return Ok(None);
+    }
+
+    let temperature = config.temperature.unwrap_or(1.0);
+    let top_k = config.top_k.unwrap_or(0);
+    let top_p = config.top_p.unwrap_or(1.0);
+
+    let shape = logits.shape()?;
+    let shape_vec: Vec<i64> = shape.as_ref().to_vec();
+    if shape_vec.is_empty() {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "sparse_distributions_from_logits: expected at least 1D logits".to_string(),
+        ));
+    }
+    let vocab_size_i64 = *shape_vec.last().unwrap();
+    if vocab_size_i64 <= 0 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "sparse_distributions_from_logits: invalid vocab size {}",
+                vocab_size_i64
+            ),
+        ));
+    }
+    let vocab_size = vocab_size_i64 as usize;
+    let rows = if shape_vec.len() == 1 {
+        1usize
+    } else {
+        shape_vec[..shape_vec.len() - 1]
+            .iter()
+            .try_fold(1usize, |acc, &dim| {
+                if dim <= 0 {
+                    None
+                } else {
+                    acc.checked_mul(dim as usize)
+                }
+            })
+            .ok_or_else(|| {
+                Error::new(
+                    Status::InvalidArg,
+                    format!(
+                        "sparse_distributions_from_logits: invalid logits shape {:?}",
+                        shape_vec
+                    ),
+                )
+            })?
+    };
+
+    let width = usize::min(top_k as usize, vocab_size);
+    if width == 0 || width > SPARSE_DISTRIBUTION_MAX_TOP_K as usize {
+        return Ok(None);
+    }
+
+    let rows_i64 = rows as i64;
+    let width_i64 = width as i64;
+    let logits_2d = logits
+        .astype(DType::Float32)?
+        .reshape(&[rows_i64, vocab_size_i64])?;
+    let sampler_logits_2d = if mode == SamplerParityMode::Mtplx {
+        logits_2d.div_scalar(temperature)?
+    } else {
+        logits_2d.clone()
+    };
+
+    let neg_logits = sampler_logits_2d.mul_scalar(-1.0)?;
+    let partitioned = neg_logits.argpartition((width as i32) - 1, Some(-1))?;
+    let top_idx = partitioned.slice(&[0, 0], &[rows_i64, width_i64])?;
+    let top_vals = sampler_logits_2d.take_along_axis(&top_idx, -1)?;
+
+    // `argpartition` leaves the first k items unordered. Sort the tiny support
+    // descending by sampler logit so the CPU top-p tail pass is deterministic.
+    let sort_order = top_vals.mul_scalar(-1.0)?.argsort(Some(-1))?;
+    let top_idx = top_idx.take_along_axis(&sort_order, -1)?;
+    let top_vals = top_vals.take_along_axis(&sort_order, -1)?;
+
+    // These probabilities are only used to reproduce the sampler's top-p
+    // support. In MTPLX parity mode the logits are already temperature-scaled.
+    let log_total = sampler_logits_2d.logsumexp(Some(&[-1]), Some(true))?;
+    let base_probs = top_vals.sub(&log_total)?.exp()?.astype(DType::Float32)?;
+
+    MxArray::eval_arrays(&[&top_idx, &top_vals, &base_probs])?;
+    let token_ids: Vec<i32> = top_idx.to_int32()?.to_vec();
+    let top_values: Vec<f32> = top_vals.to_float32()?.to_vec();
+    let base_probs: Vec<f32> = base_probs.to_float32()?.to_vec();
+
+    let mut out_probs = vec![0.0f64; rows * width];
+    let mut out_ids = vec![0i32; rows * width];
+    let apply_top_p = top_p > 0.0 && top_p < 1.0;
+
+    for row in 0..rows {
+        let start = row * width;
+        let end = start + width;
+        out_ids[start..end].copy_from_slice(&token_ids[start..end]);
+
+        let mut keep = vec![true; width];
+        if apply_top_p {
+            keep.fill(false);
+
+            if mode == SamplerParityMode::Mtplx {
+                let mut cumulative_before = 0.0f64;
+                for j in 0..width {
+                    keep[j] = cumulative_before < top_p;
+                    let p = f64::from(base_probs[start + j]);
+                    if p.is_finite() && p > 0.0 {
+                        cumulative_before += p;
+                    }
+                }
+                if !keep.is_empty() {
+                    keep[0] = true;
+                }
+            } else {
+                let threshold = (1.0 - (top_p - 1e-7)).clamp(0.0, 1.0);
+                let mut low_tail = 0.0f64;
+                for j in (0..width).rev() {
+                    let p = f64::from(base_probs[start + j]);
+                    if p.is_finite() && p > 0.0 {
+                        low_tail += p;
+                    }
+                    keep[j] = low_tail > threshold;
+                }
+            }
+
+            if !keep.iter().any(|&v| v) {
+                keep[0] = true;
+            }
+        }
+
+        let mut max_scaled = f64::NEG_INFINITY;
+        for j in 0..width {
+            if keep[j] {
+                let scaled = if mode == SamplerParityMode::Mtplx {
+                    f64::from(top_values[start + j])
+                } else {
+                    f64::from(top_values[start + j]) / temperature
+                };
+                if scaled.is_finite() {
+                    max_scaled = max_scaled.max(scaled);
+                }
+            }
+        }
+        if !max_scaled.is_finite() {
+            out_probs[start] = 1.0;
+            continue;
+        }
+
+        let mut total = 0.0f64;
+        for j in 0..width {
+            if keep[j] {
+                let scaled = if mode == SamplerParityMode::Mtplx {
+                    f64::from(top_values[start + j])
+                } else {
+                    f64::from(top_values[start + j]) / temperature
+                };
+                let weight = (scaled - max_scaled).exp();
+                if weight.is_finite() && weight > 0.0 {
+                    out_probs[start + j] = weight;
+                    total += weight;
+                }
+            }
+        }
+
+        if !total.is_finite() || total <= 0.0 {
+            out_probs[start] = 1.0;
+            continue;
+        }
+        for j in 0..width {
+            out_probs[start + j] /= total;
+        }
+    }
+
+    Ok(Some(SparseDistributionRows {
+        token_ids: out_ids,
+        probs: out_probs,
+        rows,
+        width,
+        vocab_size,
+    }))
+}
+
+pub(crate) fn accept_with_residual_sparse<R: Rng + ?Sized>(
+    target_p: SparseDistributionRef<'_>,
+    draft_q: SparseDistributionRef<'_>,
+    draft_id: i32,
+    rng: &mut R,
+) -> Result<(bool, i32)> {
+    if draft_id < 0 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "accept_with_residual_sparse: draft_id must be non-negative, got {}",
+                draft_id
+            ),
+        ));
+    }
+    if (draft_id as usize) >= target_p.vocab_size || target_p.vocab_size != draft_q.vocab_size {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "accept_with_residual_sparse: draft_id/vocab mismatch draft_id={} target_vocab={} draft_vocab={}",
+                draft_id, target_p.vocab_size, draft_q.vocab_size
+            ),
+        ));
+    }
+
+    let p = target_p.probability(draft_id);
+    let q = draft_q.probability(draft_id);
+    let accept_prob = acceptance_probability_from_probs(p, q);
+
+    let u: f64 = rng.random();
+    if u < accept_prob {
+        return Ok((true, draft_id));
+    }
+
+    let mut residual_ids = Vec::with_capacity(target_p.token_ids.len());
+    let mut residual_probs = Vec::with_capacity(target_p.probs.len());
+    let mut total = 0.0f64;
+    for (&token_id, &p_t) in target_p.token_ids.iter().zip(target_p.probs.iter()) {
+        if !p_t.is_finite() || p_t <= 0.0 {
+            continue;
+        }
+        let residual = (p_t - draft_q.probability(token_id)).max(0.0);
+        if residual > 0.0 && residual.is_finite() {
+            residual_ids.push(token_id);
+            residual_probs.push(residual);
+            total += residual;
+        }
+    }
+
+    if !total.is_finite() || total <= 0.0 {
+        return Ok((false, target_p.sample(rng)?));
+    }
+    for prob in &mut residual_probs {
+        *prob /= total;
+    }
+    Ok((
+        false,
+        sample_sparse_slices(&residual_ids, &residual_probs, rng)?,
+    ))
+}
+
+pub(crate) fn acceptance_probability_from_probs(p: f64, q: f64) -> f64 {
+    if q <= 0.0 {
+        if p > 0.0 { 1.0 } else { 0.0 }
+    } else {
+        (p / q).min(1.0)
+    }
+}
+
+/// Speculative-sampling acceptance step (Leviathan-Chen theorem).
+///
+/// `p_target` and `p_draft` are probability distributions of shape `[vocab]`
+/// (softmax already applied; not logits). `draft_id` is the token the
+/// drafter sampled. Returns `(accepted, out_token)`:
+///   - `accepted = true`  ⇒ `out_token == draft_id`. The drafter wins.
+///   - `accepted = false` ⇒ `out_token` is a fresh sample from the residual
+///     distribution `(p_target - p_draft)+ / sum`. The drafter loses and
+///     the verifier's correction is emitted instead.
+///
+/// Ratio is computed in fp32; BF16 underflows on small `q` and breaks
+/// exactness (see MTPLX `sampling.py:143-148`).
+///
+/// **T=0 (greedy) degeneracy.** When `sampling_config.temperature <= 1e-6`
+/// the entire decoding path collapses to argmax — both the drafter (via
+/// `sample()` ⇒ `compiled_sample_full`) and any non-speculative reference
+/// run pick `argmax(logits)` deterministically. To preserve byte-exact
+/// parity between AR and MTP at T=0 we MUST take the same argmax-only
+/// branch here instead of running the stochastic ratio + categorical
+/// pipeline, which uses MLX's global RNG and would emit different tokens
+/// even when both distributions agree on the argmax. Concretely:
+///   - accept iff `argmax(p_target) == draft_id`
+///   - on reject, emit `argmax(p_target)` (the residual `(p_target -
+///     p_draft)+` has its maximum at the target argmax whenever the draft
+///     mass concentrates on a non-argmax token, which is the only way to
+///     enter this branch)
+///
+/// For T > 0 the existing stochastic Leviathan-Chen logic runs unchanged.
+///
+/// The caller-supplied `rng` is consumed for the single `u ~ Uniform(0, 1)`
+/// acceptance coin flip. The residual sample uses MLX's global random state
+/// via the same `categorical` path that `sample()` uses; this matches the
+/// existing sampling contract (one MLX RNG draw per emitted token).
+///
+/// `residual.sum() == 0` (would only happen if `p_target == p_draft`
+/// element-wise after the clip) falls back to `argmax(p_target)`. The
+/// argmax fallback stays within `p_target`'s support; an exact correction
+/// is impossible in the degenerate regime where the residual carries no
+/// mass, so we pick the highest-probability target token instead.
+// `pub(crate)`: the W6 `chat_common::run_mtp_cycle_inner` speculative
+// decode helper is the production caller.
+pub(crate) fn accept_with_residual<R: Rng + ?Sized>(
+    p_target: &MxArray,
+    p_draft: &MxArray,
+    draft_id: i32,
+    sampling_config: &SamplingConfig,
+    rng: &mut R,
+) -> Result<(bool, i32)> {
+    if draft_id < 0 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "accept_with_residual: draft_id must be non-negative, got {}",
+                draft_id
+            ),
+        ));
+    }
+
+    let ndim = p_target.ndim()? as usize;
+    if ndim != 1 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "accept_with_residual: p_target must be 1D [vocab], got ndim={}",
+                ndim
+            ),
+        ));
+    }
+    if p_draft.ndim()? as usize != 1 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "accept_with_residual: p_draft must be 1D [vocab]".to_string(),
+        ));
+    }
+    let vocab = p_target.shape_at(0)?;
+    if p_draft.shape_at(0)? != vocab {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "accept_with_residual: p_target/p_draft vocab mismatch {} vs {}",
+                vocab,
+                p_draft.shape_at(0)?
+            ),
+        ));
+    }
+    if (draft_id as i64) >= vocab {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "accept_with_residual: draft_id {} out of bounds for vocab {}",
+                draft_id, vocab
+            ),
+        ));
+    }
+
+    // T=0 (greedy) shortcut. See doc-comment above: must mirror the
+    // argmax-only behavior of `sample()` at T=0 to maintain AR/MTP
+    // parity. `sampling_config.temperature` is `Option<f64>` with the
+    // default = 1.0; `None` also routes here as 1.0 (no shortcut).
+    let temperature = sampling_config.temperature.unwrap_or(1.0);
+    if is_greedy_temperature(temperature) {
+        // fp32 for the argmax so we read from a deterministic dtype.
+        let p_target_f32 = p_target.astype(DType::Float32)?;
+        let argmax_arr = p_target_f32.argmax(0, None)?;
+        argmax_arr.eval();
+        let target_argmax = argmax_arr.item_at_int32(0)?;
+        if target_argmax == draft_id {
+            return Ok((true, draft_id));
+        }
+        return Ok((false, target_argmax));
+    }
+
+    // fp32 is mandatory — BF16 underflows on small q and breaks exactness.
+    let p_target_f32 = p_target.astype(DType::Float32)?;
+    let p_draft_f32 = p_draft.astype(DType::Float32)?;
+    // `item_at_*` reads `arr.data<T>()[index]` directly, which requires the
+    // underlying buffer to be materialized. Force evaluation before any
+    // scalar extraction.
+    p_target_f32.eval();
+    p_draft_f32.eval();
+
+    let idx = draft_id as usize;
+    let p_t = p_target_f32.item_at_float32(idx)?;
+    let p_d = p_draft_f32.item_at_float32(idx)?;
+
+    // Clamp to 1.0 to handle the (legal) case where the draft underestimates
+    // the target's probability for the drawn token.
+    let p_accept = if p_d <= 0.0 {
+        // Drafter assigned ~zero probability but still sampled `draft_id`.
+        // Accept iff the target also gives it positive mass; otherwise the
+        // draft is impossible under the target and must be rejected.
+        if p_t > 0.0 { 1.0 } else { 0.0 }
+    } else {
+        (p_t / p_d).min(1.0)
+    };
+
+    let u: f64 = rng.random();
+    // Strict `<` (not `<=`): `rng.random::<f64>()` is in `[0, 1)`, so the
+    // `next_u64() == 0` path yields `u = 0.0` exactly. With `<=`, a
+    // degenerate `p_accept = 0.0` (e.g. `p_target[draft_id] = 0` and
+    // `p_draft[draft_id] > 0`) would accept a token of zero target mass and
+    // break Leviathan-Chen exactness. With `<`, `p_accept = 0` always
+    // rejects because `u >= 0`, and `p_accept = 1` always accepts because
+    // `u < 1`.
+    if u < f64::from(p_accept) {
+        return Ok((true, draft_id));
+    }
+
+    // Rejected — sample from the residual distribution `(p_target - p_draft)+`.
+    let diff = p_target_f32.sub(&p_draft_f32)?;
+    let residual = diff.clip(Some(0.0), None)?;
+
+    // Compute sum on CPU to detect the zero-mass degenerate case.
+    let total_arr = residual.sum(None, None)?;
+    total_arr.eval();
+    let total = total_arr.item_at_float32(0)?;
+    // NaN-safe: written so a NaN `total` takes the argmax fallback rather
+    // than dividing by NaN and emitting a garbage token.
+    if !total.is_finite() || total <= 0.0 {
+        // residual.sum() == 0 or NaN — both distributions agree element-wise
+        // after the clip, or one of them is non-finite. Fall back to argmax,
+        // which stays within the target's support.
+        let argmax_arr = p_target_f32.argmax(0, None)?;
+        argmax_arr.eval();
+        let argmax = argmax_arr.item_at_int32(0)?;
+        return Ok((false, argmax));
+    }
+
+    let normalized = residual.div_scalar(f64::from(total))?;
+
+    // MLX's `categorical` consumes logits and uses the MLX global RNG.
+    // Convert the normalized residual to log-space; entries where
+    // `residual == 0` map to `-inf` and are excluded from the support.
+    // `categorical` and `argmax` both return uint32 indices in MLX;
+    // `item_at_int32` performs the safe static_cast to the public i32
+    // contract (vocab sizes are far below i32::MAX).
+    let log_probs = normalized.log()?;
+    let sampled = log_probs.categorical(Some(-1))?;
+    sampled.eval();
+    let token = sampled.item_at_int32(0)?;
+    Ok((false, token))
 }
 
 /// Shared context for penalty functions: validates inputs, slices to recent tokens,
@@ -1192,5 +2076,748 @@ mod frequency_penalty_tests {
         assert_close(data[3], 4.0, 1e-5);
         assert_close(data[4], 16.0, 1e-5); // 20.0 - 4.0 = 16.0
         assert_close(data[5], 6.0, 1e-5);
+    }
+}
+
+#[cfg(test)]
+mod accept_with_residual_tests {
+    use super::*;
+    use crate::array::MxArray;
+    use rand::rngs::StdRng;
+    use rand::{SeedableRng, TryRng};
+    use std::convert::Infallible;
+
+    /// Scripted RNG that hands out predetermined `u64` values from a queue
+    /// (smallest-first) and then panics if exhausted. Used to pin the
+    /// `u ~ Uniform(0, 1)` draw inside `accept_with_residual`:
+    ///   - `0` ⇒ `u ≈ 0` (force accept whenever p_accept > 0).
+    ///   - `u64::MAX` ⇒ `u ≈ 1 - ε` (force reject whenever p_accept < 1).
+    struct ScriptedRng {
+        queue: std::collections::VecDeque<u64>,
+    }
+
+    impl ScriptedRng {
+        fn new(values: &[u64]) -> Self {
+            Self {
+                queue: values.iter().copied().collect(),
+            }
+        }
+    }
+
+    impl TryRng for ScriptedRng {
+        type Error = Infallible;
+
+        fn try_next_u32(&mut self) -> std::result::Result<u32, Self::Error> {
+            // f64 sampling routes through next_u64, so this branch is only
+            // exercised if a future caller asks for u32. Panic loudly to
+            // catch unintended additional draws during the test.
+            panic!("ScriptedRng::try_next_u32 called — accept_with_residual must only draw u64");
+        }
+
+        fn try_next_u64(&mut self) -> std::result::Result<u64, Self::Error> {
+            Ok(self
+                .queue
+                .pop_front()
+                .expect("ScriptedRng exhausted — accept_with_residual drew more u64 than scripted"))
+        }
+
+        fn try_fill_bytes(&mut self, _dst: &mut [u8]) -> std::result::Result<(), Self::Error> {
+            panic!("ScriptedRng::try_fill_bytes called — unexpected RNG path");
+        }
+    }
+
+    fn one_hot(token: usize, vocab: usize) -> MxArray {
+        let mut data = vec![0.0f32; vocab];
+        data[token] = 1.0;
+        MxArray::from_float32(&data, &[vocab as i64]).expect("from_float32")
+    }
+
+    /// SamplingConfig with `temperature = 1.0` — keeps the stochastic
+    /// Leviathan-Chen path active so the original tests exercise it.
+    fn stochastic_cfg() -> SamplingConfig {
+        SamplingConfig {
+            temperature: Some(1.0),
+            top_k: Some(0),
+            top_p: Some(1.0),
+            min_p: Some(0.0),
+        }
+    }
+
+    /// SamplingConfig with `temperature = 0.0` — forces the T=0 argmax
+    /// shortcut. Mirrors how `extract_chat_params` propagates the user-
+    /// facing `temperature` field (W4 parity requirement).
+    fn greedy_cfg() -> SamplingConfig {
+        SamplingConfig {
+            temperature: Some(0.0),
+            top_k: Some(0),
+            top_p: Some(1.0),
+            min_p: Some(0.0),
+        }
+    }
+
+    fn sparse_cfg() -> SamplingConfig {
+        SamplingConfig {
+            temperature: Some(1.0),
+            top_k: Some(2),
+            top_p: Some(1.0),
+            min_p: Some(0.0),
+        }
+    }
+
+    fn sparse_temp_cfg() -> SamplingConfig {
+        SamplingConfig {
+            temperature: Some(0.5),
+            top_k: Some(3),
+            top_p: Some(0.8),
+            min_p: Some(0.0),
+        }
+    }
+
+    fn sparse_mtplx_wide_nucleus_cfg() -> SamplingConfig {
+        SamplingConfig {
+            temperature: Some(1.0),
+            top_k: Some(2),
+            top_p: Some(0.95),
+            min_p: Some(0.0),
+        }
+    }
+
+    #[test]
+    fn sparse_distribution_rows_keep_topk_and_normalize() {
+        let logits = MxArray::from_float32(
+            &[
+                0.0f32, 1.0, 2.0, 3.0, // row 0 keeps tokens 3 and 2
+                3.0, 2.0, 1.0, 0.0, // row 1 keeps tokens 0 and 1
+            ],
+            &[2, 4],
+        )
+        .expect("logits");
+        let rows = sparse_distributions_from_logits(&logits, &sparse_cfg())
+            .expect("sparse distributions")
+            .expect("supported sparse distribution");
+
+        let row0 = rows.row(0).expect("row0");
+        assert!(row0.probability(3) > row0.probability(2));
+        assert_eq!(row0.probability(0), 0.0);
+        assert_eq!(row0.probability(1), 0.0);
+        assert_close(
+            (row0.probability(2) + row0.probability(3)) as f32,
+            1.0,
+            1e-6,
+        );
+
+        let row1 = rows.row(1).expect("row1");
+        assert!(row1.probability(0) > row1.probability(1));
+        assert_eq!(row1.probability(2), 0.0);
+        assert_eq!(row1.probability(3), 0.0);
+        assert_close(
+            (row1.probability(0) + row1.probability(1)) as f32,
+            1.0,
+            1e-6,
+        );
+    }
+
+    #[test]
+    fn sparse_distribution_rows_from_precomputed_validates_and_normalizes() {
+        let rows = SparseDistributionRows::from_precomputed(
+            vec![1, 2, 3, 0],
+            vec![2.0, 2.0, 0.0, 4.0],
+            2,
+            2,
+            4,
+            "test_precomputed",
+        )
+        .expect("precomputed rows");
+
+        let row0 = rows.row(0).expect("row0");
+        assert_close(row0.probability(1) as f32, 0.5, 1e-6);
+        assert_close(row0.probability(2) as f32, 0.5, 1e-6);
+
+        let row1 = rows.row(1).expect("row1");
+        assert_eq!(row1.probability(3), 0.0);
+        assert_close(row1.probability(0) as f32, 1.0, 1e-6);
+    }
+
+    #[test]
+    fn sparse_distribution_rows_from_precomputed_rejects_invalid_rows() {
+        assert!(
+            SparseDistributionRows::from_precomputed(
+                vec![1, 7],
+                vec![1.0, 0.0],
+                1,
+                2,
+                4,
+                "test_precomputed",
+            )
+            .is_err()
+        );
+        assert!(
+            SparseDistributionRows::from_precomputed(
+                vec![1, 2],
+                vec![0.0, 0.0],
+                1,
+                2,
+                4,
+                "test_precomputed",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn mtplx_sparse_distribution_filters_top_p_after_temperature() {
+        let logits = MxArray::from_float32(&[2.0f32, 1.0, 0.0], &[1, 3]).expect("logits");
+        let current = sparse_distributions_from_logits_with_mode(
+            &logits,
+            &sparse_temp_cfg(),
+            SamplerParityMode::Current,
+        )
+        .expect("current sparse")
+        .expect("current supported");
+        let mtplx = sparse_distributions_from_logits_with_mode(
+            &logits,
+            &sparse_temp_cfg(),
+            SamplerParityMode::Mtplx,
+        )
+        .expect("mtplx sparse")
+        .expect("mtplx supported");
+
+        let current_row = current.row(0).expect("current row");
+        assert!(current_row.probability(1) > 0.0);
+        assert_eq!(current_row.probability(2), 0.0);
+
+        let mtplx_row = mtplx.row(0).expect("mtplx row");
+        assert_close(mtplx_row.probability(0) as f32, 1.0, 1e-6);
+        assert_eq!(mtplx_row.probability(1), 0.0);
+        assert_eq!(mtplx_row.probability(2), 0.0);
+    }
+
+    #[test]
+    fn mtplx_sparse_distribution_keeps_topk_when_nucleus_extends_past_topk() {
+        let mut values = vec![0.0f32, -5.24];
+        values.extend((0..60).map(|_| -6.907));
+        let logits = MxArray::from_float32(&values, &[1, values.len() as i64]).expect("logits");
+        let current = sparse_distributions_from_logits_with_mode(
+            &logits,
+            &sparse_mtplx_wide_nucleus_cfg(),
+            SamplerParityMode::Current,
+        )
+        .expect("current sparse")
+        .expect("current supported");
+        let mtplx = sparse_distributions_from_logits_with_mode(
+            &logits,
+            &sparse_mtplx_wide_nucleus_cfg(),
+            SamplerParityMode::Mtplx,
+        )
+        .expect("mtplx sparse")
+        .expect("mtplx supported");
+
+        let current_row = current.row(0).expect("current row");
+        assert_eq!(current_row.probability(1), 0.0);
+
+        let mtplx_row = mtplx.row(0).expect("mtplx row");
+        assert!(mtplx_row.probability(1) > 0.0);
+        assert_close(
+            (mtplx_row.probability(0) + mtplx_row.probability(1)) as f32,
+            1.0,
+            1e-6,
+        );
+    }
+
+    #[test]
+    fn sparse_distribution_ref_reports_positive_rank_and_top_entry() {
+        let dist = SparseDistribution {
+            token_ids: vec![9, 8, 7, 6],
+            probs: vec![0.0, 0.5, 0.25, 0.25],
+            vocab_size: 10,
+        };
+        let row = dist.as_row();
+
+        assert_eq!(row.top_entry(), Some((8, 0.5)));
+        assert_eq!(row.positive_rank(9), None);
+        assert_eq!(row.positive_rank(8), Some(1));
+        assert_eq!(row.positive_rank(7), Some(2));
+        assert_eq!(row.positive_rank(6), Some(3));
+        assert_eq!(row.positive_rank(5), None);
+    }
+
+    #[test]
+    fn acceptance_probability_from_sparse_probs_matches_ratio_contract() {
+        assert_eq!(acceptance_probability_from_probs(0.0, 0.2), 0.0);
+        assert_eq!(acceptance_probability_from_probs(0.3, 0.0), 1.0);
+        assert_eq!(acceptance_probability_from_probs(0.0, 0.0), 0.0);
+        assert_close(
+            acceptance_probability_from_probs(0.2, 0.5) as f32,
+            0.4,
+            1e-6,
+        );
+        assert_eq!(acceptance_probability_from_probs(0.9, 0.3), 1.0);
+    }
+
+    #[test]
+    fn sparse_accept_reject_samples_sparse_residual() {
+        let target = SparseDistribution {
+            token_ids: vec![1, 2, 3],
+            probs: vec![0.4, 0.3, 0.3],
+            vocab_size: 4,
+        };
+        let draft = SparseDistribution {
+            token_ids: vec![0, 1, 2],
+            probs: vec![0.5, 0.25, 0.25],
+            vocab_size: 4,
+        };
+        // First draw pins accept u=0; p_accept=0 for draft token 0, so strict
+        // `<` still rejects. Second draw samples the first residual-support
+        // token deterministically.
+        let mut rng = ScriptedRng::new(&[0, 0]);
+        let (accepted, out) =
+            accept_with_residual_sparse(target.as_row(), draft.as_row(), 0, &mut rng)
+                .expect("sparse accept");
+        assert!(!accepted);
+        assert_eq!(out, 1);
+    }
+
+    #[test]
+    fn t0_collapse_argmax_match_accepts() {
+        // p_target = p_draft = one-hot at token 7, draft picked 7.
+        // p_t / p_d = 1.0 ⇒ always accept regardless of u.
+        let vocab = 16;
+        let p_target = one_hot(7, vocab);
+        let p_draft = one_hot(7, vocab);
+
+        // u_64 = u64::MAX still yields u < 1, so accept must fire even at
+        // the upper edge.
+        let mut rng = ScriptedRng::new(&[u64::MAX]);
+        let cfg = stochastic_cfg();
+        let (accepted, out) = accept_with_residual(&p_target, &p_draft, 7, &cfg, &mut rng)
+            .expect("accept_with_residual");
+        assert!(accepted, "T=0 argmax match must accept");
+        assert_eq!(out, 7);
+    }
+
+    #[test]
+    fn t0_collapse_argmax_mismatch_rejects() {
+        // p_target = one-hot at A (=2), p_draft = one-hot at B (=5), drawn B.
+        //   p_t[B] = 0, p_d[B] = 1 ⇒ p_accept = 0.
+        //   residual = max(p_target - p_draft, 0) = one-hot at A.
+        // For rejection we need u > 0. f64 from StandardUniform takes the
+        // top 53 bits of next_u64 (so `next_u64 >> 11`); we need that shift
+        // result to be > 0. Use u64::MAX which yields u ≈ 1 - 2^-53.
+        let vocab = 8;
+        let p_target = one_hot(2, vocab);
+        let p_draft = one_hot(5, vocab);
+
+        let mut rng = ScriptedRng::new(&[u64::MAX]);
+        let cfg = stochastic_cfg();
+        let (accepted, out) = accept_with_residual(&p_target, &p_draft, 5, &cfg, &mut rng)
+            .expect("accept_with_residual");
+        assert!(!accepted, "argmax mismatch must reject");
+        assert_eq!(out, 2, "residual collapses to argmax(p_target)");
+    }
+
+    #[test]
+    fn accept_when_target_dominates() {
+        // Contrived: target gives draft_id (=3) prob 0.6, draft gives 0.2.
+        // Ratio = 3.0, clamped to 1.0 ⇒ always accept.
+        let vocab = 4;
+        // p_target: [0.1, 0.1, 0.2, 0.6]
+        let p_target =
+            MxArray::from_float32(&[0.1f32, 0.1, 0.2, 0.6], &[vocab as i64]).expect("p_target");
+        // p_draft:  [0.3, 0.3, 0.2, 0.2]
+        let p_draft =
+            MxArray::from_float32(&[0.3f32, 0.3, 0.2, 0.2], &[vocab as i64]).expect("p_draft");
+
+        // u ≈ 0 (next_u64 = 0) forces acceptance for any positive p_accept.
+        let mut rng = ScriptedRng::new(&[0]);
+        let cfg = stochastic_cfg();
+        let (accepted, out) = accept_with_residual(&p_target, &p_draft, 3, &cfg, &mut rng)
+            .expect("accept_with_residual");
+        assert!(accepted, "ratio >= 1 with u → 0 must accept");
+        assert_eq!(out, 3);
+    }
+
+    #[test]
+    fn reject_then_residual_sample() {
+        // Contrived: draft_id = 0 has p_t=0.05, p_d=0.5 ⇒ ratio = 0.1.
+        // u ≈ 1 forces rejection. Residual support = positions where
+        // p_target > p_draft: indices {1, 2, 3}.
+        let vocab = 4;
+        let p_target =
+            MxArray::from_float32(&[0.05f32, 0.40, 0.30, 0.25], &[vocab as i64]).expect("p_target");
+        let p_draft =
+            MxArray::from_float32(&[0.50f32, 0.20, 0.15, 0.15], &[vocab as i64]).expect("p_draft");
+
+        // u ≈ 1 - ε ⇒ reject whenever p_accept < 1. Run multiple trials to
+        // verify the sample always lands in the residual support, since
+        // MLX's categorical uses its own RNG and we can't pin it.
+        let mut rejections = 0;
+        let cfg = stochastic_cfg();
+        for _ in 0..16 {
+            let mut rng = ScriptedRng::new(&[u64::MAX]);
+            let (accepted, out) = accept_with_residual(&p_target, &p_draft, 0, &cfg, &mut rng)
+                .expect("accept_with_residual");
+            assert!(!accepted, "ratio = 0.1 with u → 1 must reject");
+            assert_ne!(
+                out, 0,
+                "rejected sample must NOT be the draft token (residual is 0 there)"
+            );
+            // For each i, residual support requires p_target[i] > p_draft[i].
+            // Positions where p_target <= p_draft: index 0.
+            // So out ∈ {1, 2, 3}.
+            assert!(
+                (1..=3).contains(&out),
+                "sample must land in residual support {{1,2,3}}, got {}",
+                out
+            );
+            rejections += 1;
+        }
+        assert_eq!(rejections, 16);
+    }
+
+    #[test]
+    fn residual_zero_sum_falls_back_to_argmax() {
+        // p_target == p_draft element-wise ⇒ residual is all zeros.
+        // Force rejection (u → 1, p_accept < 1) by picking a draft_id where
+        // p_t = p_d > 0 but ratio is exactly 1.0 — at u = 1 - ε and
+        // p_accept = 1.0, `u <= p_accept` is true ⇒ accepts. So we need a
+        // draft_id where the ratio is strictly less than 1.0.
+        //
+        // Trick: make p_target == p_draft but choose draft_id with p_d > 0.
+        // ratio = 1.0 ⇒ always accept. That's the wrong path for this
+        // test. Instead bake the rejection by giving p_target slightly less
+        // mass at draft_id (so ratio < 1) while keeping the residual
+        // exactly zero everywhere. The only way both holds is if the
+        // difference is *negative* at draft_id and zero everywhere else —
+        // i.e. p_target[draft_id] < p_draft[draft_id] and p_target == p_draft
+        // elsewhere. Then residual = clip(p_t - p_d, min=0) is all zero
+        // (the only nonzero diff is negative at draft_id, clipped away).
+        //
+        // argmax(p_target) ≠ draft_id is the contract requirement.
+        let vocab = 4;
+        // p_target: [0.40, 0.30, 0.20, 0.10] — argmax at 0.
+        // p_draft:  [0.40, 0.30, 0.20, 0.20] — only differs at index 3.
+        // ratio at draft_id=3: 0.10 / 0.20 = 0.5 ⇒ u → 1 rejects.
+        // diff = [0, 0, 0, -0.10]; clip(min=0) = [0, 0, 0, 0]; sum = 0.
+        let p_target =
+            MxArray::from_float32(&[0.40f32, 0.30, 0.20, 0.10], &[vocab as i64]).expect("p_target");
+        let p_draft =
+            MxArray::from_float32(&[0.40f32, 0.30, 0.20, 0.20], &[vocab as i64]).expect("p_draft");
+        let draft_id = 3i32;
+
+        let mut rng = ScriptedRng::new(&[u64::MAX]);
+        let cfg = stochastic_cfg();
+        let (accepted, out) = accept_with_residual(&p_target, &p_draft, draft_id, &cfg, &mut rng)
+            .expect("accept_with_residual");
+        assert!(!accepted, "ratio = 0.5 with u → 1 must reject");
+        assert_eq!(
+            out, 0,
+            "residual sum = 0 must fall back to argmax(p_target) = 0"
+        );
+    }
+
+    #[test]
+    fn rejects_when_target_zero_at_draft_id() {
+        // Defense in depth: p_d > 0, p_t = 0 ⇒ p_accept = 0 ⇒ reject and
+        // sample from residual which excludes draft_id (p_t=0 there).
+        // Distinct from t0_collapse_argmax_mismatch_rejects because the
+        // distributions are not one-hot — this exercises the dense path
+        // and confirms StdRng (not just the scripted one) works end-to-end.
+        let vocab = 4;
+        let p_target =
+            MxArray::from_float32(&[0.0f32, 0.5, 0.3, 0.2], &[vocab as i64]).expect("p_target");
+        let p_draft =
+            MxArray::from_float32(&[0.4f32, 0.2, 0.2, 0.2], &[vocab as i64]).expect("p_draft");
+
+        let mut rng = StdRng::seed_from_u64(0xC0FFEE);
+        let cfg = stochastic_cfg();
+        let (accepted, out) = accept_with_residual(&p_target, &p_draft, 0, &cfg, &mut rng)
+            .expect("accept_with_residual");
+        assert!(!accepted, "p_t = 0 must reject");
+        assert_ne!(out, 0, "residual excludes draft_id where p_t = 0");
+        assert!(
+            (1..=3).contains(&out),
+            "out must be in residual support, got {}",
+            out
+        );
+    }
+
+    #[test]
+    fn rejects_when_target_zero_at_draft_id_with_u_zero() {
+        // Regression for the `u <= p_accept` → `u <` fix. `ScriptedRng::new(&[0])`
+        // pins `u = 0.0` exactly (rand's StandardUniform for f64 takes the top
+        // 53 bits of next_u64, so `next_u64 = 0` ⇒ `u = 0.0`). With
+        // `p_target[draft_id] = 0` and `p_draft[draft_id] > 0`, p_accept = 0.0.
+        // Pre-fix, `0.0 <= 0.0` accepted a token of zero target mass, breaking
+        // exactness. Post-fix, `0.0 < 0.0` is false, so we must reject and
+        // resample from the residual (which excludes draft_id).
+        let vocab = 3;
+        let p_target =
+            MxArray::from_float32(&[0.0f32, 0.5, 0.5], &[vocab as i64]).expect("p_target");
+        let p_draft = MxArray::from_float32(&[1.0f32, 0.0, 0.0], &[vocab as i64]).expect("p_draft");
+
+        let mut rng = ScriptedRng::new(&[0]);
+        let cfg = stochastic_cfg();
+        let (accepted, out) = accept_with_residual(&p_target, &p_draft, 0, &cfg, &mut rng)
+            .expect("accept_with_residual");
+        assert!(
+            !accepted,
+            "p_accept = 0 with u = 0 must reject (strict `<` semantics)"
+        );
+        assert_ne!(
+            out, 0,
+            "rejected sample must NOT land on the zero-mass draft token"
+        );
+        assert!(
+            out == 1 || out == 2,
+            "out must lie in residual support {{1, 2}}, got {}",
+            out
+        );
+    }
+
+    /// W4 Bug #3 regression: T=0 must collapse to argmax-compare. The
+    /// stochastic Leviathan-Chen path would consume MLX's global RNG
+    /// (and the supplied `rng`) and emit non-argmax tokens, breaking
+    /// AR/MTP parity. Compare with the AR T=0 contract in
+    /// `sample_compiled` (temperature → argmax via compiled C++).
+    #[test]
+    fn accepts_argmax_at_t_zero() {
+        // p_target argmax = 1, draft_id = 1 ⇒ accept.
+        let vocab = 3;
+        let p_target =
+            MxArray::from_float32(&[0.1f32, 0.7, 0.2], &[vocab as i64]).expect("p_target");
+        let p_draft = MxArray::from_float32(&[0.4f32, 0.3, 0.3], &[vocab as i64]).expect("p_draft");
+        // Scripted RNG with no entries — proves T=0 path consumes ZERO
+        // RNG draws (would panic on exhausted queue if it tried).
+        let mut rng = ScriptedRng::new(&[]);
+        let cfg = greedy_cfg();
+        let (accepted, out) = accept_with_residual(&p_target, &p_draft, 1, &cfg, &mut rng)
+            .expect("accept_with_residual");
+        assert!(accepted, "T=0: argmax(p_target) == draft_id must accept");
+        assert_eq!(out, 1);
+    }
+
+    #[test]
+    fn rejects_non_argmax_at_t_zero_emits_argmax() {
+        // p_target argmax = 1, draft_id = 0 ⇒ reject, emit 1.
+        let vocab = 3;
+        let p_target =
+            MxArray::from_float32(&[0.1f32, 0.7, 0.2], &[vocab as i64]).expect("p_target");
+        let p_draft = MxArray::from_float32(&[0.4f32, 0.3, 0.3], &[vocab as i64]).expect("p_draft");
+        // Empty queue verifies the T=0 path bypasses the stochastic
+        // coin flip entirely.
+        let mut rng = ScriptedRng::new(&[]);
+        let cfg = greedy_cfg();
+        let (accepted, out) = accept_with_residual(&p_target, &p_draft, 0, &cfg, &mut rng)
+            .expect("accept_with_residual");
+        assert!(!accepted, "T=0: argmax(p_target) != draft_id must reject");
+        assert_eq!(out, 1, "T=0 reject must emit argmax(p_target)");
+    }
+
+    fn dist_vec(arr: &MxArray) -> Vec<f32> {
+        arr.astype(DType::Float32)
+            .expect("astype f32")
+            .to_float32()
+            .expect("to_float32")
+            .to_vec()
+    }
+
+    /// FINDING 1 regression: `sampling_distribution` (the legacy-accept
+    /// proposal/target builder) must NOT error at temperature == 0 — the prior
+    /// `apply_sampling` rebuild did, turning a supported greedy MTP config into
+    /// a hard error. At T=0 it returns the one-hot argmax distribution.
+    #[test]
+    fn sampling_distribution_t_zero_is_one_hot_argmax_no_error() {
+        let logits = MxArray::from_float32(&[0.1f32, 2.0, 0.5, -1.0], &[4]).expect("logits");
+        let dist = sampling_distribution(&logits, Some(greedy_cfg()))
+            .expect("sampling_distribution must not error at T=0");
+        let v = dist_vec(&dist);
+        // argmax index = 1.
+        assert_close(v[0], 0.0, 1e-6);
+        assert_close(v[1], 1.0, 1e-6);
+        assert_close(v[2], 0.0, 1e-6);
+        assert_close(v[3], 0.0, 1e-6);
+    }
+
+    /// T6 regression: the C++ samplers must treat the whole `[0, 1e-6]`
+    /// temperature band as greedy (argmax), matching the Rust accept gates
+    /// (`temperature <= 1e-6`). At a tiny but NON-zero `T = 1e-7`, `sample`
+    /// must return the argmax DETERMINISTICALLY across many draws.
+    ///
+    /// The logit gaps are sized to the temperature on purpose: with
+    /// `inv_temp = 1e7`, gaps of `1e-7`/`2e-7` scale to O(1) (`[0, 2, 1, …]`),
+    /// so the OLD stochastic path (`categorical(logits·1e7)`) would draw the
+    /// argmax only ~66% of the time and would pick a non-argmax token within a
+    /// handful of the 32 draws. The NEW argmax band returns index 1 every time.
+    /// (A larger gap would underflow `softmax(·1e7)` to one-hot and the test
+    /// would no longer distinguish stochastic-vs-greedy — i.e. be a tautology.)
+    #[test]
+    fn sample_tiny_temperature_is_deterministic_argmax() {
+        // argmax is index 1 (2e-7); index 2 (1e-7) is the temperature-scaled
+        // runner-up that a stochastic draw would frequently select.
+        let logits =
+            MxArray::from_float32(&[0.0f32, 2e-7, 1e-7, -1.0, -3.0], &[5]).expect("logits");
+        let cfg = SamplingConfig {
+            temperature: Some(1e-7),
+            top_k: Some(0),
+            top_p: Some(1.0),
+            min_p: Some(0.0),
+        };
+        for draw in 0..32 {
+            let tok = sample(&logits, Some(cfg)).expect("sample tiny-T");
+            tok.eval();
+            let id = tok.item_at_int32(0).expect("token id");
+            assert_eq!(
+                id, 1,
+                "tiny-T sample must be deterministic argmax (draw {draw} returned {id})"
+            );
+        }
+    }
+
+    /// T6 regression: `sampling_distribution` at a tiny but non-zero
+    /// `T = 1e-7` must return the one-hot argmax (the greedy band must extend
+    /// past exactly 0.0), so AR and MTP stay byte-consistent at tiny T.
+    ///
+    /// The gaps are temperature-scaled (`inv_temp = 1e7`) so this is NOT a
+    /// tautology: under the OLD `== 0.0f` guard this path returned
+    /// `softmax(logits·1e7) = softmax([0, 2, 1, …]) ≈ [0.09, 0.665, 0.245, …]`
+    /// — clearly NOT one-hot. The NEW `<= 1e-6` band returns an exact one-hot
+    /// at the argmax, which the assertions below pin.
+    #[test]
+    fn sampling_distribution_tiny_temperature_is_one_hot_argmax() {
+        let logits =
+            MxArray::from_float32(&[0.0f32, 2e-7, 1e-7, -1.0, -3.0], &[5]).expect("logits");
+        let cfg = SamplingConfig {
+            temperature: Some(1e-7),
+            top_k: Some(0),
+            top_p: Some(1.0),
+            min_p: Some(0.0),
+        };
+        let v = dist_vec(&sampling_distribution(&logits, Some(cfg)).expect("dist tiny-T"));
+        // One-hot at argmax index 1 — under the old softmax path v[1] would be
+        // ~0.665 and v[0]/v[2] non-zero, so these assertions genuinely fail
+        // unless the greedy band extends past exactly 0.0.
+        assert_close(v[0], 0.0, 1e-6);
+        assert_close(v[1], 1.0, 1e-6);
+        assert_close(v[2], 0.0, 1e-6);
+        assert_close(v[3], 0.0, 1e-6);
+        assert_close(v[4], 0.0, 1e-6);
+    }
+
+    /// FINDING 2 (no-filter): with `top_k==0`, `top_p==1`, `min_p==0` and a
+    /// non-unit temperature, the compiled draw is `categorical(logits/temp)` =
+    /// `softmax(logits/temp)`. `sampling_distribution` must return exactly that
+    /// distribution so the legacy proposal/target density matches the draw.
+    /// This is the COMMON case (default `top_k==0`).
+    #[test]
+    fn sampling_distribution_no_filter_matches_softmax_over_temperature() {
+        let logits = MxArray::from_float32(&[1.0f32, 2.0, 3.0], &[3]).expect("logits");
+        let cfg = SamplingConfig {
+            temperature: Some(0.5),
+            top_k: Some(0),
+            top_p: Some(1.0),
+            min_p: Some(0.0),
+        };
+        let dist = dist_vec(&sampling_distribution(&logits, Some(cfg)).expect("dist"));
+
+        // Reference: softmax([1,2,3] / 0.5) = softmax([2,4,6]).
+        let scaled = [2.0f64, 4.0, 6.0];
+        let max = 6.0f64;
+        let exps: Vec<f64> = scaled.iter().map(|x| (x - max).exp()).collect();
+        let sum: f64 = exps.iter().sum();
+        for i in 0..3 {
+            assert_close(dist[i], (exps[i] / sum) as f32, 1e-5);
+        }
+    }
+
+    /// FINDING 2 (filtered): for a sparse-supported config, the per-token
+    /// proposal density built by `sampling_distribution` must agree with the
+    /// `sparse_distributions_from_logits` probabilities the draft path already
+    /// uses — they describe the SAME compiled draw, so accept/reject is
+    /// consistent whether the cycle takes the legacy or sparse branch.
+    #[test]
+    fn sampling_distribution_agrees_with_sparse_helper_on_supported_config() {
+        let logits = MxArray::from_float32(&[3.0f32, 2.0, 1.0, 0.0, -1.0], &[5]).expect("logits");
+        let cfg = SamplingConfig {
+            temperature: Some(0.7),
+            top_k: Some(3),
+            top_p: Some(1.0),
+            min_p: Some(0.0),
+        };
+        // Dense distribution from the compiled sampler path.
+        let dense = dist_vec(&sampling_distribution(&logits, Some(cfg)).expect("dense dist"));
+
+        // Sparse helper rows for the SAME config + parity mode.
+        let logits_row = logits.reshape(&[1, 5]).expect("reshape");
+        let sparse =
+            sparse_distributions_from_logits_with_mode(&logits_row, &cfg, sampler_parity_mode())
+                .expect("sparse dist")
+                .expect("supported");
+        let row = sparse.row(0).expect("row0");
+
+        // Top-3 support is {0,1,2}; tokens 3 and 4 must be filtered out (0).
+        assert_close(dense[3], 0.0, 1e-6);
+        assert_close(dense[4], 0.0, 1e-6);
+        for (tok, &d) in dense.iter().take(3).enumerate() {
+            assert_close(d, row.probability(tok as i32) as f32, 1e-5);
+        }
+    }
+
+    /// FINDING A regression (predicate): `is_greedy_temperature` must agree
+    /// with the C++ greedy guard `(f32)temperature <= 1e-6f` BIT-FOR-BIT. The
+    /// boundary value `1.00000001e-6` is the exact case Codex flagged: as a
+    /// real f64 it is `> 1e-6` (stochastic under the OLD f64 gate), but its
+    /// nearest f32 rounds to `1e-6f`, so C++ takes its greedy branch. Casting
+    /// to f32 before the comparison reproduces that — this test locks the two
+    /// precisions together so the draw-vs-accept distribution can't desync.
+    #[test]
+    fn is_greedy_temperature_matches_cpp_f32_boundary() {
+        // 1.00000001e-6 is > 1e-6 as a real f64, but rounds to 1e-6f → greedy.
+        assert!(is_greedy_temperature(1.00000001e-6));
+        assert!(is_greedy_temperature(0.0));
+        assert!(is_greedy_temperature(1e-7));
+        assert!(!is_greedy_temperature(1e-3));
+        assert!(!is_greedy_temperature(1.0));
+    }
+
+    /// FINDING A regression (end-to-end): at the flagged boundary
+    /// `T = 1.00000001e-6`, the C++ `sampling_distribution` must take its
+    /// GREEDY branch — i.e. return the exact one-hot at the argmax — matching
+    /// `is_greedy_temperature(1.00000001e-6) == true`. This proves the f32 cast
+    /// in the predicate reproduces the actual C++ sampler decision (not just an
+    /// f32 reinterpretation in Rust), so the Rust accept gates and the C++ draw
+    /// agree across the whole `(1e-6_f64, 1e-6f-as-real]` window.
+    #[test]
+    fn sampling_distribution_at_f32_boundary_is_greedy_one_hot() {
+        // Clear unique max at index 1.
+        let logits = MxArray::from_float32(&[0.0f32, 3.0, 1.0, -1.0], &[4]).expect("logits");
+        let cfg = SamplingConfig {
+            temperature: Some(1.00000001e-6),
+            top_k: Some(0),
+            top_p: Some(1.0),
+            min_p: Some(0.0),
+        };
+        // Predicate says greedy; the compiled sampler must agree (one-hot).
+        assert!(is_greedy_temperature(1.00000001e-6));
+        let v = dist_vec(&sampling_distribution(&logits, Some(cfg)).expect("dist boundary-T"));
+        assert_close(v[0], 0.0, 1e-6);
+        assert_close(v[1], 1.0, 1e-6);
+        assert_close(v[2], 0.0, 1e-6);
+        assert_close(v[3], 0.0, 1e-6);
+
+        // Contrast: at T = 1.0 (clearly stochastic) the same logits spread
+        // mass — the argmax does NOT carry probability 1.0. This is
+        // deterministic (it asserts on the DISTRIBUTION, not a draw).
+        let stochastic_cfg = SamplingConfig {
+            temperature: Some(1.0),
+            top_k: Some(0),
+            top_p: Some(1.0),
+            min_p: Some(0.0),
+        };
+        let s = dist_vec(&sampling_distribution(&logits, Some(stochastic_cfg)).expect("dist T=1"));
+        assert!(
+            s[1] < 0.999,
+            "T=1 distribution must not be one-hot at argmax (got {})",
+            s[1]
+        );
     }
 }
