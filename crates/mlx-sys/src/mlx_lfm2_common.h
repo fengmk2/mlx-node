@@ -3,10 +3,9 @@
 // =============================================================================
 // LFM2.5 MoE compiled forward path — shared definitions.
 //
-// Phase 0 (inert scaffold): this header declares the config POD that the
-// compiled graph will consume and pulls in the shared MLX includes. The actual
-// graph (pure-fns, weight lookups, compiled decode closure) lands in later
-// phases, modeled on `mlx_qwen35_common.h`.
+// Declares the config POD the compiled graph consumes and pulls in the shared
+// MLX includes. The graph (pure-fns, weight lookups, compiled decode closure)
+// is defined alongside, modeled on `mlx_qwen35_common.h`.
 //
 // The process-global weight registry (`g_weights()`, `get_weight()`,
 // `linear_proj()`, `g_active_model_id()`) is process-wide and model-agnostic;
@@ -23,7 +22,6 @@ namespace lfm2_common {
 
 // Mirrors the fields of Rust `Lfm2Config` that the compiled forward needs.
 // POD only (no `mlx::core::array` members — `array` has no default ctor).
-// Phase 0: declared for the FFI init signature; populated in Phase 1.
 struct Lfm2MoeConfig {
   int num_layers = 0;
   int hidden_size = 0;
@@ -50,8 +48,11 @@ struct Lfm2MoeConfig {
   // (conv.in_proj.bias, conv.conv.bias, conv.out_proj.bias). Default false
   // (bias-free checkpoint).
   bool conv_bias = false;
-  // Phase 3b quant fields (default 0 = bf16). Declared NOW so the config ABI is
-  // stable across 3a->3b. quant_mode: 0=bf16, 1=mxfp8, 2=mxfp4, 3=nvfp4.
+  // Unused (default 0): quant dispatch keys off `.scales` presence + the
+  // per-prefix quant-info registry (`lookup_quant_info`, populated Rust-side via
+  // `mlx_store_quant_info`), since these whole-model scalars cannot express mixed
+  // recipes (affine router + fp experts). Kept for config-ABI stability; do NOT
+  // re-wire them.
   int quant_mode = 0;
   int bits = 0;
   int group_size = 0;
@@ -171,7 +172,7 @@ inline Lfm2AttnResult lfm2_attn_pure_fn(
 // Always uses the fixed-shape padded KV cache + static additive mask
 // (positions <= offset -> 0, else -inf), the compile-safe path — so this is the
 // dynamic_kv=false branch with an array offset. The scalar fn is kept unchanged
-// so the Phase-2a operator probes stay green; the decode loop calls THIS one.
+// for the operator probes; the decode loop calls THIS one.
 // =====================================================================
 inline Lfm2AttnResult lfm2_attn_pure_fn_arr(
     const array& x,
@@ -226,7 +227,7 @@ inline Lfm2AttnResult lfm2_attn_pure_fn_arr(
 
 // =====================================================================
 // PAGED-cache variant of `lfm2_attn_pure_fn_arr` for the COMPILED-PAGED
-// decode graph (Phase P1).
+// decode graph.
 //
 // Identical lfm2 attention MATH up through RoPE to the flat array-offset fn
 // above (GQA, per-head Q/K RMSNorm, NO q-gate/bias, neox RoPE over the full
@@ -316,7 +317,7 @@ inline Lfm2AttnResult lfm2_attn_pure_fn_arr_paged(
   auto q_pa = reshape(transpose(queries, {0, 2, 1, 3}),
                       {num_tokens, cfg.num_heads, cfg.head_dim});
 
-  // Phase P1 hard-coded contract (matches qwen attn_for_compile_paged):
+  // Hard-coded contract (matches qwen attn_for_compile_paged):
   // bf16 cache, x_pack=8, sliding=0.
   constexpr int X_PACK = 8;
   constexpr int SLIDING_WINDOW = 0;
@@ -386,7 +387,7 @@ inline array lfm2_dense_mlp(const array& x, int layer_idx) {
 //   indices: [ne, k]       rhs (expert) indices
 // Returns [ne, k, out]. The bf16 branch swaps the stored [E, out, in] weight to
 // [E, in, out] for gather_mm (matching qwen35 `switch_linear_forward`). The quant
-// branch (cfg.quant_mode != 0) is declared for Phase 3b; 3a only exercises bf16.
+// branch dispatches per-prefix off the shared quant-info registry (Rust-populated).
 // =====================================================================
 inline array lfm2_switch_linear(
     const array& x,
@@ -394,29 +395,53 @@ inline array lfm2_switch_linear(
     const array& indices,
     const Lfm2MoeConfig& cfg) {
   using namespace qwen35_common;
-  if (cfg.quant_mode != 0) {
-    // Quantized experts (Phase 3b). gate/up/down ship stacked .scales (+ optional
-    // .biases for affine recipes). mode string per cfg.quant_mode.
+  // Quantized experts: dispatch per-prefix off the SHARED quant-info registry
+  // (populated Rust-side via `mlx_store_quant_info`), identical in spirit to
+  // qwen35 `switch_linear_fwd`. The presence of a `.scales` companion is the
+  // authoritative quant marker — NOT `cfg.quant_mode` (a single whole-model
+  // scalar cannot express mixed affine-router + fp-expert recipes). Registry
+  // hit → use the (mode, bits, group_size) tuple Rust resolved; miss → legacy
+  // companion heuristic (no biases → mxfp8 gs=32/bits=8; biases → affine,
+  // shape-inferred bits). After Rust registration the miss path is never taken
+  // for a registered checkpoint (every `.scales` prefix gets an entry).
+  if (has_weight(prefix + ".scales")) {
     auto w = get_weight(prefix + ".weight");
     auto scales = get_weight(prefix + ".scales");
     std::optional<array> biases = std::nullopt;
-    if (g_weights().count(prefix + ".biases") > 0) {
+    if (has_weight(prefix + ".biases")) {
       biases = get_weight(prefix + ".biases");
     }
-    const char* mode = "mxfp8";
-    if (cfg.quant_mode == 2) {
-      mode = "mxfp4";
-    } else if (cfg.quant_mode == 3) {
-      mode = "nvfp4";
+
+    int gs;
+    int bits;
+    std::string mode;
+    if (auto info = lookup_quant_info(prefix)) {
+      gs = info->group_size;
+      bits = info->bits;
+      mode = info->mode;
+    } else {
+      // Legacy heuristic. Shape-based bit inference handles mixed-bit affine
+      // recipes; no-biases means MXFP8 by convention.
+      int w_cols = w.shape(-1);
+      int s_cols = scales.shape(-1);
+      gs = 64;
+      int original_cols = s_cols * gs;
+      bits = (w_cols * 32) / original_cols;
+      mode = biases.has_value() ? "affine" : "mxfp8";
+      if (!biases.has_value()) {
+        gs = 32;
+        bits = 8;
+      }
     }
+
     return mlx::core::gather_qmm(
         x, w, scales, biases,
         std::nullopt,  // lhs_indices (not used)
         indices,       // rhs_indices (expert indices)
         true,          // transpose
-        std::optional<int>(cfg.group_size),
-        std::optional<int>(cfg.bits),
-        std::string(mode),
+        std::optional<int>(gs),
+        std::optional<int>(bits),
+        mode,
         /*sorted=*/false);
   }
   // bf16/f16: plain gather_mm over the swapped weight ([E, in, out]).

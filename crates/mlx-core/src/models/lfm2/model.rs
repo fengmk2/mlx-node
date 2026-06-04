@@ -44,6 +44,16 @@ fn last_token_slice_enabled() -> bool {
     *CACHED.get_or_init(|| std::env::var_os("MLX_LFM2_DISABLE_LAST_TOKEN_SLICE").is_none())
 }
 
+/// Escape hatch for the quantized compiled decode path (flat + paged). Returns
+/// `true` (enabled) unless `MLX_LFM2_DISABLE_QUANT_COMPILED` is set, which forces
+/// quantized checkpoints back onto the eager decode path (the A/B baseline and a
+/// production escape hatch). Read once via `OnceLock` (process-global, NOT
+/// per-request) matching the `last_token_slice_enabled` house style.
+pub(crate) fn quant_compiled_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var_os("MLX_LFM2_DISABLE_QUANT_COMPILED").is_none())
+}
+
 /// Internal model state owned exclusively by the dedicated model thread.
 ///
 /// No `Arc<RwLock<>>` — the model thread has sole ownership.
@@ -99,6 +109,23 @@ pub(crate) struct Lfm2Inner {
     /// subset. `false` until weights register (defaults safe: a model that
     /// somehow reached decode unregistered falls back to eager paged).
     pub(crate) all_float_weights_bf16: bool,
+    /// True iff this checkpoint is quantized (any `.scales`-suffixed tensor).
+    /// Computed once at load time (`persistence.rs`: `params.keys().any(.scales)`)
+    /// and set unconditionally after construction, so it is authoritative for ALL
+    /// checkpoints (independent of whether the compiled path registered).
+    /// `paged_compiled_decode_setup` consults it to switch the compiled-paged
+    /// bf16-only gate over to the `non_quant_floats_bf16` invariant — quantized
+    /// `.weight` tensors are uint32-packed, not bf16, so the all-float scan is
+    /// meaningless for them.
+    pub(crate) is_quantized: bool,
+    /// True iff every NON-quantized floating weight is BFloat16 — the
+    /// quantized-checkpoint analogue of `all_float_weights_bf16`. The packed
+    /// `.weight` tensors are uint32 (skipped); their float `.scales`/`.biases`
+    /// companions plus the unquantized dense floats (norms, conv biases, untied
+    /// lm_head, the dense bf16 embedding) must all be bf16 so the hidden state
+    /// feeding the bf16-only `paged_kv_write`/`paged_attention` stays bf16.
+    /// `false` until a quantized checkpoint registers; only meaningful then.
+    pub(crate) non_quant_floats_bf16: bool,
 }
 
 /// Commands dispatched from NAPI methods to the dedicated model thread.
@@ -321,7 +348,7 @@ impl Lfm2Inner {
         // Initialize caches
         let caches = init_caches(&config);
 
-        // Block-paged KV adapter — default ON since 2026-04-28.
+        // Block-paged KV adapter — default ON.
         //
         // Chat dispatch is wired through this adapter at every chat-entry
         // site (see the `self.paged_adapter.is_some()` early-returns in
@@ -434,6 +461,12 @@ impl Lfm2Inner {
             // registered weights (set in `persistence.rs` alongside the C++
             // weight registration). A non-match keeps compiled-PAGED OFF.
             all_float_weights_bf16: false,
+            // Safe defaults: `Lfm2Inner::new` only sees `config` (no params/scales),
+            // so both are set post-construction in `persistence.rs` — `is_quantized`
+            // unconditionally, `non_quant_floats_bf16` only when a quantized
+            // checkpoint registers. Defaults keep the quantized compiled path OFF.
+            is_quantized: false,
+            non_quant_floats_bf16: false,
         })
     }
 
@@ -447,13 +480,15 @@ impl Lfm2Inner {
     /// atom) equals this model's [`Lfm2Inner::model_id`].
     ///
     /// The id is published ONLY by `register_weights_with_cpp` (load time), which
-    /// P4 invokes for ANY non-quantized bf16/f16 checkpoint — DENSE or
-    /// sparse-MoE, FLAT or PAGED (Phase 3c lifted the MoE exclusion; P4 lifted
-    /// the paged exclusion). The single registered weight map + `model_id` serve
-    /// BOTH the flat (`lfm2_decode_fn`) and paged (`lfm2_decode_fn_paged`)
-    /// compiled graphs; the per-step dispatcher picks the right one. The gate is
-    /// structurally false for quantized checkpoints (those never register), and
-    /// false until an lfm2 model has registered its weights into the shared map.
+    /// is invoked for bf16/f16 checkpoints — DENSE or sparse-MoE, FLAT or PAGED —
+    /// AND for QUANTIZED checkpoints (authoritative per-projection quant-info is
+    /// published, so `linear_proj` / `lfm2_switch_linear` dispatch correctly),
+    /// gated by the `MLX_LFM2_DISABLE_QUANT_COMPILED` hatch + a dense (non-packed)
+    /// input embedding; see `should_register_compiled`. The single registered
+    /// weight map + `model_id` serve BOTH the flat (`lfm2_decode_fn`) and paged
+    /// (`lfm2_decode_fn_paged`) compiled graphs; the per-step dispatcher picks the
+    /// right one. The gate is false until an lfm2 model has registered its weights
+    /// into the shared map (and false for an instance evicted by a later load).
     pub(crate) fn compiled_path_active(&self) -> bool {
         let active = unsafe { mlx_sys::mlx_lfm2_get_model_id() };
         active != 0 && active == self.model_id
@@ -725,8 +760,7 @@ impl Lfm2Inner {
 
         // Block-paged dispatch: when the adapter is configured, route
         // through the parallel `chat_sync_core_paged` path. The flat path
-        // below stays untouched so off-by-default behavior is byte-
-        // identical to before this commit.
+        // below stays untouched so the off-by-default behavior is byte-identical.
         if self.paged_adapter.is_some() {
             return self.chat_sync_core_paged(
                 tokens,
@@ -1217,7 +1251,7 @@ impl Lfm2Inner {
     ///    warm `continue_turn`.
     /// 6. Session end / explicit reset / error: `release_request`.
     ///
-    /// Limitations (P1; documented in the doc comment):
+    /// Limitations:
     /// - Conv-layer prefix reuse is NOT carried across paged turns; each
     ///   paged turn reprefills conv state from the start of the prompt.
     /// - Pure-cache prompt (every prompt token already in the paged pool)
@@ -1405,12 +1439,19 @@ impl Lfm2Inner {
         let last_token_in_cache = false;
         self.save_cache_state(true, &tokens, &generated_tokens, last_token_in_cache);
 
-        // Performance metrics
+        // Performance metrics.
+        // Paged prefill reprocesses the FULL prompt through conv layers
+        // (run_paged_prefill_chunk Pass 1); only the attention suffix skips the
+        // cached prefix. ttft measures full-prompt work, so the throughput
+        // numerator must be the full prompt, not tokens.len()-cached_prefix_len.
+        // (If a future LFM2 paged variant carries conv state across turns and
+        // truly forwards only the delta during prefill, revert this to the
+        // delta count.)
         let performance = if report_perf {
             compute_performance_metrics(
                 generation_start,
                 first_token_instant,
-                tokens.len() - cached_prefix_len as usize,
+                tokens.len(),
                 generated_tokens.len(),
             )
         } else {
@@ -1449,16 +1490,16 @@ impl Lfm2Inner {
     /// MUST be called AFTER prefill (the adapter pools + conv caches are read
     /// here) and BEFORE the decode loop.
     fn paged_compiled_decode_setup(&mut self) -> Result<Lfm2PagedCompiledState> {
-        // ===== Compiled C++ PAGED decode-path dispatch (P4) =====
+        // ===== Compiled C++ PAGED decode-path dispatch =====
         //
         // Mirrors the FLAT path's lock contract (`chat_sync_core`) and qwen3.5's
         // paged `cpp_session_ready` gate. The compiled-PAGED decode runs only
         // when ALL of:
         //   1. `compiled_path_active()` — weights registered for our model_id.
-        //      (The P4-widened registration gate publishes the id for ANY
-        //      non-quantized bf16/f16 checkpoint, FLAT or PAGED, so this is the
-        //      bf16/f16 + non-quant condition; a quantized checkpoint never
-        //      registers and is structurally `false` here.)
+        //      (The registration gate publishes the id for ANY non-quantized
+        //      bf16/f16 checkpoint, FLAT or PAGED, so this is the bf16/f16 +
+        //      non-quant condition; a quantized checkpoint never registers and is
+        //      structurally `false` here.)
         //   1b. The model weights are bf16. The paged adapter's `LayerKVPool` is
         //      always BFloat16 and the C++ paged graph hard-codes `KvDtype::Bf16`
         //      (its static attn mask + pool/scale dtype probes are bf16/f32), so
@@ -1489,28 +1530,41 @@ impl Lfm2Inner {
         // turn (see `chat_sync_core_paged`'s per-turn `self.caches =
         // init_caches(..)`), so the compiled-paged graph threads conv state
         // WITHIN a turn only (in the C++ paged globals) and there is no
-        // post-loop export step (plan risk #5).
+        // post-loop export step.
         use crate::models::qwen3_5::model::CPP_PAGED_REQUIRED_BLOCK_SIZE;
         let mut use_cpp_pre = self.compiled_path_active();
-        // bf16-only gate (1b): the compiled-PAGED graph + paged KV pools are
-        // bf16-only (KvDtype::Bf16, bf16 static mask). The gate MUST match what
-        // the graph consumes, not a hand-picked subset: `lfm2_decode_fn_paged`
-        // reads operator/FFN/final norms, q/k norms, attention out_proj, conv
-        // weights/biases, dense-MLP or MoE router/expert weights, and the
-        // (untied) lm_head in addition to q/k/v — any non-bf16 float among them
-        // makes the hidden state (hence q/new_k/new_v) non-bf16 before the
-        // bf16-only `paged_kv_write`/`paged_attention` (step-0 trip at best, an
-        // out-of-contract forward at worst). So we gate on the authoritative
-        // load-time `all_float_weights_bf16` flag (computed once over the whole
-        // registered param map). Non-bf16 → pure-Rust eager paged, with no wasted
-        // seed and no lying engagement signal. `*.expert_bias` (intentional F32
-        // on MoE) is the one allowed exception, handled in the load-time scan.
-        // Quantized checkpoints are already excluded by `compiled_path_active()`.
-        if use_cpp_pre && !self.all_float_weights_bf16 {
+        // bf16-activation gate (1b): the compiled-PAGED graph + paged KV pools are
+        // bf16-only (KvDtype::Bf16, bf16 static mask), so the hidden state feeding
+        // `paged_kv_write`/`paged_attention` must be bf16. The gate MUST match what
+        // the graph consumes, not a hand-picked subset: `lfm2_decode_fn_paged` reads
+        // operator/FFN/final norms, q/k norms, attention out_proj, conv
+        // weights/biases, dense-MLP or MoE router/expert weights, and the (untied)
+        // lm_head in addition to q/k/v.
+        //
+        //  - bf16 checkpoint: EVERY float weight must be bf16
+        //    (`all_float_weights_bf16`).
+        //  - QUANTIZED checkpoint: the packed `.weight` tensors are uint32 (NOT part
+        //    of the activation dtype); the invariant is that the NON-quantized floats
+        //    (norms, conv biases, untied lm_head, dense bf16 embedding) plus the quant
+        //    float companions are bf16 (`non_quant_floats_bf16`), AND the
+        //    `MLX_LFM2_DISABLE_QUANT_COMPILED` escape hatch is not set. Packed-quant
+        //    INPUT embeddings are already barred at registration (the C++ does a dense
+        //    `take` over the embedding), so a registered quantized checkpoint reaching
+        //    here has a usable dense embedding.
+        //
+        // `*.expert_bias` (intentional F32 on MoE) is the one allowed exception,
+        // handled in the load-time scans.
+        let activations_bf16 = if self.is_quantized {
+            quant_compiled_enabled() && self.non_quant_floats_bf16
+        } else {
+            self.all_float_weights_bf16
+        };
+        if use_cpp_pre && !activations_bf16 {
             warn!(
-                "lfm2 compiled paged decode: model has a non-bf16 float weight (embedding, norm, \
-                 projection, conv, FFN/MoE, or lm_head); the compiled-PAGED graph + paged KV pools \
-                 are bf16-only, so using the pure-Rust eager paged decode path for this request."
+                "lfm2 compiled paged decode: activation-dtype invariant unmet (a non-bf16 float \
+                 weight — embedding, norm, projection, conv, FFN/MoE, or lm_head — or quantized \
+                 compiled decode disabled); the compiled-PAGED graph + paged KV pools are \
+                 bf16-only, so using the pure-Rust eager paged decode path for this request."
             );
             use_cpp_pre = false;
         }
@@ -1769,7 +1823,7 @@ impl Lfm2Inner {
             *first_token_instant = Some(std::time::Instant::now());
         }
 
-        // ===== Compiled C++ PAGED decode-path dispatch (P4) =====
+        // ===== Compiled C++ PAGED decode-path dispatch =====
         // Acquire the locks, gate, and seed the compiled-paged session for this
         // turn. The returned state holds the RAII guards (compiled lifecycle
         // mutex, weight read lock, paged reset guard) that span the whole decode
@@ -2121,7 +2175,7 @@ impl Lfm2Inner {
                 // **Limitation**: this is approximate — for exact
                 // numerical equivalence we'd need to re-run attention
                 // here too, which defeats the purpose of the prefix
-                // cache. Marked as a P1 known-issue for follow-up.
+                // cache. Known issue for follow-up.
                 continue;
             }
             // Conv layer: forward through the operator + FFN tail.
@@ -2373,12 +2427,19 @@ impl Lfm2Inner {
             }
         }
 
-        // Performance metrics
+        // Performance metrics.
+        // Paged prefill reprocesses the FULL prompt through conv layers
+        // (run_paged_prefill_chunk Pass 1); only the attention suffix skips the
+        // cached prefix. ttft measures full-prompt work, so the throughput
+        // numerator must be the full prompt, not tokens.len()-cached_prefix_len.
+        // (If a future LFM2 paged variant carries conv state across turns and
+        // truly forwards only the delta during prefill, revert this to the
+        // delta count.)
         let performance = if report_perf {
             compute_performance_metrics(
                 generation_start,
                 first_token_instant,
-                tokens.len() - cached_prefix_len as usize,
+                tokens.len(),
                 generated_tokens.len(),
             )
         } else {
@@ -2476,7 +2537,7 @@ impl Lfm2Inner {
             *first_token_instant = Some(std::time::Instant::now());
         }
 
-        // ===== Compiled C++ PAGED decode-path dispatch (P4) =====
+        // ===== Compiled C++ PAGED decode-path dispatch =====
         // Same setup the non-streaming path uses: acquire the compiled lifecycle
         // + weight locks, gate, and seed the compiled-paged session for this
         // turn. The returned state holds the RAII guards spanning the whole
@@ -2612,8 +2673,8 @@ impl Lfm2Inner {
 
         // Block-paged dispatch: when the adapter is configured, route
         // through the parallel `chat_stream_sync_core_paged` path. The
-        // flat path below stays untouched so off-by-default behavior is
-        // byte-identical to before this commit.
+        // flat path below stays untouched so the off-by-default behavior is
+        // byte-identical.
         if self.paged_adapter.is_some() {
             return self.chat_stream_sync_core_paged(
                 tokens,
@@ -3859,8 +3920,7 @@ impl Drop for Lfm2CompiledResetGuard {
 /// loop returns early via `?`, so the next generation never seeds against stale
 /// paged pools.
 ///
-/// Armed by `chat_sync_core_paged_inner` (P4) when the compiled-paged seed
-/// succeeds.
+/// Armed by `chat_sync_core_paged_inner` when the compiled-paged seed succeeds.
 struct Lfm2PagedResetGuard;
 
 impl Drop for Lfm2PagedResetGuard {
@@ -4100,7 +4160,7 @@ fn init_lfm2_paged_compiled_session(
 /// gathers via `paged_attention`, while conv layers thread their state through
 /// the compiled graph's cache slots.
 ///
-/// Caller contract (enforced in the P4 decode loop, not here):
+/// Caller contract (enforced in the decode loop, not here):
 /// * `init_lfm2_paged_compiled_session` has been called this turn (so
 ///   `g_lfm2_paged_inited == true`).
 /// * `adapter.record_tokens(&[token_id])` has advanced the cursor (and lazily
@@ -4149,7 +4209,7 @@ fn forward_lfm2_cpp_paged(
 /// `&[Lfm2LayerCache]`, not the whole `Lfm2Inner`). Identical mapping:
 /// `FullAttention { paged_idx }` for attention layers (paged_idx counts only
 /// those, in original order) and `Conv` otherwise. Called by
-/// `init_lfm2_paged_compiled_session` (P4 decode-loop wiring).
+/// `init_lfm2_paged_compiled_session` (decode-loop wiring).
 fn compute_layer_kinds_for(config: &Lfm2Config, num_layers: usize) -> Vec<Lfm2LayerKind> {
     let mut kinds = Vec::with_capacity(num_layers);
     let mut paged_idx: u32 = 0;
