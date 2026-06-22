@@ -21,8 +21,8 @@
 use std::path::Path;
 use std::time::Instant;
 
+use mlx_core::engine::types::{ChatConfig, ChatStreamChunk};
 use mlx_core::models::lfm2::model::Lfm2Model;
-use mlx_core::models::qwen3_5::model::{ChatConfig, ChatStreamChunk};
 use mlx_core::tokenizer::ChatMessage;
 
 fn chat_config_default(max_new_tokens: i32) -> ChatConfig {
@@ -92,6 +92,7 @@ async fn lfm2_session_path_keeps_ttft_flat_across_turns() {
     struct TurnSnapshot {
         ttft_ms: f64,
         prompt_tokens: u32,
+        cached_tokens: u32,
     }
 
     // --- Turn 1: chat_session_start establishes a clean session ---
@@ -108,6 +109,7 @@ async fn lfm2_session_path_keeps_ttft_flat_across_turns() {
             .expect("turn 1 performance missing")
             .ttft_ms,
         prompt_tokens: r1.prompt_tokens,
+        cached_tokens: r1.cached_tokens,
     };
     println!(
         "turn 1 ttft={:.1}ms prompt_tokens={} num_tokens={}",
@@ -142,6 +144,7 @@ async fn lfm2_session_path_keeps_ttft_flat_across_turns() {
         snapshots.push(TurnSnapshot {
             ttft_ms: ttft,
             prompt_tokens: result.prompt_tokens,
+            cached_tokens: result.cached_tokens,
         });
 
         assert!(
@@ -178,27 +181,65 @@ async fn lfm2_session_path_keeps_ttft_flat_across_turns() {
         turn4.prompt_tokens
     );
 
-    // 2. TTFT stays flat (<=1.5x of turn 1)
-    let bound_vs_turn1 = turn1.ttft_ms * 1.5;
+    // 2. The delta path reuses the entire prior context (the live KV cache)
+    //    and freshly prefills ONLY the new turn's ChatML delta. We assert on
+    //    that token accounting rather than wall-clock TTFT: TTFT flakes on
+    //    shared CI runners (tiny warm-GPU times dominated by fixed per-turn
+    //    setup, not prefill work) and is a WEAK signal — a path that silently
+    //    rebuilt the cache each turn could still post a fast TTFT on a fast
+    //    machine. `cached_tokens` is the deterministic proof.
+
+    // 2a. cached_tokens GROWS across delta turns: each delta reuses the full,
+    //     ever-longer prior context. A regressed delta that desynced and
+    //     re-prefilled from scratch reports cached_tokens == 0 (the engine's
+    //     `is_delta && !desynced` gate), so non-zero, strictly-growing
+    //     cached_tokens is direct evidence the cache is reused, not rebuilt.
+    assert_eq!(
+        turn1.cached_tokens, 0,
+        "turn 1 cold-starts but reported cached_tokens={}",
+        turn1.cached_tokens
+    );
     assert!(
-        turn4.ttft_ms < bound_vs_turn1,
-        "delta-path TTFT regression vs turn 1: turn1={:.1}ms turn4={:.1}ms bound={:.1}ms. \
-         snapshots: {:?}",
-        turn1.ttft_ms,
-        turn4.ttft_ms,
-        bound_vs_turn1,
+        turn2.cached_tokens > 0,
+        "delta turn 2 reused nothing (cached_tokens=0) — cache was rebuilt. snapshots: {:?}",
+        snapshots
+    );
+    assert!(
+        turn3.cached_tokens > turn2.cached_tokens,
+        "delta turn 3 didn't grow its reused prefix ({} -> {}). snapshots: {:?}",
+        turn2.cached_tokens,
+        turn3.cached_tokens,
+        snapshots
+    );
+    assert!(
+        turn4.cached_tokens > turn3.cached_tokens,
+        "delta turn 4 didn't grow its reused prefix ({} -> {}). snapshots: {:?}",
+        turn3.cached_tokens,
+        turn4.cached_tokens,
         snapshots
     );
 
-    // 3. Turn 4 should be in the same flat-TTFT regime as turn 2.
-    let bound_vs_turn2 = turn2.ttft_ms * 2.0;
+    // 2b. The freshly-prefilled span (prompt_tokens - cached_tokens) stays
+    //     small and FLAT even as the context grows — it is just one new user
+    //     turn's ChatML each time, never the whole transcript. A full
+    //     re-prefill regression would make turn 4's fresh span scale with the
+    //     accumulated history instead.
+    let uncached = |t: &TurnSnapshot| t.prompt_tokens.saturating_sub(t.cached_tokens);
     assert!(
-        turn4.ttft_ms < bound_vs_turn2,
-        "turn 4 TTFT much slower than turn 2: turn2={:.1}ms turn4={:.1}ms bound={:.1}ms. \
-         snapshots: {:?}",
-        turn2.ttft_ms,
-        turn4.ttft_ms,
-        bound_vs_turn2,
+        uncached(turn4) < turn4.cached_tokens,
+        "delta turn 4 prefilled more than it reused — work is not flat: \
+         prompt={} cached={} uncached={}. snapshots: {:?}",
+        turn4.prompt_tokens,
+        turn4.cached_tokens,
+        uncached(turn4),
+        snapshots
+    );
+    assert!(
+        uncached(turn4) <= uncached(turn2) * 2,
+        "delta turn 4's fresh prefill ({}) ballooned vs turn 2's ({}) — TTFT \
+         would regress. snapshots: {:?}",
+        uncached(turn4),
+        uncached(turn2),
         snapshots
     );
 }
@@ -545,8 +586,23 @@ async fn lfm2_session_continue_tool_round_trips() {
         "tool-result continue returned an empty reply: {:?}",
         result
     );
+    // This test guards the continue_tool PATH mechanics: it prefills the
+    // tool-result delta onto the live session cache, generates, and reaches a
+    // clean terminal — it does NOT assert reply content. LFM2 drops the
+    // tool_call_id (its template identifies tool responses positionally), so a
+    // minimal tool-continue on the "thinking" checkpoint enters a think block
+    // immediately and, under the 32-token budget here, legitimately bottoms out
+    // via any cutoff: EOS ("stop"), the budget cap ("length"), or the
+    // repetition guard ("repetition", which is active by default —
+    // params.rs defaults max_consecutive_tokens=16 / max_ngram_repeats=3 /
+    // ngram_size=64 when the config leaves them unset). All three are valid
+    // non-cancelled terminal states. Forward correctness is covered separately
+    // by lfm2_paged_vs_flat_parity (6/6 byte-identical).
     assert!(
-        result.finish_reason == "stop" || result.finish_reason == "length",
+        matches!(
+            result.finish_reason.as_str(),
+            "stop" | "length" | "repetition"
+        ),
         "unexpected finish_reason: {}",
         result.finish_reason
     );
@@ -624,10 +680,17 @@ async fn lfm2_session_start_rejects_reuse_cache_false() {
 // ---------------------------------------------------------------------
 
 /// After `reset_caches`, re-running the same turn-0 prompt at
-/// temperature=0 reproduces the previous `text` and `num_tokens`
-/// byte-for-byte. This proves the session-start path starts from a
-/// clean slate on reset and nothing from the previous turn leaks into
-/// the new one.
+/// temperature=0 reproduces the previous `raw_text` / `text` /
+/// `num_tokens` byte-for-byte WITHOUT any priming turn. This proves the
+/// session-start path starts from a fully cold slate on reset and
+/// nothing from the previous turn leaks into the new one — including
+/// the paged adapter's content-addressed prefix blocks: an explicit
+/// `reset_caches` purges them (`ResetScope::Command` hard reset), so
+/// the second run replays the COLD full-prompt prefill instead of a
+/// prefix-hit 1-token-suffix prefill whose different bf16 reduction
+/// order can flip a greedy near-tie (the codex S12 finding; previously
+/// masked because `text` is empty on all-thinking trajectories —
+/// `raw_text` is the assert that actually bites).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs MLX_TEST_LFM2_MODEL_PATH pointing to a real LFM2 checkpoint"]
 async fn lfm2_session_reset_reproduces_turn_output_deterministically() {
@@ -660,7 +723,8 @@ async fn lfm2_session_reset_reproduces_turn_output_deterministically() {
     // Reset the entire session/cache state, then run the SAME prompt
     // again with the SAME config. `reset_caches` is a sync NAPI method
     // on `&Lfm2Model`.
-    model.reset_caches().expect("reset_caches failed");
+    // block_in_place: reset_caches blocks on blocking_recv, which panics on a tokio worker.
+    tokio::task::block_in_place(|| model.reset_caches()).expect("reset_caches failed");
 
     let cfg2 = chat_config_default(32);
     let r2 = model
@@ -668,6 +732,15 @@ async fn lfm2_session_reset_reproduces_turn_output_deterministically() {
         .await
         .expect("second chat_session_start after reset_caches failed");
 
+    // raw_text is the load-bearing assert: lfm2 spends small budgets
+    // inside `<think>`, so `text` is often empty for BOTH runs and
+    // would mask a cold-vs-prefix-hit prefill divergence.
+    assert_eq!(
+        r1.raw_text, r2.raw_text,
+        "reset_caches did not reproduce turn-0 raw_text byte-for-byte \
+         (cold prefill vs post-reset prefill diverged): before={:?} after={:?}",
+        r1.raw_text, r2.raw_text
+    );
     assert_eq!(
         r1.text, r2.text,
         "reset_caches did not reproduce turn-0 text byte-for-byte: \
@@ -682,10 +755,14 @@ async fn lfm2_session_reset_reproduces_turn_output_deterministically() {
 }
 
 /// At temperature=0, the concatenated text emitted by
-/// `chat_stream_session_start_for_test` matches the `ChatResult.text`
-/// from `chat_session_start` byte-for-byte. A `reset_caches` call
-/// between the two runs ensures both start from an identical clean
-/// session.
+/// `chat_stream_session_start_for_test` matches the `ChatResult.raw_text`
+/// from `chat_session_start` byte-for-byte (the deltas are the verbatim
+/// stream under include_reasoning=true), and the terminal chunk's parsed
+/// `text` matches the non-stream `text`. The `reset_caches` between the
+/// two runs is a HARD reset (paged prefix blocks purged), so the
+/// streaming run replays the non-streaming run's cold prefill exactly —
+/// no priming turn needed (the S12 prime-turn workaround is gone with
+/// the `ResetScope::Command` prefix-cache purge).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs MLX_TEST_LFM2_MODEL_PATH pointing to a real LFM2 checkpoint"]
 async fn lfm2_session_stream_matches_non_stream_byte_for_byte() {
@@ -704,17 +781,20 @@ async fn lfm2_session_stream_matches_non_stream_byte_for_byte() {
         .await
         .expect("failed to load LFM2 model");
 
+    let prompt_text = "Say hi in one short word.";
+
     // Non-streaming: capture the full reply text. `ChatMessage` is not
     // `Clone`, so we reconstruct the identical prompt for both calls.
-    let prompt_text = "Say hi in one short word.";
     let cfg_ns = chat_config_default(32);
     let non_stream_result = model
         .chat_session_start(vec![user_message(prompt_text)], Some(cfg_ns))
         .await
         .expect("non-streaming chat_session_start failed");
 
-    // Reset so the streaming run starts from the same clean state.
-    model.reset_caches().expect("reset_caches failed");
+    // Hard reset so the streaming run starts from the same fully cold
+    // state as the non-streaming run above (prefix-cache purged).
+    // block_in_place: reset_caches blocks on blocking_recv, which panics on a tokio worker.
+    tokio::task::block_in_place(|| model.reset_caches()).expect("reset_caches failed");
 
     // Streaming: drain every non-done chunk and concatenate `chunk.text`.
     let cfg_s = chat_config_default(32);
@@ -724,21 +804,37 @@ async fn lfm2_session_stream_matches_non_stream_byte_for_byte() {
 
     let mut streamed = String::new();
     let mut saw_done = false;
+    let mut terminal_text: Option<String> = None;
     while let Some(result) = rx.recv().await {
         let chunk = result.expect("stream chunk error");
         if chunk.done {
             saw_done = true;
+            terminal_text = Some(chunk.text.clone());
             break;
         }
         streamed.push_str(&chunk.text);
     }
     assert!(saw_done, "stream never reached done=true");
 
+    // With include_reasoning=true the delta chunks carry the VERBATIM byte
+    // stream (reasoning included), so the correct non-stream counterpart is
+    // `raw_text`, NOT the reasoning-stripped `text`. The original
+    // `streamed == text` assert could never pass on a thinking trajectory
+    // (lfm2 spends the whole 32-token budget inside `<think>`, so `text` is
+    // empty) — a defect previously masked by the blocking_recv panic in
+    // `reset_caches` (fixed above).
     assert_eq!(
-        streamed, non_stream_result.text,
-        "streamed text does not match non-stream text byte-for-byte: \
-         streamed={:?} non_stream={:?}",
-        streamed, non_stream_result.text
+        streamed, non_stream_result.raw_text,
+        "streamed deltas do not match non-stream raw_text byte-for-byte: \
+         streamed={:?} non_stream_raw={:?}",
+        streamed, non_stream_result.raw_text
+    );
+    // Parsed-text parity: the terminal done-chunk carries the streaming
+    // run's finalized `text`; it must match the non-streaming `text`.
+    assert_eq!(
+        terminal_text.as_deref(),
+        Some(non_stream_result.text.as_str()),
+        "terminal chunk text does not match non-stream text byte-for-byte"
     );
 }
 
@@ -834,7 +930,7 @@ async fn lfm2_session_start_prefix_reuse_append_hit() {
     // Turn 1: plain session start
     let cfg1 = chat_config_default(32);
     let r1 = model
-        .chat_session_start(vec![user_message("Say hi in one short word.")], Some(cfg1))
+        .chat_session_start(vec![user_message("In exactly one short word, and nothing else, with no explanation and no punctuation and no preamble whatsoever, how would you warmly and politely greet a brand-new friend that you happen to be meeting for the very first time on this fine and bright sunny morning, bearing in mind that they have travelled a very long way over the hills and across the wide river and through the quiet forest to come and see you today and would dearly appreciate a simple kind and gentle word of welcome from you?")], Some(cfg1))
         .await
         .expect("turn 1 chat_session_start failed");
     assert_eq!(
@@ -842,11 +938,6 @@ async fn lfm2_session_start_prefix_reuse_append_hit() {
         "turn 1 should cold-start: cached_tokens={}",
         r1.cached_tokens
     );
-    let ttft1 = r1
-        .performance
-        .as_ref()
-        .expect("turn 1 performance missing")
-        .ttft_ms;
 
     // Turn 2: resend full transcript + one more user turn. The LFM2
     // chat template renders the prior assistant reply byte-for-byte, so
@@ -854,7 +945,9 @@ async fn lfm2_session_start_prefix_reuse_append_hit() {
     // saved history.
     let cfg2 = chat_config_default(32);
     let turn2_msgs = vec![
-        user_message("Say hi in one short word."),
+        user_message(
+            "In exactly one short word, and nothing else, with no explanation and no punctuation and no preamble whatsoever, how would you warmly and politely greet a brand-new friend that you happen to be meeting for the very first time on this fine and bright sunny morning, bearing in mind that they have travelled a very long way over the hills and across the wide river and through the quiet forest to come and see you today and would dearly appreciate a simple kind and gentle word of welcome from you?",
+        ),
         ChatMessage {
             role: "assistant".to_string(),
             content: r1.text.clone(),
@@ -881,19 +974,33 @@ async fn lfm2_session_start_prefix_reuse_append_hit() {
         "unexpected finish_reason on turn 2: {}",
         r2.finish_reason
     );
-    let ttft2 = r2
-        .performance
-        .as_ref()
-        .expect("turn 2 performance missing")
-        .ttft_ms;
-    // TTFT bound: on a prefix hit we only prefill the delta (a handful
-    // of tokens), so turn 2 should be NO slower than turn 1 by a
-    // noticeable margin. 1.5× is a generous headroom to absorb jitter.
+    // On a prefix-reuse hit the engine reprocesses only the new suffix: the
+    // matched prefix (turn 1's rendered transcript) is served from the
+    // content-addressed cache and `cached_tokens` reports it. Assert that
+    // token accounting directly instead of wall-clock TTFT — TTFT is a flaky
+    // CI signal (tiny warm-GPU times dominated by fixed per-turn setup, not
+    // prefill work) AND a weak one (a broken reuse that silently re-prefilled
+    // the whole prompt could still report a fast TTFT on a fast machine). The
+    // deterministic proof that "only the delta was prefilled" is that the
+    // freshly-prefilled span is smaller than the reused prefix.
+    let uncached_delta = r2.prompt_tokens.saturating_sub(r2.cached_tokens);
+    eprintln!(
+        "prefix-reuse token accounting: prompt_tokens={} cached_tokens={} uncached_delta={}",
+        r2.prompt_tokens, r2.cached_tokens, uncached_delta,
+    );
+    // The reused prefix must be the clear MAJORITY of the work: turn 2
+    // reprocesses only the short new suffix (the one-word reply + the new
+    // user turn), while turn 1's long question is served from the
+    // content-addressed cache. `cached_tokens >= 2 * uncached_delta` proves
+    // that deterministically — a broken reuse that re-prefilled the whole
+    // prompt would push uncached_delta up to the full prompt and fail.
     assert!(
-        ttft2 < ttft1 * 1.5,
-        "prefix-reuse hit did not flatten TTFT: turn1={:.1}ms turn2={:.1}ms",
-        ttft1,
-        ttft2,
+        uncached_delta * 2 < r2.cached_tokens,
+        "prefix reuse is not the clear majority of the work: reused \
+         prefix={} freshly-prefilled suffix={} (prompt_tokens={})",
+        r2.cached_tokens,
+        uncached_delta,
+        r2.prompt_tokens,
     );
 }
 

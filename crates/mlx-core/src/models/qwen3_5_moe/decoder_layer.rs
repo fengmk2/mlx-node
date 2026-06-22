@@ -114,6 +114,44 @@ impl DecoderLayer {
         h.add(&mlp_out)
     }
 
+    /// Like [`DecoderLayer::forward`], but threads an eager-MTP tape sink into
+    /// the GDN (`Linear`) sublayer so the verify forward can record the
+    /// per-step recurrence inputs for the rollback replay. Full-attention
+    /// layers ignore the sink (it stays `None` for their tape slot). When
+    /// `tape_sink` is `None`, behavior is byte-identical to `forward`.
+    pub(crate) fn forward_with_tape(
+        &mut self,
+        x: &MxArray,
+        mask: Option<&MxArray>,
+        cache: Option<&mut Qwen3_5LayerCache>,
+        position_ids: Option<&MxArray>,
+        use_kernel: bool,
+        tape_sink: Option<&mut Option<super::gated_delta_net::GdnLayerTape>>,
+    ) -> Result<MxArray> {
+        let normed = self.input_layernorm.forward(x)?;
+        let attn_out = match &mut self.attn {
+            AttentionType::Linear(gdn) => {
+                let ac = cache.and_then(|c| c.as_arrays_cache_mut());
+                gdn.forward_with_tape(&normed, mask, ac, use_kernel, tape_sink)?
+            }
+            AttentionType::Full(attn) => {
+                let _ = tape_sink;
+                let kvc = cache.and_then(|c| c.as_kv_cache_mut());
+                attn.forward(&normed, mask, kvc, position_ids)?
+            }
+        };
+
+        let h = x.add(&attn_out)?;
+
+        let normed = self.post_attention_layernorm.forward(&h)?;
+        let mlp_out = match &self.mlp {
+            MLPType::Dense(mlp) => mlp.forward(&normed)?,
+            MLPType::MoE(moe) => moe.forward(&normed)?,
+        };
+
+        h.add(&mlp_out)
+    }
+
     /// Paged-or-flat dispatch for the MoE decoder layer.
     ///
     /// Same shape as the dense `DecoderLayer::forward_paged_or_flat`
@@ -151,7 +189,6 @@ impl DecoderLayer {
             }
             Qwen3_5LayerKind::FullAttentionPaged { paged_idx } => {
                 let _ = flat_cache;
-                let _ = position_ids;
                 let _ = use_kernel;
                 let _ = mask;
                 let attn = match &self.attn {
@@ -164,6 +201,8 @@ impl DecoderLayer {
                     }
                 };
                 let normed = self.input_layernorm.forward(x)?;
+                // `position_ids` carries M-RoPE positions for an image-bearing
+                // prefill; `None` keeps the scalar-offset text path.
                 let attn_out = attn.forward_paged(
                     &normed,
                     adapter,
@@ -171,6 +210,7 @@ impl DecoderLayer {
                     first_logical_position,
                     cached_prefix_len,
                     is_prefill,
+                    position_ids,
                 )?;
                 let h = x.add(&attn_out)?;
                 let normed = self.post_attention_layernorm.forward(&h)?;

@@ -43,8 +43,8 @@
 //!    blocks to cover the prompt suffix that prefill will write. Decode
 //!    blocks are NOT pre-reserved here; `record_tokens` grows the block
 //!    table on-demand as decode crosses block boundaries (vLLM's lazy
-//!    pattern; pre-reserving `max_new_tokens` here used to blow out the
-//!    pool when callers sent `max_tokens=128000` for ~10K-token
+//!    pattern; pre-reserving `max_new_tokens` here would blow out the
+//!    pool when callers send `max_tokens=128000` for ~10K-token
 //!    generations).
 //! 4. `record_tokens(...)` — every token consumed (prefill batch + each
 //!    decoded token), in order. Lazily extends `block_table` when needed.
@@ -1223,12 +1223,12 @@ impl PagedKVCacheAdapter {
     /// Callers should pass `total_tokens` = `prompt_tokens.len()` (the full
     /// prompt length, INCLUDING the cached prefix), NOT
     /// `prompt_len + max_new_tokens`. The decode loop's per-token
-    /// `record_tokens` calls now lazily allocate further blocks on-demand
+    /// `record_tokens` calls lazily allocate further blocks on-demand
     /// as the position cursor crosses block boundaries — see `record_tokens`.
-    /// Pre-reserving the speculative `max_new_tokens` budget here used to
+    /// Pre-reserving the speculative `max_new_tokens` budget here would
     /// blow out the global `BlockAllocator` pool when callers (e.g. Claude
-    /// Code) routinely sent `max_tokens=128000` even though actual
-    /// generation rarely exceeded ~10K. vLLM uses the same lazy pattern:
+    /// Code) routinely send `max_tokens=128000` even though actual
+    /// generation rarely exceeds ~10K. vLLM uses the same lazy pattern:
     /// the prompt's blocks are reserved at prefill, decode allocates one
     /// block every `block_size` tokens.
     pub fn allocate_suffix_blocks(&mut self, total_tokens: u32) -> Result<u32, String> {
@@ -1344,8 +1344,8 @@ impl PagedKVCacheAdapter {
     /// block-table capacity (`num_blocks * block_size`), this call lazily
     /// allocates additional blocks from the shared `BlockAllocator` to
     /// cover the deficit. This matches vLLM's decode pattern and avoids
-    /// pre-reserving the speculative `max_new_tokens` budget (which used
-    /// to blow out the pool when clients sent `max_tokens=128000`).
+    /// pre-reserving the speculative `max_new_tokens` budget (which would
+    /// blow out the pool when clients send `max_tokens=128000`).
     ///
     /// On allocator exhaustion the call returns `Err` WITHOUT extending
     /// `request_tokens` or `block_table.num_tokens`, so the caller can
@@ -2612,8 +2612,8 @@ impl PagedKVCacheAdapter {
     ///
     /// This is a HOST-side gather: blits the requested blocks back over the
     /// PCIe-equivalent path, then constructs the K/V arrays element-wise
-    /// from raw bytes. That's slow but correct, and matches the spec for
-    /// P1: production zero-copy gather is a follow-up. For correctness, we
+    /// from raw bytes. That's slow but correct; production zero-copy gather is
+    /// a follow-up. For correctness, we
     /// just read each slot, copy the appropriate bytes into the output
     /// buffer, and call `MxArray::from_float16` / `from_bfloat16` to build
     /// half-precision MLX arrays. For typical chat workloads
@@ -2920,13 +2920,9 @@ impl PagedKVCacheAdapter {
     /// only the request's own reference, leaving the cache's reference
     /// behind. After release each registered block lands at `ref_count
     /// >= 1`, surviving until the LRU eviction path drives it back to 0.
-    ///
-    /// (Prior to that fix the adapter manually incref'd freshly-allocated
-    /// blocks and relied on `register_prefix` to "absorb" the extra ref;
-    /// but no eviction path released the manual incref, so blocks
-    /// orphaned at `ref_count=1` once they fell out of the cache. See
-    /// the P1A bugfix that moved ownership of the cache's ref into the
-    /// allocator itself.)
+    /// Ownership of the cache's reference lives in the allocator itself, so
+    /// the eviction path is the sole releaser — the adapter never holds a
+    /// manual incref that could orphan a block at `ref_count=1`.
     ///
     /// ## Idempotency
     ///
@@ -3168,6 +3164,42 @@ impl PagedKVCacheAdapter {
         self.already_registered = false;
         self.prefix_lookup_done = false;
         Ok(count)
+    }
+
+    /// Hard reset for an EXPLICIT session reset
+    /// (`engine::backend::ResetScope::Command`).
+    ///
+    /// [`Self::release_request`] alone is NOT a cold reset: full blocks the
+    /// request registered stay content-addressed in the shared
+    /// [`BlockAllocator`]'s prefix cache, so the next same-prompt turn
+    /// takes the prefix-hit suffix-prefill path instead of a cold
+    /// full-prompt prefill. The two paths reduce bf16 in different orders,
+    /// which can flip a greedy near-tie — making reset-then-rerun diverge
+    /// from a fresh session even though the reset's contract promises a
+    /// fully cold state (observed flip: "says," vs "said" at token ~6 on the
+    /// lfm2.5-1.2b checkpoint).
+    ///
+    /// Releases the live request (idempotent — a prior `release_request`
+    /// makes that half a no-op) AND purges every prefix-cache entry from
+    /// the allocator via [`BlockAllocator::purge_prefix_cache`]. Returns
+    /// the number of blocks the release freed.
+    ///
+    /// NOTE: the allocator may be shared by multiple adapters; purged
+    /// entries vanish for every tenant (blocks still referenced by another
+    /// live request stay allocated but lose their cache registration).
+    /// Every current integration constructs a dedicated allocator per
+    /// model instance, so this is theoretical today. Turn-internal resets
+    /// (`ResetScope::PrefixMiss`) must keep calling `release_request` only
+    /// — cross-request block reuse after a history miss is the paged
+    /// design's entire point.
+    pub fn release_request_and_purge_prefix_cache(&mut self) -> Result<u32, String> {
+        let released = self.release_request()?;
+        let mut guard = self
+            .allocator
+            .lock()
+            .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
+        guard.purge_prefix_cache();
+        Ok(released)
     }
 
     /// Finish the current turn but keep the request's live state in the
@@ -3661,9 +3693,10 @@ impl PagedKVCacheAdapter {
 
     /// Return a `[1]` fp32 K scale MxArray for `layer_idx`.
     ///
-    /// The compiled paged decode graphs (`mlx_qwen35_init_paged` and
-    /// `mlx_qwen35_moe_init_paged`) need a per-layer `k_scale` MxArray to
-    /// thread into `paged_kv_write` and `paged_attention`. The shape is
+    /// The eager paged forward threads a per-layer `k_scale` MxArray into
+    /// the `paged_kv_write` write (see `update_keys_values_native`) and the
+    /// `paged_attention` reads (see `gather_kv_for_decode_graph` /
+    /// `gather_kv_for_prefill_chunk`). The shape is
     /// always `[1]` and the dtype is always `Float32` — the C++ validator
     /// in `mlx_paged_ops.cpp` rejects anything else.
     ///
@@ -4170,14 +4203,14 @@ mod tests {
         assert_eq!(adapter.block_table().unwrap().num_blocks(), 1);
     }
 
-    /// Regression: the vLLM-style `max_cache_hit_tokens = prompt.len() - 1`
-    /// cap is what production callers use to avoid the zero-delta corner
-    /// case. With the cap applied, even when the entire prompt is already
-    /// cached, the lookup must leave at least the trailing block out of the
-    /// reuse set so the model has a non-empty prefill suffix to forward.
-    /// Without this cap the paged forward used to error with
-    /// `chat_*_core_paged: zero-delta prompt (every token cached) is not
-    /// yet supported` for client retries of an earlier identical turn.
+    /// The vLLM-style `max_cache_hit_tokens = prompt.len() - 1` cap is what
+    /// production callers use to avoid the zero-delta corner case. With the cap
+    /// applied, even when the entire prompt is already cached, the lookup must
+    /// leave at least the trailing block out of the reuse set so the model has
+    /// a non-empty prefill suffix to forward. Without this cap the paged
+    /// forward errors with `chat_*_core_paged: zero-delta prompt (every token
+    /// cached) is not yet supported` for client retries of an earlier identical
+    /// turn.
     #[test]
     fn test_find_cached_prefix_with_max_tokens_zero_delta_regression() {
         let allocator = new_allocator(8, 4);

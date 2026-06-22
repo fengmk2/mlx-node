@@ -20,8 +20,8 @@
 
 use std::path::Path;
 
+use mlx_core::engine::types::ChatConfig;
 use mlx_core::models::lfm2::model::Lfm2Model;
-use mlx_core::models::qwen3_5::model::ChatConfig;
 use mlx_core::tokenizer::ChatMessage;
 
 fn chat_config_default(max_new_tokens: i32) -> ChatConfig {
@@ -210,7 +210,8 @@ async fn lfm2_moe_reset_determinism() {
         .await
         .expect("first start failed");
 
-    model.reset_caches().expect("reset_caches failed");
+    // block_in_place: reset_caches blocks on blocking_recv, which panics on a tokio worker.
+    tokio::task::block_in_place(|| model.reset_caches()).expect("reset_caches failed");
 
     let r2 = model
         .chat_session_start(vec![user_message(prompt)], Some(chat_config_default(8)))

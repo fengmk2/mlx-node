@@ -8,13 +8,13 @@ use serde_json::Value;
 use tracing::info;
 
 use crate::array::{DType, MxArray};
+use crate::engine::persistence::{
+    dequant_fp8_weights, get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
+    prewarm_checkpoint_pages,
+};
 use crate::models::quant_dispatch::{
     default_per_layer_quant, ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
     load_quant_settings_from_disk, merge_per_layer, resolve_default_mode,
-};
-use crate::models::qwen3_5::persistence_common::{
-    dequant_fp8_weights, get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
-    prewarm_checkpoint_pages,
 };
 use crate::tokenizer::Qwen3Tokenizer;
 
@@ -621,6 +621,57 @@ pub fn sanitize_weights(
     Ok(sanitized)
 }
 
+/// Per-buffer byte budget for sharding the oversized PLE embedding. Defaults to
+/// 1 GiB — comfortably under the smallest real Metal per-buffer cap (~3.5 GiB on
+/// memory-constrained CI runners) — and is overridable via
+/// `MLX_GEMMA4_PLE_SHARD_BYTES` (tests force a tiny budget to exercise the
+/// sharded gather; a huge value disables sharding on roomy devices).
+fn ple_shard_byte_budget() -> usize {
+    const DEFAULT: usize = 1 << 30; // 1 GiB
+    std::env::var("MLX_GEMMA4_PLE_SHARD_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&b| b > 0)
+        .unwrap_or(DEFAULT)
+}
+
+/// If `embed_tokens_per_layer.weight` is a dense bf16 tensor larger than the
+/// shard budget, load it as sub-cap row shards (streamed from file) and install
+/// them on the PLE embedding, then drop the key from `params` so neither the
+/// dense apply path nor the whole-tensor materialize pass touches the oversized
+/// array. Keyed on this one tensor only — `embed_tokens` (the tied lm_head) is
+/// never sharded (it needs the dense table for `as_linear`).
+fn maybe_shard_ple_embedding(
+    inner: &mut Gemma4Inner,
+    params: &mut HashMap<String, MxArray>,
+    model_dir: &Path,
+) -> Result<()> {
+    const KEY: &str = "embed_tokens_per_layer.weight";
+    // Quantized PLE (scales present) uses a separate load path — leave it alone.
+    if params.contains_key("embed_tokens_per_layer.scales") {
+        return Ok(());
+    }
+    let budget = ple_shard_byte_budget();
+    let needs_shard = match params.get(KEY) {
+        Some(w) => w.dtype()? == DType::BFloat16 && w.nbytes() > budget,
+        None => false,
+    };
+    if !needs_shard {
+        return Ok(());
+    }
+    let Some(ple) = inner.ple.as_mut() else {
+        return Ok(());
+    };
+    let (shards, rows_per_shard) =
+        crate::utils::safetensors::load_bf16_tensor_sharded(model_dir, KEY, budget)?;
+    let n = shards.len();
+    ple.embed_tokens_per_layer
+        .set_sharded(shards, rows_per_shard)?;
+    params.remove(KEY);
+    info!("PLE embed_tokens_per_layer loaded (sharded into {n} sub-cap arrays)");
+    Ok(())
+}
+
 /// Apply sanitized weights to a Gemma4Inner.
 fn apply_weights(
     inner: &mut Gemma4Inner,
@@ -716,7 +767,7 @@ fn apply_weights(
     // `mlx_dequantize(..., "affine")` unconditionally, so MXFP4/MXFP8 metadata
     // at this key would silently mis-dequantize. The convert path already
     // forces `embed_tokens` to affine (see `apply_mxfp_upgrade` and the
-    // legacy no-recipe block), but if a future regression or hand-edited
+    // no-recipe path), but if a future regression or hand-edited
     // checkpoint claims otherwise we want to fail loud rather than emit
     // garbage outputs.
     let embed_quantized = params.contains_key("embed_tokens.scales");
@@ -1472,10 +1523,9 @@ impl Gemma4Inner {
         validate_required_weights(&params, &config)?;
 
         // Fuse split MoE expert weights: replace separate gate_proj + up_proj
-        // with a single gate_up_proj BEFORE apply_weights. This ensures:
-        // 1. The model and params share the same fused MxArray (no duplication)
-        // 2. g_weights (C++ global) stores the fused version, not the splits
-        // 3. Saves ~30 GB that would otherwise be held by redundant split arrays
+        // with a single gate_up_proj BEFORE apply_weights. This ensures the
+        // model and `params` share the same fused MxArray (no duplication) and
+        // saves ~30 GB that would otherwise be held by redundant split arrays.
         if config.enable_moe_block {
             for i in 0..config.num_hidden_layers as usize {
                 let prefix = format!("layers.{}", i);
@@ -1564,6 +1614,14 @@ impl Gemma4Inner {
             merge_split_experts_into_fused(&mut per_layer_quant, config.num_hidden_layers as usize);
         }
 
+        // gemma-4-E2B's `embed_tokens_per_layer.weight` is a single ~4GB tensor
+        // that can exceed the Metal per-buffer cap on memory-constrained
+        // devices, where the whole-tensor materialize eval below would fail to
+        // allocate one buffer. Shard it across sub-cap arrays (streamed from the
+        // file) before apply_weights so the dense PLE-load branch is skipped and
+        // the forward gathers across shards.
+        maybe_shard_ple_embedding(&mut inner, &mut params, path)?;
+
         // Apply weights
         apply_weights(
             &mut inner,
@@ -1590,26 +1648,22 @@ impl Gemma4Inner {
         // timeouts on large models. Without this, weights remain as lazy mmap
         // references and every decode step re-reads ~48GB from disk.
         {
-            let weight_refs: Vec<&MxArray> = params.values().collect();
+            let mut weight_refs: Vec<&MxArray> = params.values().collect();
+            // PLE shards live outside `params` (their oversized source key was
+            // removed); materialize them too. Each shard is sub-cap, so the
+            // chunked eval allocates fine.
+            if let Some(ple) = inner.ple.as_ref() {
+                weight_refs.extend(ple.embed_tokens_per_layer.shard_arrays());
+            }
             crate::array::memory::materialize_weights(&weight_refs)?;
         }
 
-        // NO compiled-weight registration for Gemma4. Gemma4 has NO compiled
-        // C++ forward path (there is no `mlx_gemma4*.cpp`, and Gemma4 never reads
-        // `mlx_*_get_model_id()`); its forward uses primitive-op FFI that takes
-        // weight arrays by POINTER (from this Rust `inner`/`params`), never
-        // by-name from the shared C++ `g_weights` map. The previous
-        // `register_gemma4_weights_with_cpp` was therefore vestigial for
-        // Gemma4's own inference AND actively harmful to co-resident families:
-        // it called `mlx_clear_weights()` (evicting a resident qwen3.5/lfm2
-        // compiled model's weights on every Gemma4 load) and published a
-        // Gemma4 id from a PRIVATE 0-based counter into the SHARED
-        // `g_active_model_id` atom, which could collide with a qwen3.5/lfm2 id
-        // (those draw from the shared `QWEN35_MODEL_ID_COUNTER`) and make their
-        // compiled gate false-positive against Gemma4's weights. Removing the
-        // registration closes that cross-family collision at the root and stops
-        // Gemma4 from clobbering the shared compiled registry. `inner.model_id`
-        // remains a purely local NAPI handle (never published).
+        // Gemma4's forward runs entirely through primitive-op FFI that takes
+        // weight arrays by POINTER (from this Rust `inner`/`params`), so there
+        // is no process-global weight table to populate and nothing to register
+        // here. `inner.model_id` (drawn from `QWEN35_MODEL_ID_COUNTER`) is a
+        // purely local per-instance handle surfaced to NAPI; it is not a
+        // routing key and never leaves this process state.
 
         // NOTE: the cache-limit coordinator registration happens in
         // `Gemma4Model::load_from_dir` after this function returns,
@@ -1647,10 +1701,20 @@ impl Gemma4Inner {
         // before it is dropped at end-of-function.
         // `saturating_add` guards against overflow on a corrupted
         // checkpoint.
-        let weight_bytes: u64 = params
+        let mut weight_bytes: u64 = params
             .values()
             .map(|a| a.nbytes() as u64)
             .fold(0u64, |acc, v| acc.saturating_add(v));
+        // The PLE shards were removed from `params` (their oversized source key
+        // is gone) but are still model-owned resident weights. Count them too,
+        // mirroring the materialize pass above; omitting their ~4GB would
+        // under-report the footprint and inflate the cache cap on exactly the
+        // constrained devices this sharding targets.
+        if let Some(ple) = inner.ple.as_ref() {
+            for shard in ple.embed_tokens_per_layer.shard_arrays() {
+                weight_bytes = weight_bytes.saturating_add(shard.nbytes() as u64);
+            }
+        }
 
         Ok((inner, weight_bytes))
     }
@@ -1683,7 +1747,7 @@ impl Gemma4Model {
                     (model_id, has_vision, cache_limit_guard, paged_active),
                 ))
             },
-            super::model::handle_gemma4_cmd,
+            crate::engine::cmd::handle_chat_cmd::<super::model::Gemma4Inner>,
         );
 
         let (model_id, has_vision, cache_limit_guard, paged_active) = init_rx
@@ -1759,14 +1823,14 @@ mod tests {
         assert_eq!(dt("norm.weight"), DType::BFloat16);
     }
 
-    /// Finding 1 (partial dense-MLP quant group): a checkpoint where SOME of
+    /// Partial dense-MLP quant group: a checkpoint where SOME of
     /// gate/up/down ship a quantized group and the rest are dense is
     /// truncated/malformed — `apply_weights` must FAIL LOUD naming the
-    /// projections missing their quant group. The old gate-keyed nesting
-    /// silently left the randomly-initialized MLP live (gate quantized,
-    /// up/down dense) or dense-loaded packed sidecar weights unchecked (gate
-    /// dense, up/down quantized). The two happy paths — all-dense and
-    /// all-quantized — must keep loading.
+    /// projections missing their quant group, never leave the
+    /// randomly-initialized MLP live (gate quantized, up/down dense) or
+    /// dense-load packed sidecar weights unchecked (gate dense, up/down
+    /// quantized). The two happy paths — all-dense and all-quantized — must
+    /// keep loading.
     #[test]
     fn partial_dense_mlp_quant_group_fails_loud() {
         let json = serde_json::json!({
@@ -1851,12 +1915,12 @@ mod tests {
         run(&params).expect("all-quantized MLP must keep loading");
     }
 
-    /// Round-2 Finding A (scales-only MLP group): if the MLP projections ship
-    /// ONLY their quant sidecars (`.scales`/`.biases`, `.weight` stripped),
-    /// every builder returns `None`, the tuple match lands in the all-dense
-    /// arm, and the dense loads find no `.weight` keys — the load used to
-    /// return Ok with the constructor-RANDOM MLP live. Must fail loud naming
-    /// the orphaned sidecars.
+    /// Scales-only MLP group: if the MLP projections ship ONLY their quant
+    /// sidecars (`.scales`/`.biases`, `.weight` stripped), every builder
+    /// returns `None`, the tuple match lands in the all-dense arm, and the
+    /// dense loads find no `.weight` keys. The load MUST fail loud naming
+    /// the orphaned sidecars rather than leaving the constructor-RANDOM MLP
+    /// live.
     #[test]
     fn scales_only_mlp_group_fails_loud_not_random() {
         let json = serde_json::json!({
@@ -1923,13 +1987,13 @@ mod tests {
         run(&params).expect("all-dense MLP must keep loading");
     }
 
-    /// Round-3 Finding 3 (vision embedding projection): the dense fallback of
+    /// Vision embedding projection: the dense fallback of
     /// `embed_vision.embedding_projection` must be dtype-guarded. When the
     /// `.scales` sidecar is stripped, the quantized branch (keyed on `.scales`
-    /// presence) is skipped and the packed Uint32 `.weight` used to route
+    /// presence) is skipped and the packed Uint32 `.weight` would route
     /// straight into `set_weight` — the shape can validate while the dtype is
-    /// garbage. Must fail loud naming the key; a bf16 dense weight keeps
-    /// loading.
+    /// garbage. The load MUST fail loud naming the key; a bf16 dense weight
+    /// keeps loading.
     #[test]
     fn vision_embedding_projection_stripped_sidecar_fails_loud() {
         let json = serde_json::json!({
@@ -1998,11 +2062,11 @@ mod tests {
         run(&params).expect("bf16 dense projection must keep loading");
     }
 
-    /// Round-2 Finding A (validator side): `validate_required_weights`' `has()`
-    /// no longer treats a lone `.scales` as satisfying a required `.weight`.
-    /// Every quant format stores its payload under the `.weight` key (packed
-    /// Uint32 / fp8 / int8) with `.scales` as a SIDECAR, so a well-formed
-    /// quantized checkpoint still passes the strict check, while a scales-only
+    /// Validator side: `validate_required_weights`' `has()` does not treat a
+    /// lone `.scales` as satisfying a required `.weight`. Every quant format
+    /// stores its payload under the `.weight` key (packed Uint32 / fp8 /
+    /// int8) with `.scales` as a SIDECAR, so a well-formed quantized
+    /// checkpoint still passes the strict check, while a scales-only
     /// (stripped `.weight`) group is reported missing instead of loading as
     /// constructor-random weights downstream.
     #[test]
@@ -2071,7 +2135,7 @@ mod tests {
         );
     }
 
-    /// Round-2 Finding C (MoE expert dense fallback): `try_build_qsl` returns
+    /// MoE expert dense fallback: `try_build_qsl` returns
     /// `Ok(None)` when `.scales` is absent, so a stripped expert quant group
     /// reaches the dense fallback — including the BARE HF fused key form
     /// (`layers.N.experts.gate_up_proj`, no `.weight` suffix), which is
@@ -2196,70 +2260,5 @@ mod tests {
         );
         assert!(!per_layer_quant.contains_key("layers.0.mlp.experts.gate_up_proj"));
         assert!(!per_layer_quant.contains_key("layers.0.mlp.experts.down_proj"));
-    }
-
-    /// Cross-family compiled-registry collision regression.
-    ///
-    /// Gemma4 has NO compiled C++ forward path (no `mlx_gemma4*.cpp`; its forward
-    /// uses primitive-op FFI that takes weight arrays by POINTER, never by-name
-    /// from the shared C++ `g_weights`). So a Gemma4 load MUST NOT register
-    /// weights into, or publish a model id onto, the SHARED compiled registry
-    /// (`g_active_model_id` + `g_weights`) that qwen3.5 / lfm2 own. A prior
-    /// `register_gemma4_weights_with_cpp` violated that: it `mlx_clear_weights()`
-    /// (evicting a co-resident qwen3.5/lfm2 compiled model on every Gemma4 load)
-    /// then published a Gemma4 id drawn from a PRIVATE 0-based counter onto the
-    /// shared atom — which could collide with a qwen3.5/lfm2 id (those draw from
-    /// the shared 1-based `QWEN35_MODEL_ID_COUNTER`) and make their compiled gate
-    /// false-positive against Gemma4's weights. This pins the fix: loading a
-    /// Gemma4 model leaves the shared `g_active_model_id` atom UNCHANGED.
-    ///
-    /// Race-free: holds `COMPILED_WEIGHTS_RWLOCK.write()` for the whole check, so
-    /// no concurrent registration/decode (all of which take this lock) can touch
-    /// the atom mid-test. Uses a sentinel id instead of a real qwen/lfm2 load, so
-    /// only a Gemma4 checkpoint is needed. (If Gemma4 registration is ever
-    /// re-introduced it would try to take this same write lock and the test would
-    /// block — a deliberately loud regression signal.)
-    #[test]
-    #[ignore = "needs MLX_TEST_GEMMA4_MODEL_PATH pointing to a real Gemma4 checkpoint"]
-    fn gemma4_load_does_not_touch_shared_compiled_model_id() {
-        let Ok(model_path) = std::env::var("MLX_TEST_GEMMA4_MODEL_PATH") else {
-            eprintln!("skipping: MLX_TEST_GEMMA4_MODEL_PATH unset");
-            return;
-        };
-
-        // Exclusive ownership of the shared compiled registry for the whole
-        // check (poison-recovered, matching the registration/decode lock usage).
-        let _w = crate::models::qwen3_5::model::COMPILED_WEIGHTS_RWLOCK
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-
-        // Remember whatever was published before so we leave the shared atom
-        // exactly as we found it (non-destructive to any co-resident model).
-        let original = unsafe { mlx_sys::mlx_lfm2_get_model_id() };
-
-        // Simulate a resident qwen3.5/lfm2 registration by publishing a sentinel
-        // id onto the shared atom (the same atom `mlx_lfm2_get_model_id()` reads).
-        const SENTINEL: u64 = 0x00C0_FFEE;
-        unsafe { mlx_sys::mlx_set_model_id(SENTINEL) };
-        let before = unsafe { mlx_sys::mlx_lfm2_get_model_id() };
-        assert_eq!(before, SENTINEL, "sentinel id publish failed");
-
-        // Load Gemma4 via the sync inner loader — the exact path that used to
-        // register weights / publish a model id.
-        let loaded = Gemma4Inner::load_from_dir(&model_path);
-
-        let after = unsafe { mlx_sys::mlx_lfm2_get_model_id() };
-        // Restore the pre-test atom value before releasing the lock.
-        unsafe { mlx_sys::mlx_set_model_id(original) };
-
-        let (_inner, _bytes) =
-            loaded.unwrap_or_else(|e| panic!("Gemma4Inner::load_from_dir failed: {e:?}"));
-
-        assert_eq!(
-            after, SENTINEL,
-            "Gemma4 load mutated the SHARED compiled model-id atom ({before:#x} -> {after:#x}); \
-             Gemma4 must not register into the qwen3.5/lfm2 compiled registry — cross-family \
-             model-id collision regression."
-        );
     }
 }

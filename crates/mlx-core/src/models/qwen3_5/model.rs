@@ -1,37 +1,46 @@
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use napi::bindgen_prelude::*;
-use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
+use napi::threadsafe_function::ThreadsafeFunctionCallMode;
 use napi_derive::napi;
 use tracing::{debug, info, warn};
 
 use crate::array::MxArray;
+use crate::engine::backend::{
+    ChatBackend, ChunkSink, DecodeStep, MtpBackend, MtpStepper, MtpTurnSetup, PagedBackend,
+    PagedPrefix, PagedTurnSetup, ResetScope, SaveStateArgs, ThinkingSetup, TrainBackend,
+    TurnOutput, TurnSetup, WholeTurnArgs,
+};
+use crate::engine::cmd::{
+    ChatCmd, FromChatCmd, FromTrainCmd, TrainCmd, handle_chat_cmd, handle_train_cmd,
+};
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
-use crate::model_thread::{ResponseTx, StreamTx};
+use crate::model_thread::ResponseTx;
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
-use crate::tools::ToolCallResult;
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
-use super::chat_common;
-use super::chat_common::{
-    apply_all_penalties, build_chatml_continue_delta_text, build_synthetic_user_message,
-    compute_image_cache_key, compute_performance_metrics, extract_chat_params,
-    finalize_chat_result, save_cache_state_direct, send_stream_error, verify_cache_prefix_direct,
-};
 use super::config::Qwen3_5Config;
 use super::decoder_layer::DecoderLayer;
 use super::layer_cache::Qwen3_5LayerCache;
 use super::mtp::Qwen3_5MTPModule;
+use super::mtp_decode;
 use super::persistence;
 use super::processing::Qwen35VLImageProcessor;
 use super::vision::Qwen3_5VisionEncoder;
+use crate::engine;
+use crate::engine::vision::VisionMerge;
+use crate::engine::{
+    apply_all_penalties, compute_image_cache_key, compute_performance_metrics, extract_chat_params,
+    finalize_chat_result, save_cache_state_direct, verify_cache_prefix_direct,
+};
 use crate::models::paddleocr_vl::processing::ProcessedImages;
 
 /// Maximum number of entries in the vision encoder cache before LRU eviction.
@@ -46,35 +55,14 @@ pub(crate) struct VisionCacheInner {
 
 pub(crate) type VisionCache = Arc<Mutex<VisionCacheInner>>;
 
-/// Monotonically incrementing counter for assigning unique model IDs.
-/// Shared by BOTH dense and MoE models — the C++ weight map is shared,
-/// so IDs must be globally unique across all Qwen3.5 model variants.
-pub(crate) static QWEN35_MODEL_ID_COUNTER: AtomicU64 = AtomicU64::new(1); // 0 = no model
+// The shared model-id counter lives in `crate::engine::compiled_lock` (the
+// family-neutral home for the C++ compiled-registry contract). Re-exported here
+// for unqualified internal use across the dense + MoE forward code.
+pub(crate) use crate::engine::compiled_lock::QWEN35_MODEL_ID_COUNTER;
 
-/// RwLock protecting the C++ global weight map against concurrent mutation.
-/// Write-locked during weight registration (model load), read-locked during
-/// compiled inference. This prevents a concurrent model load from swapping
-/// weights underneath an in-flight compiled decode, and eliminates the TOCTOU
-/// between has_weight() / get_weight() in linear_proj().
-pub(crate) static COMPILED_WEIGHTS_RWLOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
-
-/// Process-wide mutex serializing the compiled forward LIFECYCLE (per-turn
-/// init / decode / reset) across model instances AND model families.
-///
-/// Within a single model instance the dedicated model thread serializes calls,
-/// but distinct models run on distinct OS threads (one per model, see
-/// `model_thread.rs`), so a qwen3.5 compiled decode and an lfm2 compiled decode
-/// genuinely run in parallel. They collide on the SAME process-global C++
-/// globals: the `g_weights()` map (read by the NOT id-aware `get_weight` /
-/// `get_weight_t`), the shared `g_active_model_id` atom, and each family's
-/// compiled decode state (`g_*_caches` / `g_*_offset_int`).
-///
-/// `pub(crate)` and family-agnostic by design: EVERY model that drives a
-/// compiled path over the shared registry (qwen3.5 dense + MoE, lfm2, …) MUST
-/// serialize its compiled lifecycle on THIS one instance — never a private
-/// per-family mutex, which would provide zero mutual exclusion against an
-/// in-flight compiled decode from another family.
-pub(crate) static COMPILED_LIFECYCLE_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+// The process-wide compiled-path locks live in `crate::engine::compiled_lock`;
+// imported here for unqualified internal use (no re-export — external consumers
+// import them from `crate::engine::compiled_lock`).
 
 fn fresh_dense_layer_caches(config: &Qwen3_5Config) -> Vec<Qwen3_5LayerCache> {
     (0..config.num_layers as usize)
@@ -250,45 +238,6 @@ fn compute_paged_prefix_block_hash(
     Some(parent_hash)
 }
 
-fn export_paged_dense_linear_caches(
-    config: &Qwen3_5Config,
-) -> Result<Option<Vec<Qwen3_5LayerCache>>> {
-    let num_layers = config.num_layers as usize;
-    let expected = num_layers
-        .checked_mul(2)
-        .ok_or_else(|| Error::from_reason("paged dense cache export size overflow"))?;
-    let mut export_ptrs: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); expected];
-    let exported = unsafe {
-        mlx_sys::mlx_qwen35_export_paged_linear_caches(export_ptrs.as_mut_ptr(), expected as i32)
-    };
-    if exported == 0 {
-        return Ok(None);
-    }
-    if exported != expected as i32 {
-        return Err(Error::from_reason(format!(
-            "paged dense linear cache export returned {exported} arrays; expected {expected}"
-        )));
-    }
-
-    let cache_offset = unsafe { mlx_sys::mlx_qwen35_get_paged_cache_offset() };
-    let mut new_caches = fresh_dense_layer_caches(config);
-    for i in 0..num_layers {
-        if !config.is_linear_layer(i) {
-            continue;
-        }
-        let p0 = export_ptrs[i * 2];
-        let p1 = export_ptrs[i * 2 + 1];
-        if p0.is_null() || p1.is_null() {
-            return Err(Error::from_reason(format!(
-                "paged dense linear cache export missing layer {i}"
-            )));
-        }
-        new_caches[i].import_ptrs(p0, p1, cache_offset);
-    }
-
-    Ok(Some(new_caches))
-}
-
 /// Internal model state owned exclusively by the dedicated model thread.
 ///
 /// No `Arc<RwLock<>>` — the model thread has sole ownership of all inference
@@ -332,6 +281,12 @@ pub(crate) struct Qwen35Inner {
     /// keeps the rebuild a ONE-TIME cost on the paged→dense transition
     /// instead of re-prefilling the whole history on every MTP turn.
     pub(crate) paged_full_attn_caches_dirty: bool,
+    /// Set when a flat eager-MTP turn stopped mid-cycle leaving `self.caches`
+    /// advanced past the emitted token history (GDN state cannot be rewound).
+    /// Forces the next turn to discard `self.caches` and re-prefill the full
+    /// history. Pure-flat sessions only; the paged path rolls back its adapter
+    /// directly.
+    pub(crate) flat_mtp_caches_desynced: bool,
     /// Training state owned by the model thread.
     /// Created when `InitTraining` command is received, destroyed when training ends.
     pub(crate) training_state: Option<crate::training_state::ModelThreadTrainingState>,
@@ -346,229 +301,133 @@ pub(crate) struct Qwen35Inner {
     /// applied it to `mtp`. The module may exist from config alone; this
     /// flag prevents random-init MTP modules from advertising capability.
     pub(crate) mtp_weights_loaded: bool,
+    /// Whether the CURRENT generic-flow turn is streaming. Set by the
+    /// [`ChatBackend::profiler_label`] hook (the session core calls it
+    /// exactly once per generic-flow turn, before `begin_decode`);
+    /// consumed by [`ChatBackend::begin_decode`]'s compiled/eager
+    /// profiler relabel, which must pick the `chat_*` vs `chat_stream_*`
+    /// label family (`TurnSetup` does not carry streaming-ness).
+    /// Whole-turn override paths (vision/paged/MTP) never consult it.
+    turn_is_streaming: Cell<bool>,
+    /// Sampling + stop-token defaults parsed from the checkpoint's
+    /// `generation_config.json` at load time. Empty for checkpoints that
+    /// ship no such file. Consumed by the [`ChatBackend`] sampling/EOS
+    /// hooks and the raw `generate` loop.
+    gen_defaults: crate::engine::ModelGenerationDefaults,
 }
 
 /// Commands dispatched from NAPI methods to the dedicated model thread.
 pub(crate) enum Qwen35Cmd {
-    /// Start a new session via the text-only jinja-render path with
-    /// `<|im_end|>` as the stop token. See
-    /// [`Qwen35Inner::chat_session_start_sync`] for the behavioural
-    /// contract (full cache reset, text-only, session boundary).
-    ChatSessionStart {
-        messages: Vec<ChatMessage>,
-        config: ChatConfig,
-        reply: ResponseTx<ChatResult>,
-    },
-    /// Continue an existing session by appending a user turn. See
-    /// [`Qwen35Inner::chat_session_continue_sync`] — builds a raw ChatML
-    /// delta from `user_message`, tokenizes it, and prefills on top of
-    /// the live caches.
-    ///
-    /// `images` is an opt-in guard parameter: non-empty input is rejected
-    /// with an `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:`-prefixed error so
-    /// the TS `ChatSession` layer can route image-changes back through a
-    /// fresh `chat_session_start`.
-    ChatSessionContinue {
-        user_message: String,
-        images: Option<Vec<Uint8Array>>,
-        config: ChatConfig,
-        reply: ResponseTx<ChatResult>,
-    },
-    /// Continue an existing session with a tool-result delta. See
-    /// [`Qwen35Inner::chat_session_continue_tool_sync`] — builds a
-    /// ChatML `<tool_response>` delta and prefills on top of the live
-    /// caches.
-    ///
-    /// `is_error` is the structured tool-error signal threaded through
-    /// from the NAPI surface (`chatSessionContinueTool(..., isError)`).
-    /// When `Some(true)`, the renderer prepends the shared
-    /// [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-    /// `<tool_response>` wrapper. `None` / `Some(false)` produce the
-    /// pre-feature byte-equal output.
-    ChatSessionContinueTool {
-        tool_call_id: String,
-        content: String,
-        is_error: Option<bool>,
-        config: ChatConfig,
-        reply: ResponseTx<ChatResult>,
-    },
-    /// Streaming session-start: same semantics as
-    /// [`ChatSessionStart`](Self::ChatSessionStart) but streams token
-    /// deltas through `stream_tx`.
-    ChatStreamSessionStart {
-        messages: Vec<ChatMessage>,
-        config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
-        cancelled: Arc<AtomicBool>,
-    },
-    /// Streaming session-continue: same semantics as
-    /// [`ChatSessionContinue`](Self::ChatSessionContinue) but streams
-    /// token deltas through `stream_tx`. Carries the same opt-in
-    /// `images` guard parameter.
-    ChatStreamSessionContinue {
-        user_message: String,
-        images: Option<Vec<Uint8Array>>,
-        config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
-        cancelled: Arc<AtomicBool>,
-    },
-    /// Streaming tool-result continuation: same semantics as
-    /// [`ChatSessionContinueTool`](Self::ChatSessionContinueTool) but
-    /// streams token deltas through `stream_tx`. Carries the same
-    /// structured `is_error` signal.
-    ChatStreamSessionContinueTool {
-        tool_call_id: String,
-        content: String,
-        is_error: Option<bool>,
-        config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
-        cancelled: Arc<AtomicBool>,
-    },
+    /// All chat-session traffic (sync + streaming starts/continues/tool
+    /// turns + cache reset), routed through the model-neutral engine
+    /// dispatcher ([`crate::engine::cmd::handle_chat_cmd`]) against the
+    /// [`ChatBackend`] impl on [`Qwen35Inner`]. The per-variant
+    /// behavioural contracts live on [`crate::engine::cmd::ChatCmd`].
+    Chat(ChatCmd),
     Generate {
         prompt_tokens: MxArray,
         config: Qwen3_5GenerationConfig,
         reply: ResponseTx<Qwen3_5GenerationResult>,
     },
-    ResetCaches {
-        reply: ResponseTx<()>,
-    },
     SaveModel {
         save_path: String,
         reply: ResponseTx<()>,
     },
-    // --- Training commands ---
-    InitTraining {
+    /// Training-session commands shared with the model-neutral engine. The
+    /// thread loop routes these to
+    /// [`crate::engine::cmd::handle_train_cmd`], which drives the
+    /// [`TrainBackend`] impl on [`Qwen35Inner`].
+    Train(TrainCmd),
+}
+
+impl FromChatCmd for Qwen35Cmd {
+    #[inline]
+    fn from_chat(cmd: ChatCmd) -> Self {
+        Qwen35Cmd::Chat(cmd)
+    }
+}
+
+impl FromTrainCmd for Qwen35Cmd {
+    #[inline]
+    fn from_train(cmd: TrainCmd) -> Self {
+        Qwen35Cmd::Train(cmd)
+    }
+}
+
+/// Training backend the model-neutral [`handle_train_cmd`] drives. Each
+/// method forwards to the inherent `*_sync_impl` body on [`Qwen35Inner`].
+impl TrainBackend for Qwen35Inner {
+    fn training_state_mut(
+        &mut self,
+    ) -> &mut Option<crate::training_state::ModelThreadTrainingState> {
+        &mut self.training_state
+    }
+
+    fn init_training_sync(
+        &mut self,
         config: Box<crate::grpo::engine::GRPOEngineConfig>,
         model_type: crate::training_model::ModelType,
-        reply: ResponseTx<()>,
-    },
-    GenerateForTraining {
-        prompts: Vec<Vec<crate::tokenizer::ChatMessage>>,
+    ) -> Result<()> {
+        self.init_training_sync_impl(*config, model_type)
+    }
+
+    fn generate_for_training_thread_sync(
+        &mut self,
+        prompts: Vec<Vec<ChatMessage>>,
         group_size: usize,
         gen_config: crate::models::qwen3::GenerationConfig,
         enable_thinking: Option<bool>,
-        tools: Option<Vec<crate::tokenizer::ToolDefinition>>,
-        reply: ResponseTx<crate::training_model::GenerationPlainData>,
-    },
-    TrainStepGRPO {
+        tools: Option<Vec<ToolDefinition>>,
+    ) -> Result<crate::training_model::GenerationPlainData> {
+        self.generate_for_training_thread_sync_impl(
+            prompts,
+            group_size,
+            gen_config,
+            enable_thinking,
+            tools,
+        )
+    }
+
+    fn train_step_grpo_sync(
+        &mut self,
         rewards: Vec<f64>,
         group_size: i32,
         loss_config: crate::grpo::loss::GRPOLossConfig,
         valid_indices: Option<Vec<usize>>,
-        reply: ResponseTx<crate::training_model::TrainStepPlainMetrics>,
-    },
-    /// Bump the training step counter without applying gradients
-    /// (used by engine skip paths that abort before training).
-    /// Also clears cached generation MxArrays.
-    /// Returns the new step.
-    BumpSkippedStep {
-        reply: ResponseTx<i64>,
-    },
-    /// Restore the training step counter (for resume from checkpoint).
-    /// Does not touch optimizer state — that's loaded via LoadOptimizerState.
-    SetTrainingStep {
-        step: i64,
-        reply: ResponseTx<()>,
-    },
-    /// Drop the training state on the model thread.
-    /// After this, InitTraining can be called again. No-op if no training state.
-    ResetTraining {
-        reply: ResponseTx<()>,
-    },
-    TrainStepSFT {
+    ) -> Result<crate::training_model::TrainStepPlainMetrics> {
+        self.train_step_grpo_sync_impl(rewards, group_size, loss_config, valid_indices)
+    }
+
+    fn train_step_sft_sync(
+        &mut self,
         input_ids: Vec<i32>,
         input_shape: Vec<i64>,
         labels: Vec<i32>,
         labels_shape: Vec<i64>,
         config: crate::sft::engine::SftEngineConfig,
-        reply: ResponseTx<crate::training_model::TrainStepPlainMetrics>,
-    },
-    SaveOptimizerState {
-        path: String,
-        reply: ResponseTx<()>,
-    },
-    LoadOptimizerState {
-        path: String,
-        reply: ResponseTx<()>,
-    },
+    ) -> Result<crate::training_model::TrainStepPlainMetrics> {
+        self.train_step_sft_sync_impl(input_ids, input_shape, labels, labels_shape, config)
+    }
+
+    fn save_optimizer_state_sync(&self, path: String) -> Result<()> {
+        self.save_optimizer_state_sync_impl(path)
+    }
+
+    fn load_optimizer_state_sync(&mut self, path: String) -> Result<()> {
+        self.load_optimizer_state_sync_impl(path)
+    }
 }
 
 /// Command handler for the dedicated model thread.
 pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
     match cmd {
-        Qwen35Cmd::ChatSessionStart {
-            messages,
-            config,
-            reply,
-        } => {
-            // NOTE: no per-request cache drain here. On a multi-model
-            // server the MLX allocator free-pool is process-wide, so
-            // flushing after a request on model A discards blocks about
-            // to be reused by model B. The TS idle sweeper in
-            // `@mlx-node/server` handles between-turn drains.
-            let _ = reply.send(inner.chat_session_start_sync(messages, config));
-        }
-        Qwen35Cmd::ChatSessionContinue {
-            user_message,
-            images,
-            config,
-            reply,
-        } => {
-            let _ = reply.send(inner.chat_session_continue_sync(user_message, images, config));
-        }
-        Qwen35Cmd::ChatSessionContinueTool {
-            tool_call_id,
-            content,
-            is_error,
-            config,
-            reply,
-        } => {
-            let _ = reply.send(inner.chat_session_continue_tool_sync(
-                tool_call_id,
-                content,
-                is_error,
-                config,
-            ));
-        }
-        Qwen35Cmd::ChatStreamSessionStart {
-            messages,
-            config,
-            stream_tx,
-            cancelled,
-        } => {
-            inner.chat_stream_session_start_sync(messages, config, stream_tx, cancelled);
-        }
-        Qwen35Cmd::ChatStreamSessionContinue {
-            user_message,
-            images,
-            config,
-            stream_tx,
-            cancelled,
-        } => {
-            inner.chat_stream_session_continue_sync(
-                user_message,
-                images,
-                config,
-                stream_tx,
-                cancelled,
-            );
-        }
-        Qwen35Cmd::ChatStreamSessionContinueTool {
-            tool_call_id,
-            content,
-            is_error,
-            stream_tx,
-            config,
-            cancelled,
-        } => {
-            inner.chat_stream_session_continue_tool_sync(
-                tool_call_id,
-                content,
-                is_error,
-                config,
-                stream_tx,
-                cancelled,
-            );
+        // All chat-session traffic routes through the model-neutral
+        // engine dispatcher against `Qwen35Inner`'s `ChatBackend` impl.
+        // (The engine dispatcher carries the historical NOTE forward: no
+        // per-request cache drain here — the TS idle sweeper in
+        // `@mlx-node/server` handles between-turn drains.)
+        Qwen35Cmd::Chat(chat_cmd) => {
+            handle_chat_cmd(inner, chat_cmd);
         }
         Qwen35Cmd::Generate {
             prompt_tokens,
@@ -577,98 +436,12 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
         } => {
             let _ = reply.send(inner.generate_sync(prompt_tokens, config));
         }
-        Qwen35Cmd::ResetCaches { reply } => {
-            let _ = reply.send(inner.reset_caches_sync());
-        }
         Qwen35Cmd::SaveModel { save_path, reply } => {
             let _ = reply.send(inner.save_model_sync(&save_path));
         }
         // --- Training commands ---
-        Qwen35Cmd::InitTraining {
-            config,
-            model_type,
-            reply,
-        } => {
-            let _ = reply.send(inner.init_training_sync(*config, model_type));
-        }
-        Qwen35Cmd::GenerateForTraining {
-            prompts,
-            group_size,
-            gen_config,
-            enable_thinking,
-            tools,
-            reply,
-        } => {
-            let _ = reply.send(inner.generate_for_training_thread_sync(
-                prompts,
-                group_size,
-                gen_config,
-                enable_thinking,
-                tools,
-            ));
-        }
-        Qwen35Cmd::TrainStepGRPO {
-            rewards,
-            group_size,
-            loss_config,
-            valid_indices,
-            reply,
-        } => {
-            let _ = reply.send(inner.train_step_grpo_sync(
-                rewards,
-                group_size,
-                loss_config,
-                valid_indices,
-            ));
-        }
-        Qwen35Cmd::BumpSkippedStep { reply } => {
-            let result = if let Some(ref mut ts) = inner.training_state {
-                ts.clear_generation_cache();
-                ts.step += 1;
-                Ok(ts.step)
-            } else {
-                Err(napi::Error::from_reason(
-                    "Training state not initialized. Call InitTraining first.",
-                ))
-            };
-            let _ = reply.send(result);
-        }
-        Qwen35Cmd::SetTrainingStep { step, reply } => {
-            let result = if let Some(ref mut ts) = inner.training_state {
-                ts.step = step;
-                Ok(())
-            } else {
-                Err(napi::Error::from_reason(
-                    "Training state not initialized. Call InitTraining first.",
-                ))
-            };
-            let _ = reply.send(result);
-        }
-        Qwen35Cmd::ResetTraining { reply } => {
-            inner.training_state = None;
-            let _ = reply.send(Ok(()));
-        }
-        Qwen35Cmd::TrainStepSFT {
-            input_ids,
-            input_shape,
-            labels,
-            labels_shape,
-            config,
-            reply,
-        } => {
-            let _ = reply.send(inner.train_step_sft_sync(
-                input_ids,
-                input_shape,
-                labels,
-                labels_shape,
-                config,
-            ));
-        }
-        Qwen35Cmd::SaveOptimizerState { path, reply } => {
-            let _ = reply.send(inner.save_optimizer_state_sync(path));
-        }
-        Qwen35Cmd::LoadOptimizerState { path, reply } => {
-            let _ = reply.send(inner.load_optimizer_state_sync(path));
+        Qwen35Cmd::Train(train_cmd) => {
+            handle_train_cmd(inner, train_cmd);
         }
     }
 }
@@ -677,27 +450,21 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
 ///
 /// Packs every value the shared post-prefill pipeline needs into a single
 /// named struct so callers don't have to thread 20+ positional arguments.
-/// Constructed by the prefill-side of [`Qwen35Inner::chat_sync_core`] and
+/// Constructed by the prefill-side of [`Qwen35Inner::vision_mtp_whole_turn_core`] and
 /// [`Qwen35Inner::chat_tokens_delta_sync`].
 ///
 /// The caller is responsible for:
-///   - acquiring `COMPILED_LIFECYCLE_MUTEX` and `COMPILED_WEIGHTS_RWLOCK` in
-///     the correct order (when `use_compiled == true`),
 ///   - constructing a `WiredLimitContext` tied to `generation_stream` for
 ///     the lifetime of the call,
-///   - running prefill and packaging the resulting `last_logits`,
-///     `seq_len`, and `vlm_compiled_init_done`.
+///   - running prefill and packaging the resulting `last_logits` and
+///     `seq_len`.
 pub(crate) struct ChatDecodeInputs {
     // --- Prefill outputs -------------------------------------------------
     /// Logits for the last position of the prefill chunk. Penalties and
     /// sampling run against this to produce the first decoded token.
     pub last_logits: MxArray,
     /// Total context length after prefill (cached + newly-prefilled).
-    /// Used to compute the compiled path's `max_kv_len`.
     pub seq_len: i64,
-    /// `true` when the VLM prefill has already run the compiled init.
-    /// `false` for text-only paths and the session delta path.
-    pub vlm_compiled_init_done: bool,
     /// `true` when this invocation is a session DELTA continuation
     /// (text-only append on top of the live KV cache). Drives the
     /// post-decode save pathway: deltas keep `cached_image_key` sticky
@@ -706,15 +473,8 @@ pub(crate) struct ChatDecodeInputs {
     /// the fresh turn's `has_images`.
     pub is_delta: bool,
 
-    // --- Compiled-path state --------------------------------------------
-    /// `true` when this model owns the compiled weights and the compiled
-    /// forward path is usable for decode.
-    pub use_compiled: bool,
     /// `true` when the current turn carries images.
     pub has_images: bool,
-    /// Length of the cached prefix that the prefill reused. Only
-    /// consulted by the VLM rope-delta replay branch.
-    pub cached_prefix_len: usize,
 
     // --- Token bookkeeping ----------------------------------------------
     /// Full pre-decode token sequence. Seeds the decode loop's running
@@ -734,8 +494,11 @@ pub(crate) struct ChatDecodeInputs {
     pub tokenizer: Arc<Qwen3Tokenizer>,
     pub think_end_id: Option<u32>,
     pub think_end_str: Option<String>,
-    pub enable_thinking: Option<bool>,
-    /// End-of-sequence token id for the decode loop. For `chat_sync_core` this
+    /// Resolved thinking-mode state for the turn — the single source of
+    /// truth, threaded from `WholeTurnArgs::thinking` so the cores share
+    /// one `resolve_enable_thinking` result.
+    pub thinking: ThinkingSetup,
+    /// End-of-sequence token id for the decode loop. For `vision_mtp_whole_turn_core` this
     /// is `config.eos_token_id`; for the session delta path it's
     /// `<|im_end|>` so cache boundaries stay clean.
     pub eos_id: u32,
@@ -762,7 +525,7 @@ pub(crate) struct ChatDecodeInputs {
     pub embedding_weight: MxArray,
     pub embedding_weight_t: MxArray,
     pub generation_stream: Stream,
-    pub params: super::chat_common::ChatParams,
+    pub params: crate::engine::ChatParams,
 
     // --- prompt-prefix MTP prefill --------------------------------------
     /// Post-final-norm hidden state for every prefilled prompt token,
@@ -810,13 +573,12 @@ impl Qwen35Inner {
 
         let model_id = QWEN35_MODEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
 
-        // Block-paged KV adapter — opt-in via `use_block_paged_cache`.
+        // Block-paged KV adapter — selected by `use_block_paged_cache`.
         //
-        // VLM checkpoints can co-exist with paged dispatch for
-        // text-only inference: the M-RoPE / vision-feature path is
-        // only invoked when an input message carries images, and the
-        // chat-entry sites reject `has_images && paged_adapter` at
-        // runtime. Text-only forward (`Qwen3_5Attention::forward` with
+        // VLM checkpoints default this flag ON at load (see `parse_config`):
+        // dense image turns ONLY run on the paged-vision core, and the
+        // chat-entry sites error a vision turn that reaches a None adapter.
+        // Text-only forward (`Qwen3_5Attention::forward` with
         // `position_ids = None`) and the paged forward
         // (`Qwen3_5Attention::forward_paged`) both go through standard
         // `self.rope`, so byte-equal parity holds on text-only inputs
@@ -826,7 +588,7 @@ impl Qwen35Inner {
         // adapter None so dispatch falls through to flat eager instead of hitting
         // the throwing CUDA stubs. macOS keeps building it (probe always true).
         let paged_adapter = if config.use_block_paged_cache.unwrap_or(false)
-            && crate::models::qwen3_5::persistence_common::compiled_forward_backend_available()
+            && crate::engine::persistence::compiled_forward_backend_available()
         {
             let attn_layer_count = config.full_attention_layer_count() as u32;
             if attn_layer_count == 0 {
@@ -927,10 +689,19 @@ impl Qwen35Inner {
             gdn_last_history_checkpoint: None,
             paged_adapter,
             paged_full_attn_caches_dirty: false,
+            flat_mtp_caches_desynced: false,
             training_state: None,
             mtp,
             mtp_weights_loaded: false,
+            turn_is_streaming: Cell::new(false),
+            gen_defaults: crate::engine::ModelGenerationDefaults::default(),
         })
+    }
+
+    /// Store the checkpoint's parsed `generation_config.json` defaults.
+    /// Called once at load time after construction.
+    pub(crate) fn set_gen_defaults(&mut self, defaults: crate::engine::ModelGenerationDefaults) {
+        self.gen_defaults = defaults;
     }
 
     /// Initialize KV caches.
@@ -1526,7 +1297,7 @@ impl Qwen35Inner {
     /// the paged dispatch. The actual incompatibility is the
     /// M-RoPE / vision-feature plumbing on the paged forward path,
     /// which only fires when an input message carries images. The
-    /// chat-entry sites (`chat_sync_core`, `chat_stream_sync_inner`,
+    /// chat-entry sites (`vision_mtp_whole_turn_core`, `chat_stream_sync_inner`,
     /// and the MoE counterparts) reject `has_images && paged_adapter`
     /// before dispatching, so text-only paged turns proceed normally
     /// while image turns surface a clear runtime error.
@@ -1574,91 +1345,23 @@ impl Qwen35Inner {
         Ok(())
     }
 
-    /// Start a new chat session.
-    ///
-    /// Delegates to [`Self::chat_sync_core`] with `<|im_end|>` (from the
-    /// tokenizer vocab) as the stop token so the cached history ends on a
-    /// clean ChatML boundary that subsequent `chat_session_continue_sync`
-    /// / [`Self::chat_tokens_delta_sync`] calls can append a raw delta on
-    /// top of without re-rendering the jinja template.
-    ///
-    /// This method does not reset the caches up-front. The core path runs
-    /// `verify_cache_prefix_direct`
-    /// against the freshly-tokenized prompt and reuses the cached prefix
-    /// on an exact-append hit or resets + fully prefills on a miss. This
-    /// is what enables prefix-cache reuse for stateless agent clients
-    /// that resend the full transcript on every turn. See the matching
-    /// block comment in the method body for the GDN-safety rationale.
-    ///
-    /// Images are accepted on session start — the downstream
-    /// [`Self::chat_sync_core`] already handles the VLM prefill path
-    /// (vision encoder, image cache key, expanded tokens). Subsequent
-    /// turns in the same session MUST go through `chat_session_continue_sync`
-    /// which is text-only; changing the image set mid-session requires
-    /// starting a new session via this method again.
-    pub(crate) fn chat_session_start_sync(
-        &mut self,
-        messages: Vec<ChatMessage>,
-        config: ChatConfig,
-    ) -> Result<ChatResult> {
-        // Mirror the symmetric guard in `chat_tokens_delta_sync`. The session
-        // API only makes sense with cache reuse enabled: if we silently accept
-        // `reuse_cache = false` here, the post-decode `save_cache_state_direct`
-        // path wipes the caches we just populated, and the next
-        // `chat_session_continue` call fails with a cryptic "missing session"
-        // error. Fail fast before mutating any state.
-        if config.reuse_cache == Some(false) {
-            return Err(Error::from_reason(
-                "chat_session_start requires reuse_cache=true (pass ChatConfig { reuse_cache: Some(true), .. } or leave as None). The session API only makes sense with cache reuse enabled.",
-            ));
-        }
-
-        let tokenizer = self
-            .tokenizer
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
-            .clone();
-        let im_end_id = tokenizer
-            .im_end_id()
-            .ok_or_else(|| Error::from_reason("Tokenizer missing <|im_end|> special token"))?;
-
-        // Prefix-cache reuse contract: the caches may carry state from a
-        // prior session-start turn. `chat_sync_core` runs
-        // `verify_cache_prefix_direct` against the freshly-tokenized prompt
-        // and either (a) reuses the cached prefix and prefills only the
-        // trailing delta (exact-append hit) or (b) resets + fully prefills
-        // from scratch on a cache miss. Driving the reset from inside the
-        // core — rather than wiping up-front here — is what lets
-        // stateless-agent clients (Aider, Codex CLI, pi-mono, etc.) that
-        // resend the full transcript on every turn avoid paying an O(N)
-        // prefill cost on every turn.
-        //
-        // Safety: the invariant on `verify_cache_prefix_direct` (returns
-        // either `0` or the full cached length — never an intermediate
-        // value) guarantees a non-zero hit means the new tokens are a
-        // pure *append* on the live caches, so Qwen3.5's GDN linear-
-        // attention layers (whose recurrent state cannot be rewound
-        // mid-sequence) stay consistent without any snapshot
-        // machinery. See the rustdoc on `verify_cache_prefix_direct`.
-
-        self.chat_sync_core(messages, config, im_end_id)
-    }
-
     /// Core synchronous chat implementation (runs on the model thread).
     ///
-    /// Shared jinja rendering + prefill + decode plumbing for the session
-    /// surface. `eos_token_id` is the caller-supplied stop-on token id
-    /// (`<|im_end|>` for ChatML boundaries) so the cached history ends on
-    /// a clean delimiter that subsequent session-delta turns can append
-    /// to.
-    ///
-    /// Only called from [`Self::chat_session_start_sync`]; there is no
-    /// longer a non-session entry point.
-    fn chat_sync_core(
+    /// Whole-turn core for fresh SYNC turns reached through the engine's
+    /// `vision_turn` (image-bearing) and `mtp_turn` (MTP-enabled) probes.
+    /// The engine already rendered the prompt (`tokens`) and extracted the
+    /// raw image payloads (`images`); everything from the paged dispatch
+    /// onward runs the whole-turn pipeline. `eos_token_id` is the
+    /// caller-supplied stop-on token id (`<|im_end|>` for ChatML
+    /// boundaries) so the cached history ends on a clean delimiter that
+    /// subsequent session-delta turns can append to.
+    fn vision_mtp_whole_turn_core(
         &mut self,
-        messages: Vec<ChatMessage>,
+        tokens: Vec<u32>,
+        images: &[Vec<u8>],
         config: ChatConfig,
         eos_token_id: u32,
+        thinking: ThinkingSetup,
     ) -> Result<ChatResult> {
         let reuse_cache = config.reuse_cache.unwrap_or(true);
         let report_perf = config.report_performance.unwrap_or(false);
@@ -1669,24 +1372,13 @@ impl Qwen35Inner {
             .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
             .clone();
 
-        let has_images = messages
-            .iter()
-            .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()));
+        let has_images = !images.is_empty();
 
         let think_end_id = tokenizer.think_end_id();
         let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
 
-        let tool_defs = config.tools.as_deref();
-        let enable_thinking = chat_common::resolve_enable_thinking(&config);
-        let tokens = tokenizer.apply_chat_template_sync(
-            &messages,
-            Some(true),
-            tool_defs,
-            enable_thinking,
-        )?;
-
-        let p = extract_chat_params(&config);
-        let max_new_tokens = p.max_new_tokens;
+        let mut p = extract_chat_params(&config);
+        p.extra_eos_ids = self.gen_defaults.eos_token_ids.clone();
 
         let generation_start = if report_perf {
             Some(std::time::Instant::now())
@@ -1695,82 +1387,68 @@ impl Qwen35Inner {
         };
         let first_token_instant: Option<std::time::Instant> = None;
 
-        let model_id = self.model_id;
-
         // Paged dispatch with native MTP support; the paged path self-handles
-        // MTP via the gate inside `chat_sync_core_paged_inner`.
+        // MTP via the gate inside `paged_turn_sync_core_inner`.
         if self.paged_adapter.is_some() {
             if has_images {
-                return Err(Error::from_reason(
-                    "Qwen3.5 paged dispatch is text-only; image-bearing turns require \
-                     use_block_paged_cache=false (text-only turns continue to work).",
-                ));
+                // All image turns prefill through the paged-vision core, which
+                // runs plain autoregressive decode. MTP weights are ignored
+                // here (the core has no draft/verify), so an MTP-enabled
+                // session decodes cleanly as AR.
+                return self.vision_paged_turn_sync_core(
+                    tokens,
+                    images,
+                    tokenizer,
+                    eos_token_id,
+                    p,
+                    report_perf,
+                    thinking,
+                );
             }
-            return self.chat_sync_core_paged(tokens, tokenizer, eos_token_id, p, report_perf);
+            return self.paged_turn_sync_core(
+                tokens,
+                tokenizer,
+                eos_token_id,
+                p,
+                report_perf,
+                thinking,
+            );
         }
 
-        // Check if compiled path will be used
-        let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
-
-        // Serialize compiled lifecycle across model instances
-        let _compiled_lock = if use_compiled {
-            Some(
-                COMPILED_LIFECYCLE_MUTEX
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()),
-            )
-        } else {
-            None
-        };
-
-        // Re-validate compiled path under weight lock
-        let mut _weight_guard = None;
-        let use_compiled = if use_compiled {
-            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
-            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
-                _weight_guard = Some(guard);
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
+        // The flat fallback below is text-only. A dense image turn requires the
+        // block-paged backend; reaching here with images means the model was
+        // loaded without a paged adapter (use_block_paged_cache=false, non-Metal
+        // build, or a sym8 checkpoint).
+        if has_images {
+            return Err(Error::from_reason(
+                "qwen3.5 dense image turns require the block-paged KV backend; the model was \
+                 loaded without a paged adapter (use_block_paged_cache=false, non-Metal build, \
+                 or sym8 checkpoint)",
+            ));
+        }
 
         let embedding_weight = self.embedding.get_weight();
 
-        // === VLM image processing ===
-        let sms = self.spatial_merge_size.unwrap_or(2);
-        let (expanded_tokens, current_image_cache_key, vlm_processed) = if has_images {
-            if let (Some(_vision_enc), Some(img_proc)) =
-                (self.vision_encoder.as_ref(), self.image_processor.as_ref())
-            {
-                let all_images = extract_images_from_messages(&messages);
-                let image_refs: Vec<&[u8]> = all_images.iter().map(|v| v.as_slice()).collect();
-                let processed_pre = img_proc.process_many(&image_refs)?;
-                let per_image_token_counts =
-                    compute_image_token_counts_per_image(&processed_pre.grid_thw(), sms)?;
-                let expanded = inject_image_placeholders(&tokens, &per_image_token_counts);
-                let cache_key = compute_image_cache_key(&all_images);
-                (expanded, cache_key, Some(processed_pre))
-            } else {
-                (tokens.clone(), 0u64, None)
-            }
-        } else {
-            (tokens.clone(), 0u64, None)
-        };
+        // Text-only from here: the `has_images` early-return above is the only
+        // image path. These bindings preserve the shared cache-reuse / decode
+        // plumbing (`has_images` is always false on this branch).
+        let (expanded_tokens, current_image_cache_key) = (tokens.clone(), 0u64);
 
         // === Cache reuse: prefix verification ===
-        let cached_prefix_len = verify_cache_prefix_direct(
-            reuse_cache,
-            has_images,
-            &tokens,
-            &expanded_tokens,
-            current_image_cache_key,
-            &self.cached_token_history,
-            &self.cached_image_key,
-            self.caches.is_some(),
-        );
+        let cached_prefix_len = if self.flat_mtp_caches_desynced {
+            0
+        } else {
+            verify_cache_prefix_direct(
+                reuse_cache,
+                has_images,
+                &tokens,
+                &expanded_tokens,
+                current_image_cache_key,
+                &self.cached_token_history,
+                &self.cached_image_key,
+                self.caches.is_some(),
+            )
+        };
 
         let prefill_tokens = if cached_prefix_len > 0 {
             if has_images {
@@ -1889,52 +1567,14 @@ impl Qwen35Inner {
         // (it starts empty and builds from decode tokens — correct).
         let want_prompt_hidden = p.enable_mtp
             && self.has_mtp_weights()
-            && !chat_common::mtp_no_prompt_prefill()
+            && !mtp_decode::mtp_no_prompt_prefill()
             && cached_prefix_len == 0;
-        let mtp_prompt_history = chat_common::mtp_prompt_history_selection(prefill_tokens.len());
+        let mtp_prompt_history = mtp_decode::mtp_prompt_history_selection(prefill_tokens.len());
 
-        // === VLM or text prefill branching ===
+        // === Text prefill ===
         profiler.begin_prefill();
         let mut prompt_hidden: Option<MxArray> = None;
-        let (last_logits, seq_len, vlm_compiled_init_done) = if has_images && cached_prefix_len == 0
-        {
-            if let Some(vision_enc) = self.vision_encoder.clone() {
-                let final_tokens = &expanded_tokens;
-                let processed = vlm_processed
-                    .as_ref()
-                    .ok_or_else(|| Error::from_reason("VLM processed images missing"))?;
-
-                let input_ids =
-                    MxArray::from_uint32(final_tokens, &[1, final_tokens.len() as i64])?;
-
-                let (logits, rope_deltas, vlm_compiled) = vlm_prefill(
-                    &input_ids,
-                    current_image_cache_key,
-                    processed,
-                    &vision_enc,
-                    sms,
-                    &embedding_weight,
-                    &mut self.layers,
-                    &mut self.caches,
-                    &self.final_norm,
-                    &self.lm_head,
-                    &self.config,
-                    max_new_tokens,
-                    generation_stream,
-                    &self.vision_cache,
-                    model_id,
-                )?;
-
-                self.cached_rope_deltas = Some(rope_deltas as i32);
-
-                let vlm_seq_len = final_tokens.len() as i64;
-                (logits, vlm_seq_len, vlm_compiled)
-            } else {
-                return Err(Error::from_reason(
-                    "VLM prefill requested but vision encoder/processor not loaded",
-                ));
-            }
-        } else {
+        let (last_logits, seq_len) = {
             let prompt = MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
             let last_logits = if want_prompt_hidden {
                 let (logits, ph) = chunked_prefill_with_hidden(
@@ -1963,14 +1603,11 @@ impl Qwen35Inner {
                 )?
             };
 
-            let total_seq_len = if has_images {
-                expanded_tokens.len() as i64
-            } else {
-                tokens.len() as i64
-            };
-            (last_logits, total_seq_len, false)
+            (last_logits, tokens.len() as i64)
         };
         profiler.end_prefill();
+        // caches now reflect the prefilled history
+        self.flat_mtp_caches_desynced = false;
 
         let prompt_tokens_for_result = if has_images {
             expanded_tokens.len() as u32
@@ -1987,11 +1624,8 @@ impl Qwen35Inner {
         self.chat_with_caches_inner(ChatDecodeInputs {
             last_logits,
             seq_len,
-            vlm_compiled_init_done,
             is_delta: false,
-            use_compiled,
             has_images,
-            cached_prefix_len,
             token_history_init: tokens.clone(),
             save_tokens: tokens,
             save_expanded_tokens,
@@ -1999,7 +1633,7 @@ impl Qwen35Inner {
             tokenizer,
             think_end_id,
             think_end_str,
-            enable_thinking,
+            thinking,
             eos_id,
             profiler,
             generation_start,
@@ -2038,15 +1672,18 @@ impl Qwen35Inner {
     ///   of `config.eos_token_id`, yielding clean cache boundaries for the next
     ///   turn's delta,
     /// - resolves `enable_thinking` from `config.reasoning_effort` via
-    ///   `chat_common::resolve_enable_thinking`,
+    ///   `engine::resolve_enable_thinking`,
     /// - is text-only: errors if the session has images.
     ///
     /// Requires a live session: `self.caches` must have been initialized by a
-    /// prior [`Self::chat_session_start_sync`] call. Errors otherwise.
+    /// prior session-start turn. Errors otherwise. (The engine's delta
+    /// guards already enforce this; the checks here are defense-in-depth
+    /// for the `mtp_turn` caller.)
     pub(crate) fn chat_tokens_delta_sync(
         &mut self,
         delta_tokens: Vec<u32>,
         config: ChatConfig,
+        thinking: ThinkingSetup,
     ) -> Result<ChatResult> {
         // The delta path is a session-reuse operation by construction: it
         // prefills on top of the existing caches. `reuse_cache = Some(false)`
@@ -2104,8 +1741,8 @@ impl Qwen35Inner {
         let mut full_token_history = self.cached_token_history.clone();
         full_token_history.extend(delta_tokens.iter().copied());
 
-        let p = extract_chat_params(&config);
-        let enable_thinking = chat_common::resolve_enable_thinking(&config);
+        let mut p = extract_chat_params(&config);
+        p.extra_eos_ids = self.gen_defaults.eos_token_ids.clone();
 
         let generation_start = if report_perf {
             Some(std::time::Instant::now())
@@ -2114,44 +1751,18 @@ impl Qwen35Inner {
         };
         let first_token_instant: Option<std::time::Instant> = None;
 
-        let model_id = self.model_id;
-
         // Paged dispatch with native MTP support inside
-        // `chat_sync_core_paged_inner`.
+        // `paged_turn_sync_core_inner`.
         if self.paged_adapter.is_some() {
-            return self.chat_sync_core_paged(
+            return self.paged_turn_sync_core(
                 full_token_history.clone(),
                 tokenizer.clone(),
                 eos_id,
                 p,
                 report_perf,
+                thinking,
             );
         }
-
-        // Check compiled path availability (same contract as chat_sync_core).
-        let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
-        let _compiled_lock = if use_compiled {
-            Some(
-                COMPILED_LIFECYCLE_MUTEX
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()),
-            )
-        } else {
-            None
-        };
-
-        let mut _weight_guard = None;
-        let use_compiled = if use_compiled {
-            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
-            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
-                _weight_guard = Some(guard);
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
 
         let embedding_weight = self.embedding.get_weight();
         let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
@@ -2166,33 +1777,51 @@ impl Qwen35Inner {
 
         // Text-only prefill of the delta on top of the existing caches.
         profiler.begin_prefill();
-        let prompt = MxArray::from_uint32(&delta_tokens, &[1, delta_tokens.len() as i64])?;
-        let last_logits = chunked_prefill(
-            &prompt,
-            &embedding_weight,
-            &mut self.layers,
-            &mut self.caches,
-            &self.final_norm,
-            &self.lm_head,
-            Some(&embedding_weight_t),
-            generation_stream,
-        )?;
+        let last_logits = if self.flat_mtp_caches_desynced {
+            // A prior eager-MTP turn stopped mid-cycle, leaving self.caches
+            // advanced past the emitted history; GDN state cannot be rewound,
+            // so discard and re-prefill the full conversation into fresh caches.
+            self.caches = Some(fresh_dense_layer_caches(&self.config));
+            profiler.set_prompt_tokens(full_token_history.len() as u32);
+            let prompt =
+                MxArray::from_uint32(&full_token_history, &[1, full_token_history.len() as i64])?;
+            let logits = chunked_prefill(
+                &prompt,
+                &embedding_weight,
+                &mut self.layers,
+                &mut self.caches,
+                &self.final_norm,
+                &self.lm_head,
+                Some(&embedding_weight_t),
+                generation_stream,
+            )?;
+            self.flat_mtp_caches_desynced = false;
+            logits
+        } else {
+            let prompt = MxArray::from_uint32(&delta_tokens, &[1, delta_tokens.len() as i64])?;
+            chunked_prefill(
+                &prompt,
+                &embedding_weight,
+                &mut self.layers,
+                &mut self.caches,
+                &self.final_norm,
+                &self.lm_head,
+                Some(&embedding_weight_t),
+                generation_stream,
+            )?
+        };
         // Total context length post-prefill = full history length.
         let total_seq_len = full_token_history.len() as i64;
         profiler.end_prefill();
 
         let prompt_tokens_for_result = full_token_history.len() as u32;
 
-        // For the delta path there is no cached_prefix_len distinction for
-        // the prefill branching — the caches already reflect the entire
-        // prior history. However, for ChatResult observability we report
-        // the cached-prefix length so clients can see the session delta
-        // reused the full history. `prior_cached_len` feeds the reported
-        // `cached_tokens`; `cached_prefix_len` stays 0 so the VLM
-        // rope-deltas re-apply branch inside the decode helper is
-        // skipped (text-only delta anyway).
+        // For the delta path the caches already reflect the entire prior
+        // history. For ChatResult observability we still report the
+        // cached-prefix length so clients can see the session delta reused
+        // the full history: `prior_cached_len` feeds the reported
+        // `cached_tokens`.
         let prior_cached_len = full_token_history.len().saturating_sub(delta_tokens.len());
-        let cached_prefix_len = 0usize;
 
         // For cache save, pass the full token history (cached + delta) as
         // `save_tokens`; the helper / `save_cache_state_direct` will append
@@ -2202,11 +1831,8 @@ impl Qwen35Inner {
         self.chat_with_caches_inner(ChatDecodeInputs {
             last_logits,
             seq_len: total_seq_len,
-            vlm_compiled_init_done: false,
             is_delta: true,
-            use_compiled,
             has_images: false,
-            cached_prefix_len,
             token_history_init: full_token_history,
             save_tokens,
             save_expanded_tokens: None,
@@ -2214,7 +1840,7 @@ impl Qwen35Inner {
             tokenizer,
             think_end_id,
             think_end_str,
-            enable_thinking,
+            thinking,
             eos_id,
             profiler,
             generation_start,
@@ -2236,138 +1862,28 @@ impl Qwen35Inner {
         })
     }
 
-    /// Session-based chat continuation via a plain user message string.
-    ///
-    /// Convenience entry point on top of `chat_tokens_delta_sync`: builds the
-    /// ChatML delta that closes the previous assistant turn (the cache ended
-    /// on `<|im_end|>` courtesy of `chat_session_start_sync`), opens a new
-    /// user turn with `user_message`, and opens a fresh assistant turn.
-    /// Then tokenizes the delta and delegates to `chat_tokens_delta_sync`.
-    ///
-    /// The delta is built manually (NOT via jinja) to keep prefix stability
-    /// against the cached state: re-rendering the full conversation through
-    /// jinja would tokenize differently than the accumulated cache and break
-    /// the prefix match that makes session reuse correct.
-    ///
-    /// Text-only; errors propagate from `chat_tokens_delta_sync`.
-    ///
-    /// `images` is an opt-in guard parameter: non-empty input is rejected
-    /// with an `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:`-prefixed error so
-    /// the TS `ChatSession` layer can catch the prefix and route
-    /// image-changes back through a fresh `chat_session_start_sync`. A
-    /// `None`/empty vector takes the normal text-only delta path.
-    pub(crate) fn chat_session_continue_sync(
-        &mut self,
-        user_message: String,
-        images: Option<Vec<Uint8Array>>,
-        config: ChatConfig,
-    ) -> Result<ChatResult> {
-        if images.as_ref().is_some_and(|v| !v.is_empty()) {
-            return Err(Error::from_reason(format!(
-                "{} chat_session_continue is text-only; start a new session with chat_session_start to change the image",
-                chat_common::IMAGE_CHANGE_RESTART_PREFIX
-            )));
-        }
-
-        let tokenizer = self
-            .tokenizer
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
-            .clone();
-
-        // Match `chat_sync_core`'s sanitization so the session path is subject to
-        // the same role/content injection protection as the legacy path.
-        // The delta is text-only — images are stripped here anyway because
-        // they are never valid on the session continue path.
-        let synthetic = build_synthetic_user_message(&user_message);
-        let sanitized = Qwen3Tokenizer::sanitize_messages_public(std::slice::from_ref(&synthetic));
-        let sanitized_user = &sanitized[0].content;
-
-        // Build the delta in ChatML wire format. See
-        // `chat_common::build_chatml_continue_delta_text` for the exact
-        // wire format and thinking-prefix semantics.
-        let enable_thinking = chat_common::resolve_enable_thinking(&config);
-        let delta_text = build_chatml_continue_delta_text(sanitized_user, enable_thinking);
-
-        // `add_special_tokens: Some(false)` — we do NOT want the tokenizer
-        // auto-prepending BOS. The delta is already a raw ChatML snippet.
-        let delta_tokens = tokenizer.encode_sync(&delta_text, Some(false))?;
-
-        self.chat_tokens_delta_sync(delta_tokens, config)
-    }
-
-    /// Session-based chat continuation via a tool-result turn.
-    ///
-    /// Builds a ChatML `<tool_response>`-wrapped delta from `content`
-    /// (see [`chat_common::build_chatml_tool_delta_text`] for the exact
-    /// wire format) and prefills it on top of the live session caches.
-    /// The `tool_call_id` is currently ignored by the wire format —
-    /// Qwen3.5's chat template identifies tool responses by the
-    /// surrounding `<tool_response>` tags + position, not an explicit
-    /// id. Callers may still log it for their own bookkeeping.
-    ///
-    /// Text-only; delegates to [`Self::chat_tokens_delta_sync`] which
-    /// inherits the same text-only-delta invariant (errors if the
-    /// session currently holds image state).
-    ///
-    /// `is_error` is forwarded verbatim to
-    /// [`chat_common::build_chatml_tool_delta_text`]: `Some(true)` injects
-    /// the shared [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-    /// `<tool_response>` wrapper; `None` / `Some(false)` keep the
-    /// pre-feature byte-equal output.
-    pub(crate) fn chat_session_continue_tool_sync(
-        &mut self,
-        tool_call_id: String,
-        content: String,
-        is_error: Option<bool>,
-        config: ChatConfig,
-    ) -> Result<ChatResult> {
-        let tokenizer = self
-            .tokenizer
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
-            .clone();
-
-        let enable_thinking = chat_common::resolve_enable_thinking(&config);
-        let delta_text = chat_common::build_chatml_tool_delta_text(
-            &tool_call_id,
-            &content,
-            enable_thinking,
-            is_error,
-        );
-
-        let delta_tokens = tokenizer.encode_sync(&delta_text, Some(false))?;
-
-        self.chat_tokens_delta_sync(delta_tokens, config)
-    }
-
     /// Shared post-prefill pipeline: penalty → sample → compiled init (if needed)
     /// → decode loop → cache export → save cache state → finalize result.
     ///
-    /// Extracted from `chat_sync_core` so it can also be driven by the text-only
+    /// Extracted from `vision_mtp_whole_turn_core` so it can also be driven by the text-only
     /// session path (`chat_tokens_delta_sync`). Preserves the exact semantics
-    /// of `chat_sync_core` for the existing caller — `token_history_init` is the
+    /// of `vision_mtp_whole_turn_core` for the existing caller — `token_history_init` is the
     /// full pre-decode token sequence (used for penalty context and the decode
     /// loop's running history), and the decode loop mutates it in place.
     ///
     /// The caller is responsible for:
-    /// - Holding the `COMPILED_LIFECYCLE_MUTEX` / `COMPILED_WEIGHTS_RWLOCK` guards
-    ///   (when `inputs.use_compiled == true`) for the lifetime of this call.
     /// - Creating a `WiredLimitContext` tied to `inputs.generation_stream` for
     ///   the lifetime of this call.
-    /// - Running prefill and populating the resulting `last_logits`, `seq_len`,
-    ///   and `vlm_compiled_init_done` fields of `ChatDecodeInputs`.
+    /// - Running prefill and populating the resulting `last_logits` and
+    ///   `seq_len` fields of `ChatDecodeInputs`.
     /// - Pre-starting the profiler (`set_prompt_tokens`, `snapshot_memory_before`,
     ///   `begin_prefill`, `end_prefill`).
     fn chat_with_caches_inner(&mut self, inputs: ChatDecodeInputs) -> Result<ChatResult> {
         let ChatDecodeInputs {
             last_logits,
             seq_len,
-            vlm_compiled_init_done,
             is_delta,
-            use_compiled,
             has_images,
-            cached_prefix_len,
             token_history_init,
             save_tokens,
             save_expanded_tokens,
@@ -2375,7 +1891,7 @@ impl Qwen35Inner {
             tokenizer,
             think_end_id,
             think_end_str,
-            enable_thinking,
+            thinking,
             eos_id,
             mut profiler,
             generation_start,
@@ -2392,6 +1908,14 @@ impl Qwen35Inner {
             prompt_hidden_position_base,
         } = inputs;
 
+        // Pure-Rust ("eager") dense MTP. Gated on the same per-request /
+        // per-checkpoint preconditions (`enable_mtp`, MTP weights present),
+        // restricted to the dense FLAT path (no live paged adapter, text-only
+        // — the paged adapter has its own MTP gate and VLM routes through the
+        // text decode path).
+        let eager_mtp =
+            p.enable_mtp && self.has_mtp_weights() && self.paged_adapter.is_none() && !has_images;
+
         let mut generated_tokens: Vec<u32> = Vec::new();
         let mut finish_reason = String::from("length");
         let max_new_tokens = p.max_new_tokens;
@@ -2402,20 +1926,20 @@ impl Qwen35Inner {
         {
             let prefill_len = seq_len as i32;
             let max_kv_len_estimate =
-                chat_common::kv_capacity_round_up_saturating(prefill_len, max_new_tokens);
+                engine::kv_capacity_round_up_saturating(prefill_len, max_new_tokens);
             let has_mtp = self.has_mtp_weights();
-            let branch = if p.enable_mtp && has_mtp && use_compiled {
-                "MTP (will attempt init)"
+            let branch = if eager_mtp {
+                "MTP (eager)"
             } else if !p.enable_mtp {
                 "AR (enable_mtp=false)"
             } else if !has_mtp {
                 "AR (no MTP weights on model)"
             } else {
-                "AR (compiled path disabled)"
+                "AR"
             };
             info!(
                 "Qwen3.5 chat_decode entry: prompt_len={} max_new_tokens={} enable_mtp={} \
-                 mtp_depth={} prefill_seq_len={} max_kv_len={} use_compiled={} has_mtp_weights={} \
+                 mtp_depth={} prefill_seq_len={} max_kv_len={} has_mtp_weights={} \
                  is_delta={} has_images={} branch=\"{}\"",
                 token_history_init.len(),
                 max_new_tokens,
@@ -2423,7 +1947,6 @@ impl Qwen35Inner {
                 p.mtp_depth,
                 prefill_len,
                 max_kv_len_estimate,
-                use_compiled,
                 has_mtp,
                 is_delta,
                 has_images,
@@ -2435,485 +1958,73 @@ impl Qwen35Inner {
         let mut y = sample(&last_logits, p.sampling_config)?;
         MxArray::async_eval_arrays(&[&y]);
 
-        let _compiled_guard = if use_compiled {
-            Some(CompiledResetGuard)
-        } else {
-            None
-        };
-
         let mut token_history: Vec<u32> = token_history_init;
 
-        let mut reasoning_tracker = chat_common::ReasoningTracker::new(
-            enable_thinking.unwrap_or(true),
-            p.thinking_token_budget,
-            think_end_id,
-        );
+        let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
 
-        if use_compiled {
-            if vlm_compiled_init_done {
-                // VLM prefill already initialized compiled state
-            } else {
-                use mlx_sys as sys;
-                let prefill_len = seq_len as i32;
-                let max_kv_len = chat_common::kv_capacity_round_up(prefill_len, max_new_tokens)?;
-                let num_layers = self.config.num_layers as usize;
-                let mut cache_ptrs: Vec<*mut sys::mlx_array> =
-                    vec![std::ptr::null_mut(); num_layers * 2];
-                if let Some(ref caches) = self.caches {
-                    for (i, cache) in caches.iter().enumerate() {
-                        let (p0, p1) = cache.export_ptrs();
-                        cache_ptrs[i * 2] = p0;
-                        cache_ptrs[i * 2 + 1] = p1;
-                    }
-                }
-                unsafe {
-                    sys::mlx_qwen35_compiled_init_from_prefill(
-                        self.config.num_layers,
-                        self.config.hidden_size,
-                        self.config.num_heads,
-                        self.config.num_kv_heads,
-                        self.config.head_dim,
-                        self.config.rope_theta as f32,
-                        self.config.rope_dims(),
-                        self.config.rms_norm_eps as f32,
-                        self.config.full_attention_interval,
-                        self.config.linear_num_key_heads,
-                        self.config.linear_num_value_heads,
-                        self.config.linear_key_head_dim,
-                        self.config.linear_value_head_dim,
-                        self.config.linear_conv_kernel_dim,
-                        if self.config.tie_word_embeddings {
-                            1
-                        } else {
-                            0
-                        },
-                        max_kv_len,
-                        1,
-                        cache_ptrs.as_mut_ptr(),
-                        prefill_len,
-                    );
-                }
+        // Whether the final committed token reached the physical KV/GDN cache.
+        // The decode macros write `false` when they stop on an unforwarded
+        // token so the save below can drop it from `cached_token_history`.
+        let mut last_in_cache = true;
 
-                // Re-apply the saved M-RoPE offset when the compiled
-                // state is being (re)initialized from a KV cache that
-                // encodes image attention — see
-                // `chat_common::should_reapply_rope_delta`.
-                if let Some(delta) = self.cached_rope_deltas
-                    && chat_common::should_reapply_rope_delta(
-                        true,
-                        is_delta,
-                        has_images,
-                        cached_prefix_len,
-                    )
-                {
-                    unsafe {
-                        mlx_sys::mlx_qwen35_compiled_adjust_offset(delta);
-                    }
-                }
-            }
+        if eager_mtp {
+            // Pure-Rust eager dense MTP — the propose/verify whole-turn loop is
+            // engine-owned (`engine::run_mtp_turn`) and drives the
+            // `DenseMtpStepper` (`MtpBackend::begin_mtp_decode`). The stepper
+            // captures the embedding table + config and runs the prompt-prefix
+            // seed before the loop; the 11 former `MtpOps` closures are its
+            // `MtpStepper` methods. The `profiler.set_label("mtp_eager")` relabel
+            // moved into `DenseMtpStepper::profiler_relabel` (applied once at
+            // turn entry by the engine).
+            let mut rng = rand::rng();
 
-            // Clear stale rope deltas only on fresh text-only prefills —
-            // see `chat_common::should_clear_rope_delta`.
-            if chat_common::should_clear_rope_delta(is_delta, has_images) {
-                self.cached_rope_deltas = None;
-            }
+            // Preserve the eager block's initial `async_eval_arrays(&[&y])`
+            // (scheduling hint for the first sampled token) right before the
+            // engine takes over.
+            MxArray::async_eval_arrays(&[&y]);
 
-            profiler.set_label("chat_compiled");
-
-            // Opt-in speculative decode (MTP). Effective only when both the
-            // per-request flag and the model checkpoint carry an MTP head. Init
-            // mirrors the main path's `mlx_qwen35_compiled_init_from_prefill`
-            // and shares the C++ `g_weights` store. Init failure (no MTP
-            // weights, mismatched config) silently disables MTP for this turn —
-            // the regular single-token loop continues to work.
-            let cond_enable_mtp = p.enable_mtp;
-            let cond_has_mtp_weights = self.has_mtp_weights();
-            let mut cond_init_ok: Option<bool> = None;
-            let mtp_active = cond_enable_mtp && cond_has_mtp_weights && {
-                let prefill_len = seq_len as i32;
-                match chat_common::kv_capacity_round_up(prefill_len, max_new_tokens) {
-                    Ok(max_kv_len) => match init_mtp_compiled_from_main(&self.config, max_kv_len) {
-                        Ok(()) => {
-                            cond_init_ok = Some(true);
-                            true
-                        }
-                        Err(e) => {
-                            cond_init_ok = Some(false);
-                            warn!(
-                                "W6 MTP init failed; falling back to single-token decode: {}",
-                                e.reason
-                            );
-                            false
-                        }
-                    },
-                    Err(e) => {
-                        // KV capacity would overflow i32 — disable MTP, fall back to AR.
-                        // The non-MTP compiled cache is sized by the AR primary site
-                        // above (the `if use_compiled` else-branch / VLM prefill), which
-                        // already surfaced the same Err via `?` before reaching here, so
-                        // this arm is belt-and-suspenders.
-                        cond_init_ok = Some(false);
-                        warn!(
-                            "Qwen3.5 MTP init skipped; KV capacity overflow: {}",
-                            e.reason
-                        );
-                        false
-                    }
-                }
-            };
-            info!(
-                "Qwen3.5 MTP gate (dense): enable_mtp={} has_mtp_weights={} init_ok={:?} \
-                 -> mtp_active={}",
-                cond_enable_mtp, cond_has_mtp_weights, cond_init_ok, mtp_active
-            );
-            if mtp_active {
-                // Reset MTP compiled state on EVERY exit from this
-                // decode path — including the `?`-propagated abort out
-                // of `decode_loop_mtp!` (e.g. a failed
-                // `mlx_qwen35_mtp_compiled_commit`). The explicit
-                // post-macro `mlx_qwen35_mtp_compiled_reset()` only runs
-                // on the normal return; the guard's `Drop` covers the
-                // error path so the next turn always re-inits cleanly.
-                let _mtp_compiled_guard = MtpCompiledResetGuard;
-
-                // Prompt-prefix MTP prefill. With MTP just inited and
-                // `g_mtp_committed_len == 0`, commit the prompt prefix (+ the
-                // first sampled token `y`) into the MTP committed-history cache
-                // BEFORE the decode loop so the MTP heads attend over the
-                // prompt from cycle 1. Gated on `prompt_hidden` being captured
-                // by the hidden-emitting prefill; the commit run is
-                // `[prefill_tokens[1..], y]` so cycle 1's slot-0 seam is
-                // contiguous (see `prefill_mtp_commit`).
-                if let (Some(ph), Some(ph_ids)) =
-                    (prompt_hidden.as_ref(), prompt_hidden_ids.as_ref())
-                {
-                    if !ph_ids.is_empty() {
-                        // Read `y`'s scalar id (already async_eval'd at
-                        // the top of this function).
-                        y.eval();
-                        let y_id = y.item_at_int32(0)? as u32;
-                        prefill_mtp_commit(
-                            ph,
-                            ph_ids,
-                            y_id,
-                            &embedding_weight,
-                            prompt_hidden_position_base,
-                        )?;
-                        info!(
-                            "Qwen3.5 MTP prompt-prefill: committed prefix \
-                             ({} prompt-tail tokens + y, position_base={}) into MTP cache",
-                            ph_ids.len(),
-                            prompt_hidden_position_base,
-                        );
-                    } else {
-                        debug!(
-                            "Qwen3.5 MTP prompt-prefill: prompt too short \
-                             ({} tokens) — skipped",
-                            ph_ids.len(),
-                        );
-                    }
-                }
-
-                // Thread-local CSPRNG; one `random::<f64>()` draw per
-                // emitted token via `accept_with_residual`.
-                let mut rng = rand::rng();
-                let mut mtp_ops = chat_common::MtpOps {
-                    forward_with_hidden: |ids: &MxArray,
-                                          emb: &MxArray|
-                     -> Result<(MxArray, MxArray, bool)> {
-                        let (l, h) = forward_compiled_with_hidden(ids, emb)?;
-                        Ok((l, h, false))
-                    },
-                    draft_step: |prev_hidden: &MxArray,
-                                 prev_emb: &MxArray|
-                     -> Result<(MxArray, MxArray)> {
-                        forward_mtp_draft_compiled(prev_hidden, prev_emb)
-                    },
-                    verify_step: |ids: &MxArray,
-                                  emb: &MxArray,
-                                  depth: usize|
-                     -> Result<chat_common::MtpVerifyOutput> {
-                        // Return (logits, verify-final hidden) so the cycle
-                        // macro can chain into the next cycle's first MTP draft
-                        // and skip Step A's ~150 ms main-model forward.
-                        forward_mtp_verify_compiled_with_hidden(ids, emb, depth as i32)
-                    },
-                    verify_step_argmax_only: Some(Box::new(
-                        |ids: &MxArray,
-                         emb: &MxArray,
-                         depth: usize|
-                         -> Result<chat_common::MtpVerifyOutput> {
-                            forward_mtp_verify_compiled_with_hidden_and_argmax_only(
-                                ids,
-                                emb,
-                                depth as i32,
-                            )
-                        },
-                    )),
-                    verify_step_sparse: Some(Box::new(
-                        |ids: &MxArray,
-                         emb: &MxArray,
-                         depth: usize,
-                         sampling_cfg: &SamplingConfig|
-                         -> Result<chat_common::MtpVerifyOutput> {
-                            forward_mtp_verify_compiled_with_hidden_and_sparse_target(
-                                ids,
-                                emb,
-                                depth as i32,
-                                sampling_cfg,
-                            )
-                        },
-                    )),
-                    rollback: |accepted_drafts: usize, depth: usize| unsafe {
-                        // Committed-history policy: the MTP offset is driven
-                        // ABSOLUTELY by the commit FFI
-                        // (`mlx_qwen35_mtp_compiled_commit` sets
-                        // `g_mtp_offset_int = g_mtp_committed_len`), which
-                        // already ran BEFORE this rollback. No cycle-policy
-                        // `adjust_offset` here — double-adjusting would corrupt
-                        // the absolute offset.
-                        //
-                        // The MAIN path's offset and GDN linear caches are
-                        // still restored via the `snapshot_main_linear` /
-                        // `restore_and_replay_main` pair below.
-                        let _ = (accepted_drafts, depth);
-                        // On full accept the verifier wrote exactly `depth + 1`
-                        // surviving main-cache steps (`last_committed` plus all
-                        // drafts). Do not keep the raw batched GDN recurrent
-                        // state: the D+1 verifier recurrence keeps fp32 state
-                        // across the whole window, while AR observes the
-                        // per-token cache dtype round-trip. Replay the full
-                        // accepted prefix from the tape so the next Step A sees
-                        // the same cache state as serial decode. `_tape_replay`
-                        // disarms internally.
-                        if accepted_drafts == depth && chat_common::mtp_use_tape_replay() {
-                            mlx_sys::mlx_qwen35_compiled_tape_replay((depth + 1) as i32);
-                        }
-                    },
-                    eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
-                        eval_token_and_compiled_caches(token);
-                        if budget_forced {
-                            logits.eval();
-                        }
-                    },
-                    // Fold the chained `verify_hidden[K]` slice into the same
-                    // async_eval batch as the post-cycle token + compiled
-                    // caches. See the chained-end-of-iteration call in
-                    // `decode_loop_mtp!` (chat_common.rs): without this the
-                    // slice stays lazy across the iteration boundary and the
-                    // next cycle's draft graph build forces a Metal roundtrip
-                    // the Step-A bypass doesn't pay.
-                    eval_step_with_chained_hidden: |token: &MxArray, chained_hidden: &MxArray| {
-                        eval_token_caches_and_chained_hidden(token, chained_hidden);
-                    },
-                    // Reset MTP K/V and re-anchor MTP offset to the main path's
-                    // current offset before each draft cycle. Without this the
-                    // MTP offset drifts 2 behind per cycle (Step A's forward +
-                    // verify[0]'s forward both write to the main path but not
-                    // to the MTP path), so MTP RoPE positions become wrong and
-                    // drafts diverge.
-                    begin_cycle: |chained_anchor: bool| unsafe {
-                        let old_mtp_offset = mlx_sys::mlx_qwen35_mtp_get_offset();
-                        let main_offset = mlx_sys::mlx_qwen35_get_cache_offset();
-                        if chained_anchor {
-                            mlx_sys::mlx_qwen35_mtp_compiled_begin_chained_cycle(main_offset);
-                        } else {
-                            mlx_sys::mlx_qwen35_mtp_compiled_begin_cycle(main_offset);
-                        }
-                        tracing::debug!(
-                            target: "mlx_core::mtp",
-                            old_mtp_offset,
-                            main_offset,
-                            new_mtp_offset = mlx_sys::mlx_qwen35_mtp_get_offset(),
-                            "MTP begin_cycle: cache re-anchored to main offset"
-                        );
-                    },
-                    // Snapshot the main path's GDN linear caches + offset
-                    // BEFORE the verify FFI runs its D+1 sequential forwards.
-                    // Verify mutates `g_compiled_caches` in place; without
-                    // restoring on rejection the GDN recurrent state stays
-                    // polluted with rejected-draft positions and the next Step
-                    // A produces wrong logits.
-                    //
-                    // When tape-replay is ENABLED (default; opt out via
-                    // `MLX_MTP_USE_TAPE_REPLAY=0`), also arm the GDN tape
-                    // recorder so the rollback path can replay accepted
-                    // innovations into the snapshot state via a single Metal
-                    // kernel instead of K+1 main-model forwards. Snapshot is
-                    // still required — the tape replay starts from the snapshot
-                    // state.
-                    snapshot_main_linear: || unsafe {
-                        mlx_sys::mlx_qwen35_compiled_snapshot_linear_caches();
-                        if chat_common::mtp_use_tape_replay() {
-                            mlx_sys::mlx_qwen35_compiled_tape_arm();
-                        }
-                    },
-                    // On rejection: restore linear caches + offset, then replay
-                    // the K accepted drafts via forward_compiled so the main
-                    // linear state matches the committed token stream. Each
-                    // replay call advances the offset by 1; K calls bring the
-                    // main offset to `snapshot_offset + K`.
-                    //
-                    // When tape-replay is ENABLED, replace the K+1 forwards
-                    // with a single `_tape_replay` FFI that applies the
-                    // recorded innovations to the snapshot state.
-                    // `accepted_drafts.len()` is `K + 1` here (the slice
-                    // contains `[last_committed_id, d_0, .., d_{K-1}]` — see
-                    // `run_mtp_cycle_inner`'s `replay_ids` construction).
-                    restore_and_replay_main: |accepted_drafts: &[u32],
-                                              emb: &MxArray|
-                     -> Result<()> {
-                        if chat_common::mtp_use_tape_replay() {
-                            let steps = accepted_drafts.len() as i32;
-                            unsafe {
-                                mlx_sys::mlx_qwen35_compiled_tape_replay(steps);
-                            }
-                            return Ok(());
-                        }
-                        unsafe {
-                            mlx_sys::mlx_qwen35_compiled_restore_linear_caches();
-                        }
-                        for &tok in accepted_drafts {
-                            let id_arr = MxArray::from_int32(&[tok as i32], &[1, 1])?;
-                            let (logits, _hidden) = forward_compiled_with_hidden(&id_arr, emb)?;
-                            // Force eval so the lazy graph chain is
-                            // bounded — mirrors the eval_step closure's
-                            // behaviour on the main decode path.
-                            logits.eval();
-                        }
-                        Ok(())
-                    },
-                    // Committed-history commit hook (dense path). Appends exact
-                    // MTP K/V for this cycle's K+1 committed tokens to the
-                    // persistent MTP cache so the next cycle's drafts attend
-                    // the full committed prefix. Runs unconditionally (full
-                    // accept + reject) — see `run_mtp_cycle_inner`.
-                    commit_mtp: |anchor: chat_common::MtpCommitAnchor,
-                                 seed_hidden: &MxArray,
-                                 verify_hiddens: &MxArray,
-                                 committed_ids: &[u32],
-                                 k_accepted: usize,
-                                 emb: &MxArray|
-                     -> Result<()> {
-                        match anchor {
-                            chat_common::MtpCommitAnchor::IncludeAnchor => commit_mtp_compiled(
-                                seed_hidden,
-                                verify_hiddens,
-                                committed_ids,
-                                k_accepted,
-                                emb,
-                            ),
-                            chat_common::MtpCommitAnchor::SkipAlreadyCommittedAnchor => {
-                                commit_mtp_compiled_from_verify_prefix(
-                                    verify_hiddens,
-                                    committed_ids,
-                                    emb,
-                                )
-                            }
-                        }
-                    },
-                    // Dense committed-history path. Forces the fused-draft path
-                    // OFF (its mask excludes the committed prefix) — see
-                    // `run_mtp_cycle_inner`.
-                    committed_history_active: true,
-                    rollback_unemitted: |_: usize| {},
-                };
-                chat_common::decode_loop_mtp!(
-                    mtp_ops: mtp_ops,
-                    mtp_depth: p.mtp_depth,
-                    mtp_rng: rng,
-                    y: y,
-                    embedding_weight: embedding_weight,
-                    params: p,
-                    reasoning_tracker: reasoning_tracker,
-                    profiler: profiler,
-                    max_new_tokens: max_new_tokens,
-                    eos_id: eos_id,
-                    generated_tokens: generated_tokens,
-                    token_history: token_history,
-                    finish_reason: finish_reason,
-                    first_token_instant: first_token_instant,
+            let outcome = crate::engine::mtp_turn::run_mtp_turn(
+                self,
+                &mut rng,
+                crate::engine::mtp_turn::MtpTurnArgs {
+                    // Cheap refcounted clone: `run_mtp_turn` consumes `y`, but the
+                    // post-block `let _final_sampled_token = y;` discard (shared
+                    // with the AR `decode_loop!` arm, which reassigns `y`) still
+                    // reads it. The clone is the same lazy handle — byte-identical.
+                    y: y.clone(),
+                    depth: p.mtp_depth,
+                    params: &p,
+                    reasoning_tracker: &mut reasoning_tracker,
+                    profiler: &mut profiler,
+                    max_new_tokens,
+                    eos_id,
+                    generated_tokens: &mut generated_tokens,
+                    token_history: &mut token_history,
+                    finish_reason: &mut finish_reason,
+                    first_token_instant: &mut first_token_instant,
                     report_perf: p.report_performance,
-                    generation_stream: generation_stream
-                );
-                unsafe {
-                    mlx_sys::mlx_qwen35_mtp_compiled_reset();
-                }
-            } else {
-                let mut ops = chat_common::DecodeOps {
-                    forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
-                        Ok((forward_compiled(ids, emb)?, false))
-                    },
-                    eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
-                        eval_token_and_compiled_caches(token);
-                        if budget_forced {
-                            logits.eval();
-                        }
-                    },
-                };
-                chat_common::decode_loop!(
-                    ops: ops,
-                    y: y,
-                    embedding_weight: embedding_weight,
-                    params: p,
-                    reasoning_tracker: reasoning_tracker,
-                    profiler: profiler,
-                    max_new_tokens: max_new_tokens,
-                    eos_id: eos_id,
-                    generated_tokens: generated_tokens,
-                    token_history: token_history,
-                    finish_reason: finish_reason,
-                    first_token_instant: first_token_instant,
-                    report_perf: p.report_performance,
-                    generation_stream: generation_stream
-                );
-            }
+                    generation_stream,
+                    prompt_hidden,
+                    prompt_hidden_ids,
+                    prompt_hidden_position_base,
+                },
+                // SYNC site: no streaming sink (the streaming flat site wires
+                // its own `StreamingCtx` and shares this one loop).
+                None,
+            )?;
 
-            // Export caches from C++ before CompiledResetGuard drops
-            if p.reuse_cache {
-                let num_layers = self.config.num_layers as usize;
-                let mut export_ptrs: Vec<*mut mlx_sys::mlx_array> =
-                    vec![std::ptr::null_mut(); num_layers * 2];
-                let exported = unsafe {
-                    mlx_sys::mlx_qwen35_export_caches(
-                        export_ptrs.as_mut_ptr(),
-                        (num_layers * 2) as i32,
-                    )
-                };
-                if exported > 0 {
-                    let cache_offset = unsafe { mlx_sys::mlx_qwen35_get_cache_offset() };
-                    let mut new_caches = Vec::with_capacity(num_layers);
-                    for i in 0..num_layers {
-                        let p0 = export_ptrs[i * 2];
-                        let p1 = export_ptrs[i * 2 + 1];
-                        let mut lc = if self.config.is_linear_layer(i) {
-                            Qwen3_5LayerCache::new_linear()
-                        } else {
-                            Qwen3_5LayerCache::new_full_attention()
-                        };
-                        lc.import_ptrs(p0, p1, cache_offset);
-                        new_caches.push(lc);
-                    }
-                    self.caches = Some(new_caches);
-                    // Force-materialize the exported cache arrays before
-                    // `CompiledResetGuard` drops at end of scope and tears
-                    // down `g_compiled_caches`. `mlx_qwen35_export_caches`
-                    // hands back lazy `array` copies whose compute graph
-                    // still references compiled-graph nodes; without this
-                    // eval those handles point at buffers that get freed
-                    // when the compile cache resets, and the next turn's
-                    // compile init would feed stale handles to the GPU —
-                    // triggering Metal page-faults / innocent-victim hangs
-                    // on the first forward of the next turn.
-                    eval_layer_caches(&self.caches)?;
-                }
+            last_in_cache = outcome.last_in_cache;
+            // Propagate a mid-cycle stop: self.caches advanced past the emitted
+            // history, so force a full re-prefill next turn.
+            if outcome.desynced {
+                self.flat_mtp_caches_desynced = true;
             }
         } else {
             profiler.set_label("chat_rust");
 
             MxArray::async_eval_arrays(&[&y]);
 
-            let mut ops = chat_common::DecodeOps {
+            let mut ops = mtp_decode::DecodeOps {
                 forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
                     let logits = forward_inner(
                         ids,
@@ -2930,7 +2041,7 @@ impl Qwen35Inner {
                     MxArray::async_eval_arrays(&[token, logits]);
                 },
             };
-            chat_common::decode_loop!(
+            mtp_decode::decode_loop!(
                 ops: ops,
                 y: y,
                 embedding_weight: embedding_weight,
@@ -2942,6 +2053,7 @@ impl Qwen35Inner {
                 generated_tokens: generated_tokens,
                 token_history: token_history,
                 finish_reason: finish_reason,
+                last_in_cache: last_in_cache,
                 first_token_instant: first_token_instant,
                 report_perf: p.report_performance,
                 generation_stream: generation_stream
@@ -2954,10 +2066,11 @@ impl Qwen35Inner {
         // text-only. Prefill paths (re)set the key based on the fresh
         // turn's `has_images`.
         if is_delta {
-            chat_common::save_cache_state_after_delta(
+            engine::save_cache_state_after_delta(
                 p.reuse_cache,
                 &generated_tokens,
                 &finish_reason,
+                /* drop_last_always */ !last_in_cache,
                 &save_tokens,
                 &mut self.cached_token_history,
                 &mut self.cached_image_key,
@@ -2970,6 +2083,7 @@ impl Qwen35Inner {
                 has_images,
                 &generated_tokens,
                 &finish_reason,
+                /* drop_last_always */ !last_in_cache,
                 &save_tokens,
                 save_expanded_tokens.as_deref(),
                 save_image_cache_key,
@@ -3007,7 +2121,7 @@ impl Qwen35Inner {
             think_end_str.as_deref(),
             performance,
             p.include_reasoning,
-            enable_thinking.unwrap_or(true),
+            thinking.enabled,
             prompt_tokens_for_result,
             reasoning_tracker.reasoning_token_count(),
         )?;
@@ -3020,7 +2134,122 @@ impl Qwen35Inner {
         Ok(result)
     }
 
-    /// Block-paged variant of [`Self::chat_sync_core`].
+    /// Shared pure-Rust eager-MTP decode loop for the dense FLAT STREAMING
+    /// cores (`chat_stream_sync_inner` / `chat_stream_tokens_delta_sync_inner`).
+    ///
+    /// This is the streaming analogue of the `eager_mtp` arm of
+    /// [`Self::chat_with_caches_inner`]: the propose/verify whole-turn loop is
+    /// engine-owned ([`crate::engine::mtp_turn::run_mtp_turn`]) and drives the
+    /// [`DenseMtpStepper`] ([`MtpBackend::begin_mtp_decode`]) — the SAME stepper
+    /// and prompt-prefix committed-history seed the SYNC site uses. The only
+    /// difference is the streaming sink: this site wires a
+    /// [`crate::engine::decode::StreamingCtx`] (incremental detokenization plus
+    /// the default [`crate::engine::backend::DefaultStreamEmitter`]) so accepted
+    /// tokens stream out the `cb` sink incrementally, sharing ONE loop with the
+    /// sync site. Caller owns prefill, sampling of the first `y`, the
+    /// `WiredLimitContext`, and the post-loop save-cache / final-chunk tail.
+    ///
+    /// Preconditions (enforced by the callers' gate): `enable_mtp`,
+    /// `has_mtp_weights()`, `paged_adapter.is_none()`, text-only. The body is
+    /// byte-identical to the non-streaming eager MTP decode (same accept/rewind
+    /// math, same GDN tape replay) — only the streamed deltas differ.
+    #[allow(clippy::too_many_arguments)]
+    fn run_flat_stream_eager_mtp<'a>(
+        &mut self,
+        y: MxArray,
+        token_history: &mut Vec<u32>,
+        generated_tokens: &mut Vec<u32>,
+        finish_reason: &mut String,
+        reasoning_tracker: &mut engine::ReasoningTracker,
+        profiler: &mut crate::decode_profiler::DecodeProfiler,
+        first_token_instant: &mut Option<std::time::Instant>,
+        streamed_text_len: &mut usize,
+        last_is_reasoning: &mut bool,
+        decode_stream: &mut tokenizers::DecodeStream<
+            'a,
+            tokenizers::ModelWrapper,
+            tokenizers::NormalizerWrapper,
+            tokenizers::PreTokenizerWrapper,
+            tokenizers::PostProcessorWrapper,
+            tokenizers::DecoderWrapper,
+        >,
+        tokenizer: &'a Arc<Qwen3Tokenizer>,
+        cb: &StreamSender<'_>,
+        cancelled: &AtomicBool,
+        // The embedding table + its transpose are owned by the model and
+        // pulled inside `begin_mtp_decode` (`self.embedding.get_weight()`),
+        // so the engine-owned loop does not read these; kept in the signature
+        // for call-site parity with the AR streaming arm.
+        _embedding_weight: MxArray,
+        _embedding_weight_t: MxArray,
+        p: &engine::ChatParams,
+        eos_id: u32,
+        max_new_tokens: i32,
+        generation_stream: Stream,
+        prompt_hidden: Option<MxArray>,
+        prompt_hidden_ids: Option<Vec<u32>>,
+        prompt_hidden_position_base: usize,
+        last_in_cache: &mut bool,
+    ) -> Result<()> {
+        // The turn profiler relabel ("mtp_eager") now moves into
+        // `DenseMtpStepper::profiler_relabel`, applied once at turn entry by
+        // the engine — mirroring the SYNC site.
+        MxArray::async_eval_arrays(&[&y]);
+
+        let mut rng = rand::rng();
+
+        // Wire the streaming sink: incremental detokenization through the
+        // shared `step_decode_stream` + the default ChatML emitter (qwen3_5
+        // does not override `stream_emitter`, so the macro's inline emit is
+        // byte-identical to `DefaultStreamEmitter::on_token_text`). The
+        // engine's `run_mtp_turn` routes the SAME three emit sites + the
+        // pre-loop cancel break through this `StreamingCtx`.
+        let mut emitter = crate::engine::backend::DefaultStreamEmitter;
+        let streaming = crate::engine::decode::StreamingCtx {
+            callback: cb.0,
+            cancelled,
+            decode_stream,
+            tokenizer: tokenizer.inner(),
+            streamed_text_len,
+            last_is_reasoning,
+            emitter: &mut emitter,
+        };
+
+        let outcome = crate::engine::mtp_turn::run_mtp_turn(
+            self,
+            &mut rng,
+            crate::engine::mtp_turn::MtpTurnArgs {
+                y,
+                depth: p.mtp_depth,
+                params: p,
+                reasoning_tracker,
+                profiler,
+                max_new_tokens,
+                eos_id,
+                generated_tokens,
+                token_history,
+                finish_reason,
+                first_token_instant,
+                report_perf: p.report_performance,
+                generation_stream,
+                prompt_hidden,
+                prompt_hidden_ids,
+                prompt_hidden_position_base,
+            },
+            Some(streaming),
+        )?;
+
+        *last_in_cache = outcome.last_in_cache;
+        // Propagate a mid-cycle stop: self.caches advanced past the emitted
+        // history, so force a full re-prefill next turn.
+        if outcome.desynced {
+            self.flat_mtp_caches_desynced = true;
+        }
+
+        Ok(())
+    }
+
+    /// Block-paged variant of [`Self::vision_mtp_whole_turn_core`].
     ///
     /// Mirrors the flat path's control flow (penalty stack, decode
     /// loop, EOS / repetition cutoff, performance timing, output
@@ -3052,13 +2281,14 @@ impl Qwen35Inner {
     ///   pool) is rejected — same caveat as LFM2 / Qwen3 paged paths.
     /// * The compiled C++ forward path is bypassed — paged turns run
     ///   the pure-Rust `DecoderLayer::forward_paged_or_flat`.
-    fn chat_sync_core_paged(
+    fn paged_turn_sync_core(
         &mut self,
         tokens: Vec<u32>,
         tokenizer: Arc<Qwen3Tokenizer>,
         eos_token_id: u32,
-        p: chat_common::ChatParams,
+        p: engine::ChatParams,
         report_perf: bool,
+        thinking: ThinkingSetup,
     ) -> Result<ChatResult> {
         if tokens.is_empty() {
             return Err(Error::from_reason("Empty prompt"));
@@ -3076,12 +2306,10 @@ impl Qwen35Inner {
 
         let think_end_id = tokenizer.think_end_id();
         let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
-        let thinking_enabled = true;
-        let mut reasoning_tracker = chat_common::ReasoningTracker::new(
-            thinking_enabled,
-            p.thinking_token_budget,
-            think_end_id,
-        );
+        // Thinking is resolved ONCE at turn entry and honors
+        // `enable_thinking=false`.
+        let thinking_enabled = thinking.enabled;
+        let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
 
         let generation_start = if report_perf {
             Some(std::time::Instant::now())
@@ -3090,37 +2318,6 @@ impl Qwen35Inner {
         };
         let mut first_token_instant: Option<std::time::Instant> = None;
         let trace_enabled = inference_trace_enabled();
-
-        // Detect availability of the C++ compiled paged decode path.
-        // Mirrors the MoE paged path: if the weights for this model are
-        // still registered (no other model swapped `g_active_model_id`),
-        // we can run `mlx_qwen35_init_paged` + `mlx_qwen35_forward_paged`.
-        // Both the legacy flat compiled path and the new paged compiled
-        // path share `COMPILED_LIFECYCLE_MUTEX`/`COMPILED_WEIGHTS_RWLOCK` for
-        // process-wide serialization.
-        let model_id = self.model_id;
-        let use_cpp_paged = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
-        let _dense_lock = if use_cpp_paged {
-            Some(
-                COMPILED_LIFECYCLE_MUTEX
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()),
-            )
-        } else {
-            None
-        };
-        let mut _weight_guard = None;
-        let use_cpp_paged = if use_cpp_paged {
-            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
-            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
-                _weight_guard = Some(guard);
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
 
         // === Adapter lifecycle: warm continuation OR cold start ===
         let seq_id: u32 = 0;
@@ -3135,12 +2332,12 @@ impl Qwen35Inner {
             let adapter = self
                 .paged_adapter
                 .as_ref()
-                .ok_or_else(|| Error::from_reason("chat_sync_core_paged: paged_adapter is None"))?;
+                .ok_or_else(|| Error::from_reason("paged_turn_sync_core: paged_adapter is None"))?;
             adapter.block_size()
         };
-        let lookup_extra_keys = chat_common::build_paged_extra_keys(tokens.len(), block_size, &[]);
+        let lookup_extra_keys = engine::build_paged_extra_keys(tokens.len(), block_size, &[]);
         let cache_salt = 0;
-        // vLLM exact-prefix cap — see qwen3/model.rs:chat_sync_core_paged.
+        // vLLM exact-prefix cap — see qwen3/model.rs:paged_turn_sync_core.
         // Ensures every paged turn has at least one suffix token to prefill,
         // even when the live cache (or a prior request's residue) already
         // covers the entire new prompt.
@@ -3149,14 +2346,21 @@ impl Qwen35Inner {
         let live_prefix_match;
         let live_tokens_len;
         let mut live_mismatch = TokenPrefixMismatchTrace::default();
-        let (cached_prefix_len, continued_live_prefix) = {
-            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+        // Adapter-owned warm/cold lifecycle. The [MLX_TRACE] line below
+        // reads the PRE-turn live state, so probe the adapter immutably FIRST
+        // (prepare_turn mutates request_tokens via continue_turn/reset). The
+        // adapter re-reads the same state internally, so live_* matches what
+        // prepare_turn decides. extra_keys=&[] (uniform API) is bit-equal to
+        // `&lookup_extra_keys` for text-only dispatch (all-empty per-block vec
+        // → identical hashes; see the block_size comment above).
+        // Suffix blocks are allocated inside prepare_turn.
+        {
+            let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
                 Error::from_reason(
-                    "chat_sync_core_paged: paged_adapter is None — caller must check \
+                    "paged_turn_sync_core: paged_adapter is None — caller must check \
                      use_block_paged_cache before dispatch",
                 )
             })?;
-
             live_ready = adapter.is_live_for_continue();
             let live_tokens = adapter.request_tokens();
             live_tokens_len = live_tokens.len();
@@ -3164,56 +2368,29 @@ impl Qwen35Inner {
             if trace_enabled && live_ready && !live_prefix_match {
                 live_mismatch = token_prefix_mismatch_trace(&tokens, live_tokens);
             }
-            let can_continue =
-                live_ready && live_prefix_match && live_tokens_len <= max_cache_hit_tokens as usize;
-
-            if can_continue {
-                match adapter.continue_turn(&tokens, total_budget) {
-                    Ok((prior_token_count, _newly_alloc)) => (prior_token_count, true),
-                    Err(_drift) => {
-                        let _ = adapter.release_request();
-                        adapter
-                            .reset_for_new_request(seq_id)
-                            .map_err(Error::from_reason)?;
-                        let prefix = adapter
-                            .find_cached_prefix_per_block_with_max_tokens(
-                                &tokens,
-                                &lookup_extra_keys,
-                                cache_salt,
-                                false,
-                                max_cache_hit_tokens,
-                            )
-                            .map_err(Error::from_reason)?;
-                        let cached = prefix.cached_token_count;
-                        adapter
-                            .allocate_suffix_blocks(total_budget)
-                            .map_err(Error::from_reason)?;
-                        (cached, false)
-                    }
-                }
-            } else {
-                if adapter.block_table().is_some() {
-                    let _ = adapter.release_request();
-                }
-                adapter
-                    .reset_for_new_request(seq_id)
-                    .map_err(Error::from_reason)?;
-                let prefix = adapter
-                    .find_cached_prefix_per_block_with_max_tokens(
-                        &tokens,
-                        &lookup_extra_keys,
-                        cache_salt,
-                        false,
-                        max_cache_hit_tokens,
-                    )
-                    .map_err(Error::from_reason)?;
-                let cached = prefix.cached_token_count;
-                adapter
-                    .allocate_suffix_blocks(total_budget)
-                    .map_err(Error::from_reason)?;
-                (cached, false)
-            }
-        };
+        }
+        let plan = self
+            .paged_adapter
+            .as_mut()
+            .ok_or_else(|| {
+                Error::from_reason(
+                    "paged_turn_sync_core: paged_adapter is None — caller must check \
+                     use_block_paged_cache before dispatch",
+                )
+            })?
+            .prepare_turn_with_max_cache_hit_tokens(
+                seq_id,
+                &tokens,
+                total_budget,
+                true,
+                &[],
+                cache_salt,
+                false,
+                max_cache_hit_tokens,
+            )
+            .map_err(Error::from_reason)?;
+        let cached_prefix_len = plan.cached_prefix_len;
+        let continued_live_prefix = plan.continued_live_prefix;
         if trace_enabled {
             write_inference_trace(format_args!(
                 "[MLX_TRACE] qwen3.5-dense paged_prefix_lookup prompt_tokens={} \
@@ -3247,10 +2424,10 @@ impl Qwen35Inner {
         let suffix_len = prompt_token_count
             .checked_sub(cached_prefix_len)
             .ok_or_else(|| {
-                Error::from_reason("chat_sync_core_paged: cached_prefix_len > total_prompt_tokens")
+                Error::from_reason("paged_turn_sync_core: cached_prefix_len > total_prompt_tokens")
             })?;
 
-        let forward_result = self.chat_sync_core_paged_inner(
+        let forward_result = self.paged_turn_sync_core_inner(
             &tokens,
             cached_prefix_len,
             suffix_len,
@@ -3260,7 +2437,6 @@ impl Qwen35Inner {
             &mut reasoning_tracker,
             report_perf,
             &mut first_token_instant,
-            use_cpp_paged,
             gdn_prefix_already_primed,
         );
 
@@ -3273,7 +2449,7 @@ impl Qwen35Inner {
                     // uniform `&[]` finalize.
                     let total_for_finalize = adapter.request_tokens().len();
                     let finalize_extra_keys =
-                        chat_common::build_paged_extra_keys(total_for_finalize, block_size, &[]);
+                        engine::build_paged_extra_keys(total_for_finalize, block_size, &[]);
                     let _ = adapter.finalize_turn_keep_live_per_block(&finalize_extra_keys, 0);
                 }
                 t
@@ -3351,29 +2527,25 @@ impl Qwen35Inner {
         Ok(result)
     }
 
-    /// Inner forward + decode loop for `chat_sync_core_paged`. Split
+    /// Inner forward + decode loop for `paged_turn_sync_core`. Split
     /// out so the caller can wrap it with `release_request` on either
     /// path.
     ///
-    /// Uses a C++ compiled paged decode dispatcher when `use_cpp_paged` is
-    /// true. The pure-Rust paged prefill always runs (it populates the GDN
-    /// linear caches and writes K/V into the adapter pool); after prefill,
-    /// decode steps choose between `mlx_qwen35_forward_paged` (fast) and
-    /// `paged_forward::run_paged_decode_step` (fallback) based on adapter block
-    /// size and `init_paged_dense_compiled_session` success.
+    /// The pure-Rust paged prefill populates the GDN linear caches and
+    /// writes K/V into the adapter pool; decode steps then run through
+    /// `paged_forward::run_paged_decode_step`.
     #[allow(clippy::too_many_arguments)]
-    fn chat_sync_core_paged_inner(
+    fn paged_turn_sync_core_inner(
         &mut self,
         tokens: &[u32],
         cached_prefix_len: u32,
         suffix_len: u32,
-        p: &chat_common::ChatParams,
+        p: &engine::ChatParams,
         eos_token_id: u32,
         sampling_config: &Option<crate::sampling::SamplingConfig>,
-        reasoning_tracker: &mut chat_common::ReasoningTracker,
+        reasoning_tracker: &mut engine::ReasoningTracker,
         report_perf: bool,
         first_token_instant: &mut Option<std::time::Instant>,
-        use_cpp_paged: bool,
         gdn_prefix_already_primed: bool,
     ) -> Result<(
         Vec<u32>,
@@ -3383,7 +2555,7 @@ impl Qwen35Inner {
         // Invariant: caller-applied vLLM cap guarantees suffix_len > 0.
         debug_assert!(
             suffix_len > 0,
-            "chat_sync_core_paged_inner: caller must cap max_cache_hit_tokens at prompt.len() - 1"
+            "paged_turn_sync_core_inner: caller must cap max_cache_hit_tokens at prompt.len() - 1"
         );
 
         let suffix = &tokens[(cached_prefix_len as usize)..];
@@ -3402,10 +2574,9 @@ impl Qwen35Inner {
         // tensor.
         let want_prompt_hidden = p.enable_mtp
             && self.has_mtp_weights()
-            && chat_common::mtp_verify_paged_attn_enabled()
-            && !chat_common::mtp_no_prompt_prefill()
+            && !mtp_decode::mtp_no_prompt_prefill()
             && cached_prefix_len == 0;
-        let mtp_prompt_history = chat_common::mtp_prompt_history_selection(tokens.len());
+        let mtp_prompt_history = mtp_decode::mtp_prompt_history_selection(tokens.len());
 
         // === PREFILL ===
         let mut prompt_hidden: Option<MxArray> = None;
@@ -3413,10 +2584,10 @@ impl Qwen35Inner {
             let embed = self.embedding.clone();
             let embedding_weight = embed.get_weight();
             let caches_ref = self.caches.as_mut().ok_or_else(|| {
-                Error::from_reason("chat_sync_core_paged_inner: caches not initialized")
+                Error::from_reason("paged_turn_sync_core_inner: caches not initialized")
             })?;
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                Error::from_reason("chat_sync_core_paged_inner: paged_adapter dropped")
+                Error::from_reason("paged_turn_sync_core_inner: paged_adapter dropped")
             })?;
             if want_prompt_hidden {
                 let (logits, ph) = super::paged_forward::run_paged_prefill_chunk_with_hidden(
@@ -3470,439 +2641,95 @@ impl Qwen35Inner {
             *first_token_instant = Some(std::time::Instant::now());
         }
 
-        // Decide between C++ compiled paged decode (fast) and pure-Rust
-        // paged decode (fallback). C++ paged needs:
-        // 1. `use_cpp_paged` (weights still registered for our model_id —
-        //    re-validated under `COMPILED_WEIGHTS_RWLOCK` in the caller).
-        // 2. `adapter.block_size() == CPP_PAGED_REQUIRED_BLOCK_SIZE`.
-        //    The compiled C++ paged graph hard-codes block_size = 16.
-        // 3. `init_paged_dense_compiled_session` to succeed (every linear
-        //    layer must have populated conv/recurrent state from the
-        //    pure-Rust GDN forward above; every full-attn layer must
-        //    have a usable `LayerKVPool` slot, and the C++
-        //    `g_dense_paged_inited` must be set after init catches no
-        //    exceptions).
-        // The `CompiledResetGuard` ensures `mlx_qwen35_compiled_reset()`
-        // runs on any exit path so the next session starts with cleared
-        // C++ globals.
-        let mut cpp_session_ready = if use_cpp_paged {
-            let caches_ref = self.caches.as_ref().ok_or_else(|| {
-                Error::from_reason("chat_sync_core_paged_inner: caches dropped post-prefill")
-            })?;
-            let adapter_ref = self.paged_adapter.as_ref().ok_or_else(|| {
-                Error::from_reason("chat_sync_core_paged_inner: paged_adapter dropped post-prefill")
-            })?;
-            if adapter_ref.block_size() != CPP_PAGED_REQUIRED_BLOCK_SIZE {
-                eprintln!(
-                    "[MLX] Qwen3.5 Dense: skipping C++ compiled paged decode — \
-                     adapter block_size={} but compiled graph requires {}; \
-                     falling back to pure-Rust paged decode",
-                    adapter_ref.block_size(),
-                    CPP_PAGED_REQUIRED_BLOCK_SIZE
-                );
-                false
-            } else {
-                let prefill_offset = adapter_ref.current_token_count() as i32;
-                init_paged_dense_compiled_session(
-                    &self.config,
-                    caches_ref,
-                    adapter_ref,
-                    prefill_offset,
-                )
-                .is_ok()
-            }
-        } else {
-            false
-        };
-
-        // RAII guard: resets BOTH g_compiled_* and g_dense_paged_*
-        // globals (single `mlx_qwen35_compiled_reset` symbol clears
-        // both) when this scope ends. Always armed
-        // when init succeeded — even if a later forward fails and we
-        // flip `cpp_session_ready=false`, the guard still runs at scope
-        // exit so stale C++ globals don't leak into the next request.
-        let _dense_paged_guard = cpp_session_ready.then_some(CompiledResetGuard);
-
-        // Tracks whether ANY compiled C++ paged step has succeeded
-        // during this turn. After a successful compiled step the C++
-        // side has advanced its per-layer GDN linear-cache globals
-        // (conv_state / recurrent_state) but those updates never get
-        // imported back into `self.caches`. Falling back to pure-Rust
-        // decode after that point would run from stale pre-step-N GDN
-        // state while `paged_adapter` and `token_history` have already
-        // advanced — silently corrupting the rest of the request. The
-        // mid-turn fallback below is therefore only safe BEFORE the
-        // first successful compiled step (the only failure mode we
-        // really need to defend against is init/configuration mismatch
-        // on the very first forward call).
-        let mut cpp_compiled_step_completed = false;
-
         // === DECODE LOOP ===
         let max_new_tokens = p.max_new_tokens;
         let mut generated_tokens: Vec<u32> =
-            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens));
+            Vec::with_capacity(engine::generated_capacity_hint(max_new_tokens));
         let mut finish_reason = String::from("length");
 
-        // Compile-cached `max_blocks_per_seq` shape — picking the
-        // adapter's max_seq_len divided by block_size keeps the compile
-        // key stable across all decode steps within one turn.
-        let max_blocks_per_seq: u32 = {
-            let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
-                Error::from_reason("chat_sync_core_paged_inner: paged_adapter dropped pre-decode")
-            })?;
-            let max_seq = self.config.max_position_embeddings as u32;
-            max_seq.div_ceil(adapter.block_size())
-        };
-
-        // Paged-MTP gate. Mirrors the dense MTP gate at `chat_sync_core`.
-        // Default ON; opt out with `MLX_MTP_VERIFY_PAGED_ATTN=0` to fall back
-        // to AR paged decode.
-        //
-        // Requires `cpp_session_ready` because the AR step inside the
-        // cycle (`forward_with_hidden`) consumes the C++ paged graph's
-        // hidden export; the verify FFI also reads
-        // `g_dense_paged_inited` and the linear-cache snapshot helpers
-        // operate on `g_dense_paged_linear_caches[]`.
-        let mtp_paged_active = p.enable_mtp
-            && self.has_mtp_weights()
-            && chat_common::mtp_verify_paged_attn_enabled()
-            && cpp_session_ready
-            && {
-                let prefill_len = token_history.len() as i32;
-                match chat_common::kv_capacity_round_up(prefill_len, max_new_tokens) {
-                    Ok(max_kv_len) => match init_mtp_compiled_from_main(&self.config, max_kv_len) {
-                        Ok(()) => true,
-                        Err(e) => {
-                            warn!(
-                                "Qwen3.5 MTP-paged init failed; falling back to AR paged decode: {}",
-                                e.reason
-                            );
-                            false
-                        }
-                    },
-                    Err(e) => {
-                        // KV capacity would overflow i32 — disable MTP and fall back to
-                        // AR paged decode, whose block-paged KV cache grows dynamically
-                        // (no fixed i32 capacity), so it has nothing to overflow.
-                        warn!(
-                            "Qwen3.5 MTP init skipped; KV capacity overflow: {}",
-                            e.reason
-                        );
-                        false
-                    }
-                }
-            };
+        // Pure-Rust ("eager") paged MTP gate. The paged adapter IS present
+        // here (this is the paged core), so — unlike the flat eager gate —
+        // the gate does NOT require `paged_adapter.is_none()`.
+        let eager_mtp_paged = p.enable_mtp && self.has_mtp_weights();
         info!(
-            "Qwen3.5 MTP gate (paged): enable_mtp={} has_mtp_weights={} env={} \
-             cpp_session_ready={} -> mtp_paged_active={}",
+            "Qwen3.5 MTP gate (paged): enable_mtp={} has_mtp_weights={} -> eager_mtp_paged={}",
             p.enable_mtp,
             self.has_mtp_weights(),
-            chat_common::mtp_verify_paged_attn_enabled(),
-            cpp_session_ready,
-            mtp_paged_active
+            eager_mtp_paged
         );
 
-        if mtp_paged_active {
-            let _mtp_compiled_guard = MtpCompiledResetGuard;
+        if eager_mtp_paged {
+            // Pure-Rust ("eager") paged MTP.
+            // The main Step-A / verify forwards route through the paged adapter
+            // (`run_paged_step_with_hidden` / `run_paged_verify_step`); the GDN
+            // recurrent state stays FLAT in `self.caches` Linear slots, so the
+            // GDN tape replay (the rollback keystone) is IDENTICAL to the flat
+            // eager arm. Full-attention K/V lives in the paged pool, so the
+            // rollback rewinds it via `adapter.rollback_last_tokens(rejected)`,
+            // NOT a `self.caches` KV trim.
+            MxArray::async_eval_arrays(&[&y]);
 
-            let embedding_weight = self.embedding.get_weight();
+            let mut profiler =
+                crate::decode_profiler::DecodeProfiler::new("chat_paged_mtp_eager", "qwen3_5");
+            profiler.set_prompt_tokens(token_history.len() as u32);
+            profiler.snapshot_memory_before();
 
-            // Prompt-prefix MTP commit. With MTP just inited and
-            // `g_mtp_committed_len == 0`, commit the prompt prefix (+ first
-            // sampled token `y`) into the MTP committed-history cache BEFORE
-            // the decode loop so the MTP heads attend over the prompt from
-            // cycle 1. Mirrors the dense gate.
-            //
-            // Gated on `prompt_hidden` being captured by the
-            // hidden-emitting paged prefill (only runs when
-            // `want_prompt_hidden` was true above — and the predicate
-            // already requires `cached_prefix_len == 0` so `tokens`
-            // here IS the full prompt that produced `prompt_hidden`).
-            if let Some(ph) = prompt_hidden.as_ref() {
-                let prompt_hidden_position_base = mtp_prompt_history.position_base;
-                let prompt_hidden_ids = {
-                    let start = mtp_prompt_history
-                        .hidden_start_token_index()
-                        .min(tokens.len());
-                    &tokens[start..]
-                };
-                if !prompt_hidden_ids.is_empty() {
-                    y.eval();
-                    let y_id = y.item_at_int32(0)? as u32;
-                    prefill_mtp_commit(
-                        ph,
-                        prompt_hidden_ids,
-                        y_id,
-                        &embedding_weight,
-                        prompt_hidden_position_base,
-                    )?;
-                    info!(
-                        "Qwen3.5 MTP-paged prompt-prefill: committed prefix \
-                         ({} prompt-tail tokens + y, position_base={}) into MTP cache",
-                        prompt_hidden_ids.len(),
-                        prompt_hidden_position_base,
-                    );
-                } else {
-                    debug!(
-                        "Qwen3.5 MTP-paged prompt-prefill: prompt too short \
-                         ({} tokens) — skipped",
-                        prompt_hidden_ids.len(),
-                    );
-                }
-            }
             let eos_id = eos_token_id;
             let generation_stream = crate::stream::Stream::new(crate::stream::DeviceType::Gpu);
             let model_size_bytes = self.config.estimate_memory_bytes() as usize;
             let _wired_ctx =
                 crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
 
-            let mut profiler =
-                crate::decode_profiler::DecodeProfiler::new("chat_paged_mtp", "qwen3_5");
-            profiler.set_prompt_tokens(token_history.len() as u32);
-            profiler.snapshot_memory_before();
-
-            // RefCell shape (per design-pass Q1): the MtpOps closures
-            // each need `&mut PagedKVCacheAdapter` for record / build /
-            // rollback. Wrapping the single live `&mut` in
-            // `Rc<RefCell<...>>` lets every closure borrow short-lived
-            // mutable access at invocation time without re-borrowing
-            // through `self`, which the macro's repeated closure calls
-            // would otherwise reject. Single-threaded decode → no panic
-            // risk; the borrow is dropped before any FFI call so MLX
-            // never races against an outstanding RefMut.
-            let adapter_cell = std::rc::Rc::new(std::cell::RefCell::new(
-                self.paged_adapter.as_mut().ok_or_else(|| {
-                    Error::from_reason(
-                        "chat_sync_core_paged_inner: paged_adapter dropped before MTP gate",
-                    )
-                })?,
-            ));
+            // Prompt-tail ids + position base for the committed-history seed.
+            // `prompt_hidden` is only `Some` when `want_prompt_hidden` held,
+            // which already requires `cached_prefix_len == 0` (=> position_base
+            // is 0 on those turns), so committed-history v2 is correct.
+            let prompt_hidden_position_base = mtp_prompt_history.position_base;
+            let prompt_hidden_ids: Vec<u32> = {
+                let start = mtp_prompt_history
+                    .hidden_start_token_index()
+                    .min(tokens.len());
+                tokens[start..].to_vec()
+            };
 
             let mut rng = rand::rng();
 
-            let adapter_fwd = std::rc::Rc::clone(&adapter_cell);
-            let adapter_verify = std::rc::Rc::clone(&adapter_cell);
-            let adapter_rollback = std::rc::Rc::clone(&adapter_cell);
-            let adapter_rollback_unemitted = std::rc::Rc::clone(&adapter_cell);
+            // The propose/verify whole-turn loop is engine-owned
+            // (`run_mtp_turn`) and drives the `DenseMtpStepper` in its PAGED
+            // mode: `begin_mtp_decode` moves `self.paged_adapter` into the
+            // stepper for the turn, runs the committed-history prompt seed, and
+            // routes the Step-A / verify forwards through the adapter; the
+            // stepper's `Drop` restores the adapter into `self.paged_adapter`
+            // before this call returns, so the paged-history save below finds
+            // it. The paged path commits cache state through its own
+            // paged-history save, so `outcome.last_in_cache` is unused here.
+            let outcome = crate::engine::mtp_turn::run_mtp_turn(
+                self,
+                &mut rng,
+                crate::engine::mtp_turn::MtpTurnArgs {
+                    y: y.clone(),
+                    depth: p.mtp_depth,
+                    params: p,
+                    reasoning_tracker,
+                    profiler: &mut profiler,
+                    max_new_tokens,
+                    eos_id,
+                    generated_tokens: &mut generated_tokens,
+                    token_history: &mut token_history,
+                    finish_reason: &mut finish_reason,
+                    first_token_instant,
+                    report_perf: p.report_performance,
+                    generation_stream,
+                    prompt_hidden,
+                    prompt_hidden_ids: Some(prompt_hidden_ids),
+                    prompt_hidden_position_base,
+                },
+                None,
+            )?;
+            let _ = outcome.last_in_cache;
 
-            let mut mtp_ops = chat_common::MtpOps {
-                forward_with_hidden: |ids: &MxArray,
-                                      emb: &MxArray|
-                 -> Result<(MxArray, MxArray, bool)> {
-                    // `ids` is `next_ids = $y.reshape(&[1, 1])` from the
-                    // macro. `$y` was eval'd before the gate, but the
-                    // reshape is a lazy view — force it here so
-                    // `item_at_int32` reads from a materialised buffer
-                    // instead of forcing a mid-gate sync.
-                    ids.eval();
-                    let token_id = ids.item_at_int32(0)? as u32;
-                    let inputs = {
-                        let mut adapter = adapter_fwd.borrow_mut();
-                        adapter
-                            .record_tokens(&[token_id])
-                            .map_err(Error::from_reason)?;
-                        adapter
-                            .build_paged_attention_inputs(1, 1, max_blocks_per_seq)
-                            .map_err(Error::from_reason)?
-                    };
-                    let input_ids = MxArray::from_uint32(&[token_id], &[1, 1])?;
-                    let logits = forward_dense_cpp_paged(&input_ids, emb, &inputs)?;
-                    let hidden = export_last_hidden_paged()?;
-                    // `forward_dense_cpp_paged` returns logits shaped
-                    // `[1, vocab]` (2D — the compiled paged graph projects
-                    // `h: [1, hidden]` directly through `lm_head`). The
-                    // dense MTP path's `forward_compiled_with_hidden`
-                    // returns the same 2D shape, so `needs_squeeze=false`
-                    // matches that contract.
-                    Ok((logits, hidden, false))
-                },
-                draft_step: |prev_hidden: &MxArray,
-                             prev_emb: &MxArray|
-                 -> Result<(MxArray, MxArray)> {
-                    forward_mtp_draft_compiled(prev_hidden, prev_emb)
-                },
-                verify_step: |ids: &MxArray,
-                              emb: &MxArray,
-                              depth: usize|
-                 -> Result<chat_common::MtpVerifyOutput> {
-                    let id_window = ids.to_int32().map_err(|e| {
-                        Error::from_reason(format!(
-                            "MTP-paged verify_step: ids to_int32: {}",
-                            e.reason
-                        ))
-                    })?;
-                    if id_window.len() < depth + 1 {
-                        return Err(Error::from_reason(format!(
-                            "MTP-paged verify_step: ids has {} elements, need {}",
-                            id_window.len(),
-                            depth + 1
-                        )));
-                    }
-                    let id_slice: Vec<u32> = id_window
-                        .iter()
-                        .take(depth + 1)
-                        .map(|&v| v as u32)
-                        .collect();
-                    let inputs = {
-                        let mut adapter = adapter_verify.borrow_mut();
-                        adapter
-                            .record_tokens(&id_slice)
-                            .map_err(Error::from_reason)?;
-                        adapter
-                            .build_paged_attention_inputs((depth + 1) as u32, 6, max_blocks_per_seq)
-                            .map_err(Error::from_reason)?
-                    };
-                    let cu_seqlens_q = MxArray::from_int32(&[0_i32, (depth + 1) as i32], &[2])?;
-                    forward_mtp_verify_paged(ids, emb, depth as i32, &inputs, &cu_seqlens_q)
-                },
-                verify_step_argmax_only: None,
-                verify_step_sparse: None,
-                rollback: |accepted_drafts: usize, depth: usize| {
-                    let rejected = depth.saturating_sub(accepted_drafts);
-                    if rejected > 0
-                        && let Ok(mut adapter) = adapter_rollback.try_borrow_mut()
-                        && let Err(e) = adapter.rollback_last_tokens(rejected as u32)
-                    {
-                        tracing::warn!(
-                            target: "mlx_core::qwen3_5::paged",
-                            "MTP-paged rollback_last_tokens({rejected}) failed (ignored): {e}",
-                        );
-                    }
-                    unsafe {
-                        if accepted_drafts == depth && chat_common::mtp_use_tape_replay() {
-                            mlx_sys::mlx_qwen35_compiled_tape_replay_paged((depth + 1) as i32);
-                        }
-                    }
-                },
-                eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
-                    eval_token_and_compiled_caches(token);
-                    if budget_forced {
-                        logits.eval();
-                    }
-                },
-                eval_step_with_chained_hidden: |token: &MxArray, chained_hidden: &MxArray| {
-                    eval_token_caches_and_chained_hidden(token, chained_hidden);
-                },
-                begin_cycle: |chained_anchor: bool| unsafe {
-                    let old_mtp_offset = mlx_sys::mlx_qwen35_mtp_get_offset();
-                    let main_offset = mlx_sys::mlx_qwen35_get_cache_offset();
-                    if chained_anchor {
-                        mlx_sys::mlx_qwen35_mtp_compiled_begin_chained_cycle(main_offset);
-                    } else {
-                        mlx_sys::mlx_qwen35_mtp_compiled_begin_cycle(main_offset);
-                    }
-                    tracing::debug!(
-                        target: "mlx_core::mtp",
-                        old_mtp_offset,
-                        main_offset,
-                        new_mtp_offset = mlx_sys::mlx_qwen35_mtp_get_offset(),
-                        "MTP-paged begin_cycle: cache re-anchored to main offset"
-                    );
-                },
-                snapshot_main_linear: || unsafe {
-                    mlx_sys::mlx_qwen35_compiled_snapshot_paged_linear_caches();
-                    if chat_common::mtp_use_tape_replay() {
-                        mlx_sys::mlx_qwen35_compiled_tape_arm_paged();
-                    }
-                },
-                restore_and_replay_main: |accepted_drafts: &[u32], _emb: &MxArray| -> Result<()> {
-                    let steps = accepted_drafts.len() as i32;
-                    if chat_common::mtp_use_tape_replay() {
-                        unsafe {
-                            mlx_sys::mlx_qwen35_compiled_tape_replay_paged(steps);
-                        }
-                        return Ok(());
-                    }
-                    unsafe {
-                        mlx_sys::mlx_qwen35_compiled_restore_paged_linear_caches();
-                    }
-                    Ok(())
-                },
-                commit_mtp: |anchor: chat_common::MtpCommitAnchor,
-                             seed_hidden: &MxArray,
-                             verify_hiddens: &MxArray,
-                             committed_ids: &[u32],
-                             k_accepted: usize,
-                             emb: &MxArray|
-                 -> Result<()> {
-                    match anchor {
-                        chat_common::MtpCommitAnchor::IncludeAnchor => commit_mtp_compiled(
-                            seed_hidden,
-                            verify_hiddens,
-                            committed_ids,
-                            k_accepted,
-                            emb,
-                        ),
-                        chat_common::MtpCommitAnchor::SkipAlreadyCommittedAnchor => {
-                            commit_mtp_compiled_from_verify_prefix(
-                                verify_hiddens,
-                                committed_ids,
-                                emb,
-                            )
-                        }
-                    }
-                },
-                committed_history_active: true,
-                rollback_unemitted: |unemitted: usize| {
-                    if let Ok(mut adapter) = adapter_rollback_unemitted.try_borrow_mut()
-                        && let Err(e) = adapter.rollback_last_tokens(unemitted as u32)
-                    {
-                        tracing::warn!(
-                            target: "mlx_core::qwen3_5::paged",
-                            "MTP-paged rollback_unemitted({unemitted}) failed (ignored): {e}",
-                        );
-                    }
-                },
-            };
-
-            chat_common::decode_loop_mtp!(
-                mtp_ops: mtp_ops,
-                mtp_depth: p.mtp_depth,
-                mtp_rng: rng,
-                y: y,
-                embedding_weight: embedding_weight,
-                params: p,
-                reasoning_tracker: reasoning_tracker,
-                profiler: profiler,
-                max_new_tokens: max_new_tokens,
-                eos_id: eos_id,
-                generated_tokens: generated_tokens,
-                token_history: token_history,
-                finish_reason: finish_reason,
-                first_token_instant: *first_token_instant,
-                report_perf: p.report_performance,
-                generation_stream: generation_stream
-            );
-
-            drop(adapter_cell);
-
-            match export_paged_dense_linear_caches(&self.config) {
-                Ok(Some(new_caches)) => {
-                    self.caches = Some(new_caches);
-                    eval_layer_caches(&self.caches)?;
-                    write_inference_trace(format_args!(
-                        "[MLX_TRACE] qwen3.5-dense paged_mtp_linear_cache_export ok=true"
-                    ));
-                }
-                Ok(None) => {
-                    self.caches = None;
-                    write_inference_trace(format_args!(
-                        "[MLX_TRACE] qwen3.5-dense paged_mtp_linear_cache_export ok=false reason=not_initialized"
-                    ));
-                }
-                Err(err) => {
-                    write_inference_trace(format_args!(
-                        "[MLX_TRACE] qwen3.5-dense paged_mtp_linear_cache_export ok=false error={}",
-                        err
-                    ));
-                    self.caches = None;
-                }
-            }
-
-            unsafe {
-                mlx_sys::mlx_qwen35_mtp_compiled_reset();
-            }
-
+            // `self.caches` already holds the live GDN state (the eager paged
+            // forwards wrote it directly) — no compiled cache export needed.
             return Ok((generated_tokens, finish_reason, Some(profiler)));
         }
 
@@ -3912,7 +2739,7 @@ impl Qwen35Inner {
             token_history.push(token_id);
             reasoning_tracker.observe_token(token_id);
 
-            if token_id == eos_token_id {
+            if token_id == eos_token_id || p.extra_eos_ids.contains(&token_id) {
                 finish_reason = String::from("stop");
                 break;
             }
@@ -3929,101 +2756,16 @@ impl Qwen35Inner {
                 break;
             }
 
-            // Decode forward.
-            //
-            // Defense-in-depth: if the C++ compiled paged forward returns
-            // null on the FIRST step, we rollback the `record_tokens`
-            // cursor advance, mark `cpp_session_ready = false`, and
-            // re-run this token through pure-Rust `run_paged_decode_step`
-            // (which re-calls `record_tokens` on the now-rolled-back
-            // cursor). After ANY compiled step has succeeded the C++ GDN
-            // linear-cache globals have advanced but we never copy them
-            // back into `self.caches`, so a Rust fallback would read
-            // stale pre-step state — propagate the error as fatal
-            // instead of silently corrupting the response.
-            let next_logits = if cpp_session_ready {
-                let embedding_weight = self.embedding.get_weight();
-                let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                    Error::from_reason(
-                        "chat_sync_core_paged_inner: paged_adapter dropped mid-decode (cpp)",
-                    )
-                })?;
-                adapter
-                    .record_tokens(&[token_id])
-                    .map_err(Error::from_reason)?;
-                let inputs = adapter
-                    .build_paged_attention_inputs(1, 1, max_blocks_per_seq)
-                    .map_err(Error::from_reason)?;
-                let input_ids = MxArray::from_uint32(&[token_id], &[1, 1])?;
-                match forward_dense_cpp_paged(&input_ids, &embedding_weight, &inputs) {
-                    Ok(logits) => {
-                        cpp_compiled_step_completed = true;
-                        logits
-                    }
-                    Err(e) => {
-                        if chat_common::should_propagate_compiled_paged_error(
-                            cpp_compiled_step_completed,
-                        ) {
-                            eprintln!(
-                                "[MLX] Qwen3.5 Dense: C++ compiled paged forward failed \
-                                 mid-decode (step={step}) AFTER an earlier compiled step \
-                                 succeeded. The C++ GDN linear-cache globals have advanced \
-                                 but those updates are not imported back into self.caches, \
-                                 so a pure-Rust fallback would run from stale pre-step state \
-                                 and silently corrupt the response. Propagating as fatal. \
-                                 cause: {e}"
-                            );
-                            adapter
-                                .rollback_last_tokens(1)
-                                .map_err(Error::from_reason)?;
-                            return Err(e);
-                        }
-                        eprintln!(
-                            "[MLX] Qwen3.5 Dense: C++ compiled paged forward failed on \
-                             first decode step (step={step}); rolling back token cursor \
-                             and falling back to pure-Rust paged decode for the rest of \
-                             this request. cause: {e}"
-                        );
-                        adapter
-                            .rollback_last_tokens(1)
-                            .map_err(Error::from_reason)?;
-                        cpp_session_ready = false;
-                        let embed = self.embedding.clone();
-                        let embedding_weight_pure = embed.get_weight();
-                        let caches_ref = self.caches.as_mut().ok_or_else(|| {
-                            Error::from_reason(
-                                "chat_sync_core_paged_inner: caches dropped during cpp fallback",
-                            )
-                        })?;
-                        let adapter_mut = self.paged_adapter.as_mut().ok_or_else(|| {
-                            Error::from_reason(
-                                "chat_sync_core_paged_inner: paged_adapter dropped during cpp fallback",
-                            )
-                        })?;
-                        let logits = super::paged_forward::run_paged_decode_step(
-                            token_id,
-                            &embed,
-                            &mut self.layers,
-                            caches_ref,
-                            &self.final_norm,
-                            &self.lm_head,
-                            &embedding_weight_pure,
-                            &layer_kinds,
-                            adapter_mut,
-                        )?;
-                        logits.squeeze(Some(&[1]))?
-                    }
-                }
-            } else {
-                // Pure-Rust paged decode fallback.
+            // Decode forward (pure-Rust paged step).
+            let next_logits = {
                 let embed = self.embedding.clone();
                 let embedding_weight = embed.get_weight();
                 let caches_ref = self.caches.as_mut().ok_or_else(|| {
-                    Error::from_reason("chat_sync_core_paged_inner: caches dropped mid-decode")
+                    Error::from_reason("paged_turn_sync_core_inner: caches dropped mid-decode")
                 })?;
                 let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                     Error::from_reason(
-                        "chat_sync_core_paged_inner: paged_adapter dropped mid-decode",
+                        "paged_turn_sync_core_inner: paged_adapter dropped mid-decode",
                     )
                 })?;
                 let logits = super::paged_forward::run_paged_decode_step(
@@ -4055,49 +2797,752 @@ impl Qwen35Inner {
             crate::array::maybe_clear_cache_for_paged_step(step);
         }
 
-        if cpp_compiled_step_completed {
-            match export_paged_dense_linear_caches(&self.config) {
-                Ok(Some(new_caches)) => {
-                    self.caches = Some(new_caches);
-                    eval_layer_caches(&self.caches)?;
-                    write_inference_trace(format_args!(
-                        "[MLX_TRACE] qwen3.5-dense paged_linear_cache_export ok=true"
+        Ok((generated_tokens, finish_reason, None))
+    }
+
+    /// Single-turn image-bearing block-paged dispatch (non-streaming).
+    ///
+    /// The paged sibling of the flat VLM prefill: it processes the images,
+    /// merges the vision features into the token embeddings, computes M-RoPE
+    /// positions, then prefills through the paged adapter via
+    /// [`super::paged_forward::run_paged_vlm_prefill`] and runs the plain
+    /// autoregressive decode loop.
+    ///
+    /// SINGLE-TURN ONLY: the adapter is cold-started (no cache-hit, no warm
+    /// continue) and decode uses the scalar-offset RoPE path (the physical
+    /// token count), matching the flat path's decode RoPE. This core runs plain
+    /// autoregressive decode with no draft/verify; MTP weights are ignored, so
+    /// an MTP-enabled session's image turns route here and decode as AR.
+    #[allow(clippy::too_many_arguments)]
+    fn vision_paged_turn_sync_core(
+        &mut self,
+        tokens: Vec<u32>,
+        images: &[Vec<u8>],
+        tokenizer: Arc<Qwen3Tokenizer>,
+        eos_token_id: u32,
+        p: engine::ChatParams,
+        report_perf: bool,
+        thinking: ThinkingSetup,
+    ) -> Result<ChatResult> {
+        if tokens.is_empty() {
+            return Err(Error::from_reason("Empty prompt"));
+        }
+
+        let (vision_encoder, img_proc) =
+            match (self.vision_encoder.clone(), self.image_processor.as_ref()) {
+                (Some(enc), Some(proc)) => (enc, proc),
+                _ => {
+                    return Err(Error::from_reason(
+                        "VLM prefill requested but vision encoder/processor not loaded",
                     ));
                 }
-                Ok(None) => {
-                    self.caches = None;
-                    write_inference_trace(format_args!(
-                        "[MLX_TRACE] qwen3.5-dense paged_linear_cache_export ok=false reason=not_initialized"
+            };
+
+        // This paged turn writes full-attention K/V into the paged adapter pool,
+        // leaving the flat `self.caches` full-attention slots stale. A later
+        // dense-MTP fallback must rebuild them first.
+        self.paged_full_attn_caches_dirty = true;
+
+        let think_end_id = tokenizer.think_end_id();
+        let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
+        let thinking_enabled = thinking.enabled;
+        let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
+
+        let generation_start = if report_perf {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let mut first_token_instant: Option<std::time::Instant> = None;
+        let sampling_config = p.sampling_config;
+
+        // === VLM image processing: expand placeholders + merge features ===
+        let sms = self.spatial_merge_size.unwrap_or(2);
+        let image_refs: Vec<&[u8]> = images.iter().map(|v| v.as_slice()).collect();
+        let processed = img_proc.process_many(&image_refs)?;
+        let per_image_token_counts =
+            compute_image_token_counts_per_image(&processed.grid_thw(), sms)?;
+        let expanded_tokens = inject_image_placeholders(&tokens, &per_image_token_counts);
+        let image_cache_key = compute_image_cache_key(images);
+        let prompt_token_count = expanded_tokens.len() as u32;
+
+        let embed = self.embedding.clone();
+        let embedding_weight = embed.get_weight();
+        let input_ids = MxArray::from_uint32(&expanded_tokens, &[1, expanded_tokens.len() as i64])?;
+
+        let generation_stream = Stream::new(DeviceType::Gpu);
+        let model_size_bytes = self.config.estimate_memory_bytes() as usize;
+        let _wired_ctx =
+            crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
+
+        let merge = vlm_prepare_vision_features(
+            &input_ids,
+            image_cache_key,
+            &processed,
+            &vision_encoder,
+            sms,
+            &embedding_weight,
+            generation_stream,
+            &self.vision_cache,
+        )?;
+
+        // === Cold-start the paged adapter on the expanded sequence ===
+        let seq_id: u32 = 0;
+        let total_budget = expanded_tokens.len() as u32;
+        {
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("vision_paged_turn_sync_core: paged_adapter is None")
+            })?;
+            adapter
+                .prepare_turn_with_max_cache_hit_tokens(
+                    seq_id,
+                    &expanded_tokens,
+                    total_budget,
+                    /* reuse_cache */ false,
+                    &[],
+                    /* cache_salt */ 0,
+                    /* skip_lookup */ true,
+                    /* max_cache_hit_tokens */ 0,
+                )
+                .map_err(Error::from_reason)?;
+        }
+        self.cached_token_history.clear();
+        self.cached_image_key = None;
+        self.cached_rope_deltas = None;
+
+        // Fresh per-layer caches (GDN linear slots + empty full-attention slots).
+        let new_caches = (0..self.config.num_layers as usize)
+            .map(|i| {
+                if self.config.is_linear_layer(i) {
+                    Qwen3_5LayerCache::new_linear()
+                } else {
+                    Qwen3_5LayerCache::new_full_attention()
+                }
+            })
+            .collect();
+        self.caches = Some(new_caches);
+
+        let layer_kinds =
+            super::decoder_layer::compute_layer_kinds(self.config.num_layers as usize, |i| {
+                self.config.is_linear_layer(i)
+            });
+
+        let forward_result = (|| -> Result<(Vec<u32>, String)> {
+            // === PREFILL ===
+            let last_logits = {
+                let _stream_ctx = StreamContext::new(generation_stream);
+                let caches_ref = self.caches.as_mut().ok_or_else(|| {
+                    Error::from_reason("vision_paged_turn_sync_core: caches not initialized")
+                })?;
+                let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                    Error::from_reason("vision_paged_turn_sync_core: paged_adapter dropped")
+                })?;
+                super::paged_forward::run_paged_vlm_prefill(
+                    &expanded_tokens,
+                    &merge,
+                    &embed,
+                    &mut self.layers,
+                    caches_ref,
+                    &self.final_norm,
+                    &self.lm_head,
+                    &embedding_weight,
+                    &layer_kinds,
+                    adapter,
+                )?
+            };
+
+            let mut token_history: Vec<u32> = expanded_tokens.clone();
+            let last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
+            let mut y = sample(&last_logits, sampling_config)?;
+            y.eval();
+
+            crate::array::synchronize_and_clear_cache();
+            if report_perf {
+                first_token_instant = Some(std::time::Instant::now());
+            }
+
+            // === DECODE LOOP (autoregressive, scalar-offset RoPE) ===
+            let max_new_tokens = p.max_new_tokens;
+            let mut generated_tokens: Vec<u32> =
+                Vec::with_capacity(engine::generated_capacity_hint(max_new_tokens));
+            let mut finish_reason = String::from("length");
+
+            for step in 0..max_new_tokens {
+                let token_id = y.item_at_int32(0)? as u32;
+                generated_tokens.push(token_id);
+                token_history.push(token_id);
+                reasoning_tracker.observe_token(token_id);
+
+                if token_id == eos_token_id || p.extra_eos_ids.contains(&token_id) {
+                    finish_reason = String::from("stop");
+                    break;
+                }
+                if let Some(reason) = crate::sampling::check_repetition_cutoff(
+                    &generated_tokens,
+                    p.max_consecutive_tokens,
+                    p.max_ngram_repeats,
+                    p.ngram_size,
+                ) {
+                    finish_reason = reason.to_string();
+                    break;
+                }
+                if step + 1 >= max_new_tokens {
+                    break;
+                }
+
+                let next_logits = {
+                    let _stream_ctx = StreamContext::new(generation_stream);
+                    let caches_ref = self.caches.as_mut().ok_or_else(|| {
+                        Error::from_reason("vision_paged_turn_sync_core: caches dropped mid-decode")
+                    })?;
+                    let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                        Error::from_reason(
+                            "vision_paged_turn_sync_core: paged_adapter dropped mid-decode",
+                        )
+                    })?;
+                    let logits = super::paged_forward::run_paged_decode_step(
+                        token_id,
+                        &embed,
+                        &mut self.layers,
+                        caches_ref,
+                        &self.final_norm,
+                        &self.lm_head,
+                        &embedding_weight,
+                        &layer_kinds,
+                        adapter,
+                    )?;
+                    logits.squeeze(Some(&[1]))?
+                };
+
+                if reasoning_tracker.should_force_think_end() {
+                    let forced_id = reasoning_tracker.forced_token_id()? as i32;
+                    y = MxArray::from_int32(&[forced_id], &[1])?;
+                    y.eval();
+                    continue;
+                }
+                let next_logits = apply_all_penalties(next_logits, &token_history, &p)?;
+
+                y = sample(&next_logits, sampling_config)?;
+                y.eval();
+
+                crate::array::maybe_clear_cache_for_paged_step(step);
+            }
+
+            Ok((generated_tokens, finish_reason))
+        })();
+
+        // Terminal lifecycle, mirroring the text paged core
+        // (`paged_turn_sync_core` / `finalize_paged_turn`). The error path
+        // always releases the request and returns. The success path is
+        // resolved below so the session ends in exactly one of two states,
+        // never a partial one: FULLY continuable (keep-live registered AND GDN
+        // checkpoint stored AND history + image key published) or
+        // NON-continuable (request released AND history cleared AND image key
+        // None) so a follow-up text continue is safely rejected instead of
+        // cold-prefilling image-placeholder ids as ordinary tokens.
+        let (generated_tokens, finish_reason) = match forward_result {
+            Ok(t) => t,
+            Err(e) => {
+                if let Some(adapter) = self.paged_adapter.as_mut() {
+                    let _ = adapter.release_request();
+                }
+                return Err(e);
+            }
+        };
+
+        // Build the saved history: the EXPANDED (image-placeholder) prompt plus
+        // all generated tokens except the last — the paged decode loop never
+        // forwards the final sampled token into the cache, so it would not match
+        // the live `request_tokens` (drop-last rule shared with the text paged
+        // core).
+        let mut full_history = expanded_tokens.clone();
+        if !generated_tokens.is_empty() {
+            full_history.extend_from_slice(&generated_tokens[..generated_tokens.len() - 1]);
+        }
+
+        // Keep-live registration must run before the GDN checkpoint, which
+        // snapshots the live recurrent state; short-circuit `&&` preserves that
+        // order. `remember_dense_gdn_history_checkpoint` snapshots from
+        // `cached_token_history`, so publish the history first, then checkpoint.
+        // Any failure downgrades to NON-continuable rather than discarding the
+        // already-successful generation output.
+        let keep_live_ok = p.reuse_cache
+            && match self.paged_adapter.as_mut() {
+                Some(adapter) => {
+                    let total_for_finalize = adapter.request_tokens().len();
+                    let bs = adapter.block_size();
+                    let finalize_extra_keys =
+                        engine::build_paged_extra_keys(total_for_finalize, bs, &[]);
+                    adapter
+                        .finalize_turn_keep_live_per_block(&finalize_extra_keys, 0)
+                        .is_ok()
+                }
+                None => false,
+            };
+        let continuable = if keep_live_ok {
+            self.cached_token_history = full_history;
+            self.remember_dense_gdn_history_checkpoint().is_ok()
+        } else {
+            false
+        };
+
+        if continuable {
+            // FULLY continuable: live KV + GDN recurrent state encode the image
+            // context; `cached_image_key` records it (flat vision save contract).
+            self.cached_image_key = Some(image_cache_key);
+        } else {
+            // No-reuse, keep-live failure, or checkpoint failure: release the
+            // request and reset to a pristine non-live state. `reset_caches_sync`
+            // nulls `self.caches` (so `has_live_session()` reports false) and
+            // clears token history, image key, rope deltas, and GDN checkpoints,
+            // so a follow-up continue is rejected ("requires an initialized
+            // session") instead of cold-prefilling image-placeholder ids.
+            if let Some(adapter) = self.paged_adapter.as_mut() {
+                let _ = adapter.release_request();
+            }
+            let _ = self.reset_caches_sync();
+        }
+
+        let performance = if report_perf {
+            compute_performance_metrics(
+                generation_start,
+                first_token_instant,
+                expanded_tokens.len(),
+                generated_tokens.len(),
+            )
+        } else {
+            None
+        };
+
+        let mut result = finalize_chat_result(
+            &tokenizer,
+            &generated_tokens,
+            finish_reason,
+            think_end_id,
+            think_end_str.as_deref(),
+            performance,
+            p.include_reasoning,
+            thinking_enabled,
+            prompt_token_count,
+            reasoning_tracker.reasoning_token_count(),
+        )?;
+        result.cached_tokens = 0;
+        Ok(result)
+    }
+
+    /// Streaming twin of [`Self::vision_paged_turn_sync_core`].
+    ///
+    /// Single-turn image-bearing block-paged dispatch that emits each
+    /// generated token through the streaming callback. Same prefill + decode
+    /// spine; plain AR decode, MTP weights ignored.
+    #[allow(clippy::too_many_arguments)]
+    fn vision_paged_turn_stream_core(
+        &mut self,
+        tokens: Vec<u32>,
+        images: &[Vec<u8>],
+        tokenizer: Arc<Qwen3Tokenizer>,
+        eos_token_id: u32,
+        p: engine::ChatParams,
+        report_perf: bool,
+        cb: &StreamSender<'_>,
+        cancelled: &AtomicBool,
+        thinking: ThinkingSetup,
+    ) -> Result<()> {
+        if tokens.is_empty() {
+            return Err(Error::from_reason("Empty prompt"));
+        }
+
+        let (vision_encoder, img_proc) =
+            match (self.vision_encoder.clone(), self.image_processor.as_ref()) {
+                (Some(enc), Some(proc)) => (enc, proc),
+                _ => {
+                    return Err(Error::from_reason(
+                        "VLM prefill requested but vision encoder/processor not loaded",
                     ));
                 }
-                Err(err) => {
-                    write_inference_trace(format_args!(
-                        "[MLX_TRACE] qwen3.5-dense paged_linear_cache_export ok=false error={}",
-                        err
-                    ));
-                    self.caches = None;
+            };
+
+        self.paged_full_attn_caches_dirty = true;
+
+        let include_reasoning = p.include_reasoning;
+        let think_end_id = tokenizer.think_end_id();
+        let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
+        let thinking_enabled = thinking.enabled;
+        let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
+
+        let generation_start = if report_perf {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let mut first_token_instant: Option<std::time::Instant> = None;
+        let sampling_config = p.sampling_config;
+
+        let mut decode_stream = tokenizer.inner().decode_stream(true);
+        let mut streamed_text_len = 0usize;
+        let mut last_is_reasoning = thinking_enabled;
+
+        // === VLM image processing: expand placeholders + merge features ===
+        let sms = self.spatial_merge_size.unwrap_or(2);
+        let image_refs: Vec<&[u8]> = images.iter().map(|v| v.as_slice()).collect();
+        let processed = img_proc.process_many(&image_refs)?;
+        let per_image_token_counts =
+            compute_image_token_counts_per_image(&processed.grid_thw(), sms)?;
+        let expanded_tokens = inject_image_placeholders(&tokens, &per_image_token_counts);
+        let image_cache_key = compute_image_cache_key(images);
+        let prompt_token_count = expanded_tokens.len() as u32;
+
+        let embed = self.embedding.clone();
+        let embedding_weight = embed.get_weight();
+        let input_ids = MxArray::from_uint32(&expanded_tokens, &[1, expanded_tokens.len() as i64])?;
+
+        let generation_stream = Stream::new(DeviceType::Gpu);
+        let model_size_bytes = self.config.estimate_memory_bytes() as usize;
+        let _wired_ctx =
+            crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
+
+        let merge = vlm_prepare_vision_features(
+            &input_ids,
+            image_cache_key,
+            &processed,
+            &vision_encoder,
+            sms,
+            &embedding_weight,
+            generation_stream,
+            &self.vision_cache,
+        )?;
+
+        // === Cold-start the paged adapter on the expanded sequence ===
+        let seq_id: u32 = 0;
+        let total_budget = expanded_tokens.len() as u32;
+        {
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("vision_paged_turn_stream_core: paged_adapter is None")
+            })?;
+            adapter
+                .prepare_turn_with_max_cache_hit_tokens(
+                    seq_id,
+                    &expanded_tokens,
+                    total_budget,
+                    /* reuse_cache */ false,
+                    &[],
+                    /* cache_salt */ 0,
+                    /* skip_lookup */ true,
+                    /* max_cache_hit_tokens */ 0,
+                )
+                .map_err(Error::from_reason)?;
+        }
+        self.cached_token_history.clear();
+        self.cached_image_key = None;
+        self.cached_rope_deltas = None;
+
+        let new_caches = (0..self.config.num_layers as usize)
+            .map(|i| {
+                if self.config.is_linear_layer(i) {
+                    Qwen3_5LayerCache::new_linear()
+                } else {
+                    Qwen3_5LayerCache::new_full_attention()
                 }
+            })
+            .collect();
+        self.caches = Some(new_caches);
+
+        let layer_kinds =
+            super::decoder_layer::compute_layer_kinds(self.config.num_layers as usize, |i| {
+                self.config.is_linear_layer(i)
+            });
+
+        let forward_result = (|| -> Result<(Vec<u32>, String)> {
+            // === PREFILL ===
+            let last_logits = {
+                let _stream_ctx = StreamContext::new(generation_stream);
+                let caches_ref = self.caches.as_mut().ok_or_else(|| {
+                    Error::from_reason("vision_paged_turn_stream_core: caches not initialized")
+                })?;
+                let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                    Error::from_reason("vision_paged_turn_stream_core: paged_adapter dropped")
+                })?;
+                super::paged_forward::run_paged_vlm_prefill(
+                    &expanded_tokens,
+                    &merge,
+                    &embed,
+                    &mut self.layers,
+                    caches_ref,
+                    &self.final_norm,
+                    &self.lm_head,
+                    &embedding_weight,
+                    &layer_kinds,
+                    adapter,
+                )?
+            };
+
+            let mut token_history: Vec<u32> = expanded_tokens.clone();
+            let last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
+            let mut y = sample(&last_logits, sampling_config)?;
+            y.eval();
+
+            crate::array::synchronize_and_clear_cache();
+            if report_perf {
+                first_token_instant = Some(std::time::Instant::now());
+            }
+
+            let max_new_tokens = p.max_new_tokens;
+            let mut generated_tokens: Vec<u32> =
+                Vec::with_capacity(engine::generated_capacity_hint(max_new_tokens));
+            let mut finish_reason = String::from("length");
+
+            for step in 0..max_new_tokens {
+                let token_id = y.item_at_int32(0)? as u32;
+                generated_tokens.push(token_id);
+                token_history.push(token_id);
+                let is_reasoning = reasoning_tracker.observe_token(token_id);
+                last_is_reasoning = is_reasoning;
+
+                if token_id == eos_token_id || p.extra_eos_ids.contains(&token_id) {
+                    finish_reason = String::from("stop");
+                    break;
+                }
+                if cancelled.load(Ordering::Relaxed) {
+                    finish_reason = String::from("cancelled");
+                    break;
+                }
+
+                let token_text = Qwen3Tokenizer::step_decode_stream(
+                    &mut decode_stream,
+                    tokenizer.inner(),
+                    token_id,
+                    &generated_tokens,
+                    streamed_text_len,
+                );
+                streamed_text_len += token_text.len();
+                if include_reasoning || !is_reasoning {
+                    cb.call(
+                        Ok(ChatStreamChunk {
+                            text: token_text,
+                            done: false,
+                            finish_reason: None,
+                            tool_calls: None,
+                            thinking: None,
+                            num_tokens: None,
+                            prompt_tokens: None,
+                            reasoning_tokens: None,
+                            raw_text: None,
+                            cached_tokens: None,
+                            performance: None,
+                            is_reasoning: Some(is_reasoning),
+                        }),
+                        ThreadsafeFunctionCallMode::NonBlocking,
+                    );
+                }
+
+                if let Some(reason) = crate::sampling::check_repetition_cutoff(
+                    &generated_tokens,
+                    p.max_consecutive_tokens,
+                    p.max_ngram_repeats,
+                    p.ngram_size,
+                ) {
+                    finish_reason = reason.to_string();
+                    break;
+                }
+                if step + 1 >= max_new_tokens {
+                    break;
+                }
+
+                let next_logits = {
+                    let _stream_ctx = StreamContext::new(generation_stream);
+                    let caches_ref = self.caches.as_mut().ok_or_else(|| {
+                        Error::from_reason(
+                            "vision_paged_turn_stream_core: caches dropped mid-decode",
+                        )
+                    })?;
+                    let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                        Error::from_reason(
+                            "vision_paged_turn_stream_core: paged_adapter dropped mid-decode",
+                        )
+                    })?;
+                    let logits = super::paged_forward::run_paged_decode_step(
+                        token_id,
+                        &embed,
+                        &mut self.layers,
+                        caches_ref,
+                        &self.final_norm,
+                        &self.lm_head,
+                        &embedding_weight,
+                        &layer_kinds,
+                        adapter,
+                    )?;
+                    logits.squeeze(Some(&[1]))?
+                };
+
+                if reasoning_tracker.should_force_think_end() {
+                    let forced_id = reasoning_tracker.forced_token_id()? as i32;
+                    y = MxArray::from_int32(&[forced_id], &[1])?;
+                    y.eval();
+                    continue;
+                }
+                let next_logits = apply_all_penalties(next_logits, &token_history, &p)?;
+
+                y = sample(&next_logits, sampling_config)?;
+                y.eval();
+
+                crate::array::maybe_clear_cache_for_paged_step(step);
+            }
+
+            Ok((generated_tokens, finish_reason))
+        })();
+
+        // Terminal lifecycle, mirroring the text paged core. The error path
+        // always releases and returns. The success path is resolved below so
+        // the session ends FULLY continuable (keep-live + GDN checkpoint +
+        // history + image key) or NON-continuable (released + history cleared +
+        // image key None), never partial — a follow-up text continue must never
+        // cold-prefill image-placeholder ids as ordinary tokens.
+        let (generated_tokens, finish_reason) = match forward_result {
+            Ok(t) => t,
+            Err(e) => {
+                if let Some(adapter) = self.paged_adapter.as_mut() {
+                    let _ = adapter.release_request();
+                }
+                return Err(e);
+            }
+        };
+
+        // Saved history: expanded prompt + generated[..len-1] (drop-last rule
+        // shared with the sync sibling / text paged core).
+        let mut full_history = expanded_tokens.clone();
+        if !generated_tokens.is_empty() {
+            full_history.extend_from_slice(&generated_tokens[..generated_tokens.len() - 1]);
+        }
+
+        // Keep-live before the GDN checkpoint (which snapshots the live state);
+        // checkpoint reads `cached_token_history`, so publish it first. Any
+        // failure downgrades to NON-continuable rather than discarding output.
+        let keep_live_ok = p.reuse_cache
+            && match self.paged_adapter.as_mut() {
+                Some(adapter) => {
+                    let total_for_finalize = adapter.request_tokens().len();
+                    let bs = adapter.block_size();
+                    let finalize_extra_keys =
+                        engine::build_paged_extra_keys(total_for_finalize, bs, &[]);
+                    adapter
+                        .finalize_turn_keep_live_per_block(&finalize_extra_keys, 0)
+                        .is_ok()
+                }
+                None => false,
+            };
+        let continuable = if keep_live_ok {
+            self.cached_token_history = full_history;
+            self.remember_dense_gdn_history_checkpoint().is_ok()
+        } else {
+            false
+        };
+
+        if continuable {
+            self.cached_image_key = Some(image_cache_key);
+        } else {
+            // Non-continuable: release the request and reset to a pristine
+            // non-live state so a follow-up continue is rejected instead of
+            // cold-prefilling image-placeholder ids. `reset_caches_sync` nulls
+            // `self.caches` (so `has_live_session()` is false) and clears token
+            // history, image key, rope deltas, and GDN checkpoints.
+            if let Some(adapter) = self.paged_adapter.as_mut() {
+                let _ = adapter.release_request();
+            }
+            let _ = self.reset_caches_sync();
+        }
+
+        // Flush residual buffered bytes (mirrors flat / text paged streaming).
+        let full_text = tokenizer
+            .decode_sync(&generated_tokens, true)
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed to decode generated tokens: {}", e);
+                String::new()
+            });
+        if full_text.len() > streamed_text_len {
+            let residual = full_text[streamed_text_len..].to_string();
+            if include_reasoning || !last_is_reasoning {
+                cb.call(
+                    Ok(ChatStreamChunk {
+                        text: residual,
+                        done: false,
+                        finish_reason: None,
+                        tool_calls: None,
+                        thinking: None,
+                        num_tokens: None,
+                        prompt_tokens: None,
+                        reasoning_tokens: None,
+                        raw_text: None,
+                        cached_tokens: None,
+                        performance: None,
+                        is_reasoning: Some(last_is_reasoning),
+                    }),
+                    ThreadsafeFunctionCallMode::NonBlocking,
+                );
             }
         }
 
-        Ok((generated_tokens, finish_reason, None))
+        let performance = if report_perf {
+            compute_performance_metrics(
+                generation_start,
+                first_token_instant,
+                expanded_tokens.len(),
+                generated_tokens.len(),
+            )
+        } else {
+            None
+        };
+
+        let reasoning_tokens = reasoning_tracker.reasoning_token_count();
+        let result = finalize_chat_result(
+            &tokenizer,
+            &generated_tokens,
+            finish_reason,
+            think_end_id,
+            think_end_str.as_deref(),
+            performance,
+            include_reasoning,
+            thinking_enabled,
+            prompt_token_count,
+            reasoning_tokens,
+        )?;
+
+        cb.call(
+            Ok(ChatStreamChunk {
+                text: result.text.clone(),
+                done: true,
+                finish_reason: Some(result.finish_reason.clone()),
+                tool_calls: Some(result.tool_calls.clone()),
+                thinking: result.thinking.clone(),
+                num_tokens: Some(result.num_tokens),
+                prompt_tokens: Some(result.prompt_tokens),
+                reasoning_tokens: Some(result.reasoning_tokens),
+                raw_text: Some(result.raw_text.clone()),
+                cached_tokens: Some(0),
+                performance: result.performance.clone(),
+                is_reasoning: None,
+            }),
+            ThreadsafeFunctionCallMode::NonBlocking,
+        );
+
+        Ok(())
     }
 
     /// Block-paged streaming variant of [`Self::chat_stream_sync_inner`].
     ///
-    /// Mirrors `chat_sync_core_paged`'s adapter lifecycle and
+    /// Mirrors `paged_turn_sync_core`'s adapter lifecycle and
     /// per-layer dispatch but emits each generated token through the
     /// streaming callback as it is produced.
     #[allow(clippy::too_many_arguments)]
-    fn chat_stream_sync_core_paged(
+    fn paged_turn_stream_core(
         &mut self,
         tokens: Vec<u32>,
         tokenizer: Arc<Qwen3Tokenizer>,
         eos_token_id: u32,
-        p: chat_common::ChatParams,
+        p: engine::ChatParams,
         report_perf: bool,
-        cb: &StreamSender,
-        cancelled: &Arc<AtomicBool>,
+        cb: &StreamSender<'_>,
+        cancelled: &AtomicBool,
+        thinking: ThinkingSetup,
     ) -> Result<()> {
         if tokens.is_empty() {
             return Err(Error::from_reason("Empty prompt"));
@@ -4115,12 +3560,10 @@ impl Qwen35Inner {
 
         let think_end_id = tokenizer.think_end_id();
         let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
-        let thinking_enabled = true;
-        let mut reasoning_tracker = chat_common::ReasoningTracker::new(
-            thinking_enabled,
-            p.thinking_token_budget,
-            think_end_id,
-        );
+        // Thinking is resolved ONCE at turn entry and honors
+        // `enable_thinking=false`.
+        let thinking_enabled = thinking.enabled;
+        let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
 
         let generation_start = if report_perf {
             Some(std::time::Instant::now())
@@ -4135,61 +3578,37 @@ impl Qwen35Inner {
         let mut streamed_text_len = 0usize;
         let mut last_is_reasoning = thinking_enabled;
 
-        // C++ paged-decode availability + compile-lifecycle locks. See
-        // `chat_sync_core_paged` for the full rationale; this is the
-        // streaming twin.
-        let model_id = self.model_id;
-        let use_cpp_paged = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
-        let _dense_lock = if use_cpp_paged {
-            Some(
-                COMPILED_LIFECYCLE_MUTEX
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()),
-            )
-        } else {
-            None
-        };
-        let mut _weight_guard = None;
-        let use_cpp_paged = if use_cpp_paged {
-            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
-            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
-                _weight_guard = Some(guard);
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-
         // === Adapter lifecycle: warm continue OR cold start ===
         let seq_id: u32 = 0;
         // Lazy decode allocation: pass the prompt length only.
         let total_budget = tokens.len() as u32;
         // Per-block extra_keys for prefix-cache lookup. See the matching
-        // comment in `chat_sync_core_paged`.
+        // comment in `paged_turn_sync_core`.
         let block_size = {
             let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
-                Error::from_reason("chat_stream_sync_core_paged: paged_adapter is None")
+                Error::from_reason("paged_turn_stream_core: paged_adapter is None")
             })?;
             adapter.block_size()
         };
-        let lookup_extra_keys = chat_common::build_paged_extra_keys(tokens.len(), block_size, &[]);
+        let lookup_extra_keys = engine::build_paged_extra_keys(tokens.len(), block_size, &[]);
         let cache_salt = 0;
-        // See `chat_sync_core_paged` for the vLLM exact-prefix cap rationale.
+        // See `paged_turn_sync_core` for the vLLM exact-prefix cap rationale.
         let max_cache_hit_tokens = total_budget.saturating_sub(1);
         let live_ready;
         let live_prefix_match;
         let live_tokens_len;
         let mut live_mismatch = TokenPrefixMismatchTrace::default();
-        let (cached_prefix_len, continued_live_prefix) = {
-            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+        // Adapter-owned warm/cold lifecycle (see paged_turn_sync_core for
+        // the full bit-identity rationale: pre-turn immutable probe for the
+        // trace, extra_keys=&[] bit-equal to per-block for text-only,
+        // reuse_cache=true, suffix blocks allocated internally).
+        {
+            let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
                 Error::from_reason(
-                    "chat_stream_sync_core_paged: paged_adapter is None — caller must check \
+                    "paged_turn_stream_core: paged_adapter is None — caller must check \
                      use_block_paged_cache before dispatch",
                 )
             })?;
-
             live_ready = adapter.is_live_for_continue();
             let live_tokens = adapter.request_tokens();
             live_tokens_len = live_tokens.len();
@@ -4197,56 +3616,29 @@ impl Qwen35Inner {
             if trace_enabled && live_ready && !live_prefix_match {
                 live_mismatch = token_prefix_mismatch_trace(&tokens, live_tokens);
             }
-            let can_continue =
-                live_ready && live_prefix_match && live_tokens_len <= max_cache_hit_tokens as usize;
-
-            if can_continue {
-                match adapter.continue_turn(&tokens, total_budget) {
-                    Ok((prior_token_count, _newly_alloc)) => (prior_token_count, true),
-                    Err(_drift) => {
-                        let _ = adapter.release_request();
-                        adapter
-                            .reset_for_new_request(seq_id)
-                            .map_err(Error::from_reason)?;
-                        let prefix = adapter
-                            .find_cached_prefix_per_block_with_max_tokens(
-                                &tokens,
-                                &lookup_extra_keys,
-                                cache_salt,
-                                false,
-                                max_cache_hit_tokens,
-                            )
-                            .map_err(Error::from_reason)?;
-                        let cached = prefix.cached_token_count;
-                        adapter
-                            .allocate_suffix_blocks(total_budget)
-                            .map_err(Error::from_reason)?;
-                        (cached, false)
-                    }
-                }
-            } else {
-                if adapter.block_table().is_some() {
-                    let _ = adapter.release_request();
-                }
-                adapter
-                    .reset_for_new_request(seq_id)
-                    .map_err(Error::from_reason)?;
-                let prefix = adapter
-                    .find_cached_prefix_per_block_with_max_tokens(
-                        &tokens,
-                        &lookup_extra_keys,
-                        cache_salt,
-                        false,
-                        max_cache_hit_tokens,
-                    )
-                    .map_err(Error::from_reason)?;
-                let cached = prefix.cached_token_count;
-                adapter
-                    .allocate_suffix_blocks(total_budget)
-                    .map_err(Error::from_reason)?;
-                (cached, false)
-            }
-        };
+        }
+        let plan = self
+            .paged_adapter
+            .as_mut()
+            .ok_or_else(|| {
+                Error::from_reason(
+                    "paged_turn_stream_core: paged_adapter is None — caller must check \
+                     use_block_paged_cache before dispatch",
+                )
+            })?
+            .prepare_turn_with_max_cache_hit_tokens(
+                seq_id,
+                &tokens,
+                total_budget,
+                true,
+                &[],
+                cache_salt,
+                false,
+                max_cache_hit_tokens,
+            )
+            .map_err(Error::from_reason)?;
+        let cached_prefix_len = plan.cached_prefix_len;
+        let continued_live_prefix = plan.continued_live_prefix;
         if trace_enabled {
             write_inference_trace(format_args!(
                 "[MLX_TRACE] qwen3.5-dense paged_prefix_lookup prompt_tokens={} \
@@ -4282,7 +3674,7 @@ impl Qwen35Inner {
             .checked_sub(cached_prefix_len)
             .ok_or_else(|| {
                 Error::from_reason(
-                    "chat_stream_sync_core_paged: cached_prefix_len > total_prompt_tokens",
+                    "paged_turn_stream_core: cached_prefix_len > total_prompt_tokens",
                 )
             })?;
 
@@ -4291,7 +3683,7 @@ impl Qwen35Inner {
                 "[MLX_TRACE] qwen3.5-dense stream_paged_start prompt_tokens={} \
                  cached_prefix_tokens={} suffix_tokens={} block_size={} \
                  prefill_chunk_size={} prefill_eval_interval={} decode_clear_interval={} \
-                 cpp_paged_candidate={} gdn_prefix_state={}",
+                 gdn_prefix_state={}",
                 prompt_token_count,
                 cached_prefix_len,
                 suffix_len,
@@ -4299,12 +3691,11 @@ impl Qwen35Inner {
                 crate::array::paged_prefill_chunk_size(),
                 crate::array::paged_prefill_eval_interval(),
                 crate::array::paged_decode_cache_clear_interval(),
-                use_cpp_paged,
                 gdn_prefix_state
             ));
         }
 
-        let result = self.chat_stream_sync_core_paged_inner(
+        let result = self.paged_turn_stream_core_inner(
             &tokens,
             cached_prefix_len,
             suffix_len,
@@ -4320,7 +3711,6 @@ impl Qwen35Inner {
             &mut last_is_reasoning,
             cb,
             cancelled,
-            use_cpp_paged,
             gdn_prefix_already_primed,
         );
 
@@ -4329,7 +3719,7 @@ impl Qwen35Inner {
                 if let Some(adapter) = self.paged_adapter.as_mut() {
                     let total_for_finalize = adapter.request_tokens().len();
                     let finalize_extra_keys =
-                        chat_common::build_paged_extra_keys(total_for_finalize, block_size, &[]);
+                        engine::build_paged_extra_keys(total_for_finalize, block_size, &[]);
                     let _ = adapter.finalize_turn_keep_live_per_block(&finalize_extra_keys, 0);
                 }
                 t
@@ -4451,23 +3841,23 @@ impl Qwen35Inner {
     }
 
     /// Inner forward + streaming decode loop for
-    /// [`Self::chat_stream_sync_core_paged`]. Mirrors LFM2's
-    /// `chat_stream_sync_core_paged_inner`.
+    /// [`Self::paged_turn_stream_core`]. Mirrors LFM2's
+    /// `paged_turn_stream_core_inner`.
     ///
     /// Uses a C++ compiled paged decode dispatcher when
     /// `use_cpp_paged` is true. See the sync sibling
-    /// `chat_sync_core_paged_inner` for the cpp_session_ready gate
+    /// `paged_turn_sync_core_inner` for the cpp_session_ready gate
     /// rationale.
     #[allow(clippy::too_many_arguments)]
-    fn chat_stream_sync_core_paged_inner<'a>(
+    fn paged_turn_stream_core_inner<'a>(
         &mut self,
         tokens: &[u32],
         cached_prefix_len: u32,
         suffix_len: u32,
-        p: &chat_common::ChatParams,
+        p: &engine::ChatParams,
         sampling_config: Option<crate::sampling::SamplingConfig>,
         eos_token_id: u32,
-        reasoning_tracker: &mut chat_common::ReasoningTracker,
+        reasoning_tracker: &mut engine::ReasoningTracker,
         report_perf: bool,
         first_token_instant: &mut Option<std::time::Instant>,
         tokenizer: &'a Arc<Qwen3Tokenizer>,
@@ -4481,15 +3871,14 @@ impl Qwen35Inner {
         >,
         streamed_text_len: &mut usize,
         last_is_reasoning: &mut bool,
-        cb: &StreamSender,
-        cancelled: &Arc<AtomicBool>,
-        use_cpp_paged: bool,
+        cb: &StreamSender<'_>,
+        cancelled: &AtomicBool,
         gdn_prefix_already_primed: bool,
     ) -> Result<(Vec<u32>, String)> {
         // Invariant: caller-applied vLLM cap guarantees suffix_len > 0.
         debug_assert!(
             suffix_len > 0,
-            "chat_stream_sync_core_paged_inner: caller must cap max_cache_hit_tokens at prompt.len() - 1"
+            "paged_turn_stream_core_inner: caller must cap max_cache_hit_tokens at prompt.len() - 1"
         );
 
         let suffix = &tokens[(cached_prefix_len as usize)..];
@@ -4498,29 +3887,58 @@ impl Qwen35Inner {
                 self.config.is_linear_layer(i)
             });
 
+        // Eager paged MTP needs the prompt-tail hidden for the
+        // committed-history v2 seed, same as the sync core. Only capture it
+        // when the eager paged MTP arm will actually run.
+        let eager_mtp_paged = p.enable_mtp && self.has_mtp_weights();
+        let want_prompt_hidden =
+            eager_mtp_paged && !mtp_decode::mtp_no_prompt_prefill() && cached_prefix_len == 0;
+        let mtp_prompt_history = mtp_decode::mtp_prompt_history_selection(tokens.len());
+
+        let mut prompt_hidden: Option<MxArray> = None;
         let last_logits = {
             let embed = self.embedding.clone();
             let embedding_weight = embed.get_weight();
             let caches_ref = self.caches.as_mut().ok_or_else(|| {
-                Error::from_reason("chat_stream_sync_core_paged_inner: caches not initialized")
+                Error::from_reason("paged_turn_stream_core_inner: caches not initialized")
             })?;
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                Error::from_reason("chat_stream_sync_core_paged_inner: paged_adapter dropped")
+                Error::from_reason("paged_turn_stream_core_inner: paged_adapter dropped")
             })?;
-            super::paged_forward::run_paged_prefill_chunk(
-                tokens,
-                suffix,
-                cached_prefix_len,
-                gdn_prefix_already_primed,
-                &embed,
-                &mut self.layers,
-                caches_ref,
-                &self.final_norm,
-                &self.lm_head,
-                &embedding_weight,
-                &layer_kinds,
-                adapter,
-            )?
+            if want_prompt_hidden {
+                let (logits, ph) = super::paged_forward::run_paged_prefill_chunk_with_hidden(
+                    tokens,
+                    suffix,
+                    cached_prefix_len,
+                    gdn_prefix_already_primed,
+                    &embed,
+                    &mut self.layers,
+                    caches_ref,
+                    &self.final_norm,
+                    &self.lm_head,
+                    &embedding_weight,
+                    &layer_kinds,
+                    adapter,
+                    Some(mtp_prompt_history.keep_tokens),
+                )?;
+                prompt_hidden = Some(ph);
+                logits
+            } else {
+                super::paged_forward::run_paged_prefill_chunk(
+                    tokens,
+                    suffix,
+                    cached_prefix_len,
+                    gdn_prefix_already_primed,
+                    &embed,
+                    &mut self.layers,
+                    caches_ref,
+                    &self.final_norm,
+                    &self.lm_head,
+                    &embedding_weight,
+                    &layer_kinds,
+                    adapter,
+                )?
+            }
         };
 
         let mut token_history: Vec<u32> = tokens.to_vec();
@@ -4529,77 +3947,91 @@ impl Qwen35Inner {
         y.eval();
 
         // Smooth memory peak: drop transient prefill buffers before decode
-        // starts allocating (see chat_sync_core_paged_inner for rationale).
+        // starts allocating (see paged_turn_sync_core_inner for rationale).
         crate::array::synchronize_and_clear_cache();
 
         if report_perf {
             *first_token_instant = Some(std::time::Instant::now());
         }
 
-        // Decide between C++ compiled paged decode (fast) and pure-Rust
-        // paged decode (fallback). See `chat_sync_core_paged_inner` for
-        // the cpp_session_ready gate rationale.
-        let mut cpp_session_ready = if use_cpp_paged {
-            let caches_ref = self.caches.as_ref().ok_or_else(|| {
-                Error::from_reason("chat_stream_sync_core_paged_inner: caches dropped post-prefill")
-            })?;
-            let adapter_ref = self.paged_adapter.as_ref().ok_or_else(|| {
-                Error::from_reason(
-                    "chat_stream_sync_core_paged_inner: paged_adapter dropped post-prefill",
-                )
-            })?;
-            if adapter_ref.block_size() != CPP_PAGED_REQUIRED_BLOCK_SIZE {
-                eprintln!(
-                    "[MLX] Qwen3.5 Dense (stream): skipping C++ compiled paged decode — \
-                     adapter block_size={} but compiled graph requires {}; \
-                     falling back to pure-Rust paged decode",
-                    adapter_ref.block_size(),
-                    CPP_PAGED_REQUIRED_BLOCK_SIZE
-                );
-                false
-            } else {
-                let prefill_offset = adapter_ref.current_token_count() as i32;
-                init_paged_dense_compiled_session(
-                    &self.config,
-                    caches_ref,
-                    adapter_ref,
-                    prefill_offset,
-                )
-                .is_ok()
-            }
-        } else {
-            false
-        };
-
-        // RAII guard: even if a later forward fails and we flip
-        // `cpp_session_ready=false`, the guard still runs at scope exit
-        // so stale C++ globals don't leak into the next request.
-        let _dense_paged_guard = cpp_session_ready.then_some(CompiledResetGuard);
-
-        // Tracks whether ANY compiled C++ paged step has succeeded
-        // during this turn. After a successful compiled step the C++
-        // GDN linear-cache globals (conv_state / recurrent_state) have
-        // advanced but are never imported back into `self.caches`, so a
-        // pure-Rust fallback would read stale pre-step state. The
-        // mid-turn fallback below is therefore only safe BEFORE the
-        // first successful compiled step. See sync sibling
-        // `chat_sync_core_paged_inner` for the full rationale.
-        let mut cpp_compiled_step_completed = false;
-
         let max_new_tokens = p.max_new_tokens;
         let mut generated_tokens: Vec<u32> =
-            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens));
+            Vec::with_capacity(engine::generated_capacity_hint(max_new_tokens));
         let mut finish_reason = String::from("length");
 
-        let max_blocks_per_seq: u32 = {
-            let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
-                Error::from_reason(
-                    "chat_stream_sync_core_paged_inner: paged_adapter dropped pre-decode",
-                )
-            })?;
-            let max_seq = self.config.max_position_embeddings as u32;
-            max_seq.div_ceil(adapter.block_size())
-        };
+        if eager_mtp_paged {
+            // Pure-Rust ("eager") paged MTP — streaming twin of the sync core's
+            // `eager_mtp_paged` arm. Same stepper spine; the engine's
+            // `run_mtp_turn` streaming path emits decoded text per token via `cb`.
+            MxArray::async_eval_arrays(&[&y]);
+
+            let mut profiler =
+                crate::decode_profiler::DecodeProfiler::new("chat_paged_mtp_eager", "qwen3_5");
+            profiler.set_prompt_tokens(token_history.len() as u32);
+            profiler.snapshot_memory_before();
+
+            let eos_id = eos_token_id;
+            let generation_stream = crate::stream::Stream::new(crate::stream::DeviceType::Gpu);
+            let model_size_bytes = self.config.estimate_memory_bytes() as usize;
+            let _wired_ctx =
+                crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
+
+            let prompt_hidden_position_base = mtp_prompt_history.position_base;
+            let prompt_hidden_ids: Vec<u32> = {
+                let start = mtp_prompt_history
+                    .hidden_start_token_index()
+                    .min(tokens.len());
+                tokens[start..].to_vec()
+            };
+
+            let mut rng = rand::rng();
+
+            // Streaming twin of the sync paged arm: the propose/verify whole-turn
+            // loop is engine-owned (`run_mtp_turn`) and drives the
+            // `DenseMtpStepper` in its PAGED mode. The streaming sink wires the
+            // shared incremental detokenizer + the default ChatML emitter so
+            // accepted tokens stream out `cb` per token; the stepper's `Drop`
+            // restores `self.paged_adapter` before this call returns (the
+            // paged-history save below relies on it). `outcome.last_in_cache` is
+            // unused (the paged-history save owns cache state).
+            let mut emitter = crate::engine::backend::DefaultStreamEmitter;
+            let streaming = crate::engine::decode::StreamingCtx {
+                callback: cb.0,
+                cancelled,
+                decode_stream,
+                tokenizer: tokenizer.inner(),
+                streamed_text_len,
+                last_is_reasoning,
+                emitter: &mut emitter,
+            };
+
+            let outcome = crate::engine::mtp_turn::run_mtp_turn(
+                self,
+                &mut rng,
+                crate::engine::mtp_turn::MtpTurnArgs {
+                    y: y.clone(),
+                    depth: p.mtp_depth,
+                    params: p,
+                    reasoning_tracker,
+                    profiler: &mut profiler,
+                    max_new_tokens,
+                    eos_id,
+                    generated_tokens: &mut generated_tokens,
+                    token_history: &mut token_history,
+                    finish_reason: &mut finish_reason,
+                    first_token_instant,
+                    report_perf: p.report_performance,
+                    generation_stream,
+                    prompt_hidden,
+                    prompt_hidden_ids: Some(prompt_hidden_ids),
+                    prompt_hidden_position_base,
+                },
+                Some(streaming),
+            )?;
+            let _ = outcome.last_in_cache;
+
+            return Ok((generated_tokens, finish_reason));
+        }
 
         for step in 0..max_new_tokens {
             let token_id = y.item_at_int32(0)? as u32;
@@ -4608,7 +4040,7 @@ impl Qwen35Inner {
             let is_reasoning = reasoning_tracker.observe_token(token_id);
             *last_is_reasoning = is_reasoning;
 
-            if token_id == eos_token_id {
+            if token_id == eos_token_id || p.extra_eos_ids.contains(&token_id) {
                 finish_reason = String::from("stop");
                 break;
             }
@@ -4661,94 +4093,16 @@ impl Qwen35Inner {
                 break;
             }
 
-            // Decode forward. Defense-in-depth fallback: see
-            // `chat_sync_core_paged_inner` for the rollback rationale —
-            // mid-turn fallback only safe BEFORE the first successful
-            // compiled step.
-            let next_logits = if cpp_session_ready {
-                let embedding_weight = self.embedding.get_weight();
-                let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                    Error::from_reason(
-                        "chat_stream_sync_core_paged_inner: paged_adapter dropped mid-decode (cpp)",
-                    )
-                })?;
-                adapter
-                    .record_tokens(&[token_id])
-                    .map_err(Error::from_reason)?;
-                let inputs = adapter
-                    .build_paged_attention_inputs(1, 1, max_blocks_per_seq)
-                    .map_err(Error::from_reason)?;
-                let input_ids = MxArray::from_uint32(&[token_id], &[1, 1])?;
-                match forward_dense_cpp_paged(&input_ids, &embedding_weight, &inputs) {
-                    Ok(logits) => {
-                        cpp_compiled_step_completed = true;
-                        logits
-                    }
-                    Err(e) => {
-                        if chat_common::should_propagate_compiled_paged_error(
-                            cpp_compiled_step_completed,
-                        ) {
-                            eprintln!(
-                                "[MLX] Qwen3.5 Dense (stream): C++ compiled paged forward \
-                                 failed mid-decode (step={step}) AFTER an earlier compiled \
-                                 step succeeded. The C++ GDN linear-cache globals have \
-                                 advanced but those updates are not imported back into \
-                                 self.caches, so a pure-Rust fallback would run from stale \
-                                 pre-step state and silently corrupt the response. \
-                                 Propagating as fatal. cause: {e}"
-                            );
-                            adapter
-                                .rollback_last_tokens(1)
-                                .map_err(Error::from_reason)?;
-                            return Err(e);
-                        }
-                        eprintln!(
-                            "[MLX] Qwen3.5 Dense (stream): C++ compiled paged forward failed \
-                             on first decode step (step={step}); rolling back token cursor \
-                             and falling back to pure-Rust paged decode for the rest of \
-                             this request. cause: {e}"
-                        );
-                        adapter
-                            .rollback_last_tokens(1)
-                            .map_err(Error::from_reason)?;
-                        cpp_session_ready = false;
-                        let embed = self.embedding.clone();
-                        let embedding_weight_pure = embed.get_weight();
-                        let caches_ref = self.caches.as_mut().ok_or_else(|| {
-                            Error::from_reason(
-                                "chat_stream_sync_core_paged_inner: caches dropped during cpp fallback",
-                            )
-                        })?;
-                        let adapter_mut = self.paged_adapter.as_mut().ok_or_else(|| {
-                            Error::from_reason(
-                                "chat_stream_sync_core_paged_inner: paged_adapter dropped during cpp fallback",
-                            )
-                        })?;
-                        let logits = super::paged_forward::run_paged_decode_step(
-                            token_id,
-                            &embed,
-                            &mut self.layers,
-                            caches_ref,
-                            &self.final_norm,
-                            &self.lm_head,
-                            &embedding_weight_pure,
-                            &layer_kinds,
-                            adapter_mut,
-                        )?;
-                        logits.squeeze(Some(&[1]))?
-                    }
-                }
-            } else {
+            // Decode forward (pure-Rust paged step).
+            let next_logits = {
                 let embed = self.embedding.clone();
                 let embedding_weight = embed.get_weight();
                 let caches_ref = self.caches.as_mut().ok_or_else(|| {
-                    Error::from_reason(
-                        "chat_stream_sync_core_paged_inner: caches dropped mid-decode",
-                    )
+                    Error::from_reason("paged_turn_stream_core_inner: caches dropped mid-decode")
                 })?;
                 let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                     Error::from_reason(
-                        "chat_stream_sync_core_paged_inner: paged_adapter dropped mid-decode",
+                        "paged_turn_stream_core_inner: paged_adapter dropped mid-decode",
                     )
                 })?;
                 let logits = super::paged_forward::run_paged_decode_step(
@@ -4780,288 +4134,15 @@ impl Qwen35Inner {
             crate::array::maybe_clear_cache_for_paged_step(step);
         }
 
-        if cpp_compiled_step_completed {
-            match export_paged_dense_linear_caches(&self.config) {
-                Ok(Some(new_caches)) => {
-                    self.caches = Some(new_caches);
-                    eval_layer_caches(&self.caches)?;
-                    write_inference_trace(format_args!(
-                        "[MLX_TRACE] qwen3.5-dense paged_linear_cache_export ok=true"
-                    ));
-                }
-                Ok(None) => {
-                    self.caches = None;
-                    write_inference_trace(format_args!(
-                        "[MLX_TRACE] qwen3.5-dense paged_linear_cache_export ok=false reason=not_initialized"
-                    ));
-                }
-                Err(err) => {
-                    write_inference_trace(format_args!(
-                        "[MLX_TRACE] qwen3.5-dense paged_linear_cache_export ok=false error={}",
-                        err
-                    ));
-                    self.caches = None;
-                }
-            }
-        }
-
         Ok((generated_tokens, finish_reason))
-    }
-
-    /// Streaming chat (session-start variant): same semantics as
-    /// [`Self::chat_session_start_sync`] but streams token deltas through
-    /// `stream_tx` rather than returning a `ChatResult`. Stops on
-    /// `<|im_end|>`. Inherits the prefix-cache reuse contract — the
-    /// caches may carry state from a prior turn; `chat_stream_sync_inner`
-    /// verifies the prefix and resets on miss.
-    ///
-    /// Images are accepted on session start — the downstream
-    /// `chat_stream_sync_inner` already handles VLM prefill. Subsequent
-    /// turns in the same session go through
-    /// `chat_stream_session_continue_sync` which is text-only; changing
-    /// the image set mid-session requires starting a new session.
-    pub(crate) fn chat_stream_session_start_sync(
-        &mut self,
-        messages: Vec<ChatMessage>,
-        config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
-        cancelled: Arc<AtomicBool>,
-    ) {
-        let cb = StreamSender(stream_tx.clone());
-
-        // Guard: respect cancellation before doing any work.
-        if cancelled.load(Ordering::Relaxed) {
-            send_stream_error(
-                &stream_tx,
-                "chat_stream_session_start cancelled before start",
-            );
-            return;
-        }
-
-        // Guard: reuse_cache must not be explicitly disabled.
-        if config.reuse_cache == Some(false) {
-            send_stream_error(
-                &stream_tx,
-                "chat_stream_session_start requires reuse_cache=true (leave as None or set to true). \
-                 The session API only makes sense with cache reuse enabled.",
-            );
-            return;
-        }
-
-        // Resolve <|im_end|> for the eos override.
-        let im_end_id = match self.tokenizer.as_ref().and_then(|t| t.im_end_id()) {
-            Some(id) => id,
-            None => {
-                send_stream_error(
-                    &stream_tx,
-                    "chat_stream_session_start requires a tokenizer with an <|im_end|> special token",
-                );
-                return;
-            }
-        };
-
-        // Prefix-cache reuse contract: same as `chat_session_start_sync`.
-        // Any cached state from a prior turn is intentionally preserved so
-        // `chat_stream_sync_inner` can run `verify_cache_prefix_direct`
-        // against the freshly-tokenized prompt. The inner path resets the
-        // caches on a miss and reuses them on an exact-append hit. See
-        // the rustdoc on `verify_cache_prefix_direct` for the GDN-safety
-        // invariant that keeps this sound.
-
-        let result = self.chat_stream_sync_inner(messages, config, im_end_id, &cb, &cancelled);
-        if let Err(e) = result {
-            let _ = stream_tx.send(Err(e));
-        }
-    }
-
-    /// Streaming chat (session-continue variant): same semantics as
-    /// [`Self::chat_session_continue_sync`] but streams token deltas
-    /// through `stream_tx`. Builds the ChatML delta, tokenizes it, and
-    /// delegates to [`Self::chat_stream_tokens_delta_sync`].
-    ///
-    /// `images` is an opt-in guard parameter: non-empty input is
-    /// rejected via `send_stream_error` with an
-    /// `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:`-prefixed message so
-    /// the TS `ChatSession` layer can catch the prefix and route
-    /// image-changes back through a fresh session start.
-    pub(crate) fn chat_stream_session_continue_sync(
-        &mut self,
-        user_message: String,
-        images: Option<Vec<Uint8Array>>,
-        config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
-        cancelled: Arc<AtomicBool>,
-    ) {
-        if cancelled.load(Ordering::Relaxed) {
-            send_stream_error(
-                &stream_tx,
-                "chat_stream_session_continue cancelled before start",
-            );
-            return;
-        }
-
-        if images.as_ref().is_some_and(|v| !v.is_empty()) {
-            send_stream_error(
-                &stream_tx,
-                &format!(
-                    "{} chat_stream_session_continue is text-only; start a new session with chat_stream_session_start to change the image",
-                    chat_common::IMAGE_CHANGE_RESTART_PREFIX
-                ),
-            );
-            return;
-        }
-
-        let tokenizer = match self.tokenizer.as_ref() {
-            Some(t) => t.clone(),
-            None => {
-                send_stream_error(&stream_tx, "Tokenizer not loaded");
-                return;
-            }
-        };
-
-        // Sanitize the user message the same way chat_session_continue_sync
-        // does so the streaming path is subject to the same role/content
-        // injection protection.
-        let synthetic = build_synthetic_user_message(&user_message);
-        let sanitized = Qwen3Tokenizer::sanitize_messages_public(std::slice::from_ref(&synthetic));
-        let sanitized_user = &sanitized[0].content;
-
-        let enable_thinking = chat_common::resolve_enable_thinking(&config);
-        let delta_text = build_chatml_continue_delta_text(sanitized_user, enable_thinking);
-
-        let delta_tokens = match tokenizer.encode_sync(&delta_text, Some(false)) {
-            Ok(t) => t,
-            Err(e) => {
-                // Forward the tokenizer error as an mpsc send — this path
-                // signals generic errors via an error-result send rather
-                // than an error chunk, matching the `chat_stream_sync_inner`
-                // final-catch behavior.
-                let _ = stream_tx.send(Err(e));
-                return;
-            }
-        };
-
-        self.chat_stream_tokens_delta_sync(delta_tokens, config, stream_tx, cancelled);
-    }
-
-    /// Streaming analog of [`Self::chat_session_continue_tool_sync`].
-    ///
-    /// Builds a ChatML tool-response delta, tokenizes it, and delegates
-    /// to [`Self::chat_stream_tokens_delta_sync`]. Inherits the same
-    /// text-only-delta invariant. `is_error` is forwarded verbatim to
-    /// the wire-format renderer; see the non-streaming entry point for
-    /// the marker semantics.
-    pub(crate) fn chat_stream_session_continue_tool_sync(
-        &mut self,
-        tool_call_id: String,
-        content: String,
-        is_error: Option<bool>,
-        config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
-        cancelled: Arc<AtomicBool>,
-    ) {
-        if cancelled.load(Ordering::Relaxed) {
-            send_stream_error(
-                &stream_tx,
-                "chat_stream_session_continue_tool cancelled before start",
-            );
-            return;
-        }
-
-        let tokenizer = match self.tokenizer.as_ref() {
-            Some(t) => t.clone(),
-            None => {
-                send_stream_error(&stream_tx, "Tokenizer not loaded");
-                return;
-            }
-        };
-
-        let enable_thinking = chat_common::resolve_enable_thinking(&config);
-        let delta_text = chat_common::build_chatml_tool_delta_text(
-            &tool_call_id,
-            &content,
-            enable_thinking,
-            is_error,
-        );
-
-        let delta_tokens = match tokenizer.encode_sync(&delta_text, Some(false)) {
-            Ok(t) => t,
-            Err(e) => {
-                let _ = stream_tx.send(Err(e));
-                return;
-            }
-        };
-
-        self.chat_stream_tokens_delta_sync(delta_tokens, config, stream_tx, cancelled);
-    }
-
-    /// Streaming analog of [`Self::chat_tokens_delta_sync`]: prefill the
-    /// caller-provided delta tokens on top of the existing KV caches and
-    /// stream the reply through `stream_tx`.
-    ///
-    /// Applies the same four guards as the non-streaming path and —
-    /// critically — still calls `save_cache_state_direct` at the end
-    /// regardless of whether cancellation fired, so the cache stays
-    /// consistent for the next turn even on an early abort.
-    pub(crate) fn chat_stream_tokens_delta_sync(
-        &mut self,
-        delta_tokens: Vec<u32>,
-        config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
-        cancelled: Arc<AtomicBool>,
-    ) {
-        // Respect cancellation before any work.
-        if cancelled.load(Ordering::Relaxed) {
-            send_stream_error(
-                &stream_tx,
-                "chat_stream_tokens_delta cancelled before start",
-            );
-            return;
-        }
-
-        // --- Same four guards as chat_tokens_delta_sync ---
-        if config.reuse_cache == Some(false) {
-            send_stream_error(
-                &stream_tx,
-                "chat_stream_tokens_delta requires reuse_cache to be enabled; \
-                 the delta path operates on session state by construction",
-            );
-            return;
-        }
-        if self.caches.is_none() {
-            send_stream_error(
-                &stream_tx,
-                "chat_stream_tokens_delta requires an initialized session (call chatStreamSessionStart first)",
-            );
-            return;
-        }
-        if delta_tokens.is_empty() {
-            send_stream_error(
-                &stream_tx,
-                "chat_stream_tokens_delta requires a non-empty delta",
-            );
-            return;
-        }
-        // Text-only deltas are allowed on sessions whose KV cache carries
-        // prior image attention state — see `chat_tokens_delta_sync` for
-        // the full rationale. The outer `chat_stream_session_continue`
-        // gate already filters IMAGE-SET CHANGES via the
-        // `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` prefix path.
-
-        // All guards passed — enter the prefill+decode helper. Any error
-        // returned from here propagates as an mpsc error, same as
-        // `chat_stream_sync_inner`.
-        let cb = StreamSender(stream_tx.clone());
-        let result =
-            self.chat_stream_tokens_delta_sync_inner(delta_tokens, config, &cb, &cancelled);
-        if let Err(e) = result {
-            let _ = stream_tx.send(Err(e));
-        }
     }
 
     /// Prefill the delta tokens and run the streaming decode loop.
     ///
-    /// This mirrors [`Self::chat_stream_sync_inner`] but skips the
+    /// Whole-turn core for STREAMING delta turns reached through the
+    /// engine's `mtp_turn` probe (MTP-enabled sessions; non-MTP
+    /// streaming deltas run the engine's generic flow or the paged
+    /// probe). Mirrors [`Self::chat_stream_sync_inner`] but skips the
     /// message rendering + prefix verification stages — the caller owns
     /// cache coherence by construction. Uses `<|im_end|>` as eos so the
     /// cached history continues to end on a clean ChatML boundary after
@@ -5070,10 +4151,11 @@ impl Qwen35Inner {
         &mut self,
         delta_tokens: Vec<u32>,
         config: ChatConfig,
-        cb: &StreamSender,
-        cancelled: &Arc<AtomicBool>,
+        cb: &StreamSender<'_>,
+        cancelled: &AtomicBool,
+        thinking: ThinkingSetup,
     ) -> Result<()> {
-        let reuse_cache = config.reuse_cache.unwrap_or(true);
+        let _reuse_cache = config.reuse_cache.unwrap_or(true);
         let report_perf = config.report_performance.unwrap_or(false);
 
         let tokenizer = self
@@ -5100,8 +4182,8 @@ impl Qwen35Inner {
         let mut full_token_history = self.cached_token_history.clone();
         full_token_history.extend(delta_tokens.iter().copied());
 
-        let p = extract_chat_params(&config);
-        let enable_thinking = chat_common::resolve_enable_thinking(&config);
+        let mut p = extract_chat_params(&config);
+        p.extra_eos_ids = self.gen_defaults.eos_token_ids.clone();
 
         let generation_start = if report_perf {
             Some(std::time::Instant::now())
@@ -5109,8 +4191,6 @@ impl Qwen35Inner {
             None
         };
         let mut first_token_instant: Option<std::time::Instant> = None;
-
-        let model_id = self.model_id;
 
         // Paged streaming path does not carry an MTP gate;
         // MTP-on-paged streams continue to fall through to the dense
@@ -5128,7 +4208,7 @@ impl Qwen35Inner {
             );
         }
         if self.paged_adapter.is_some() && !mtp_takes_dense_path {
-            return self.chat_stream_sync_core_paged(
+            return self.paged_turn_stream_core(
                 full_token_history.clone(),
                 tokenizer_for_decode,
                 eos_id,
@@ -5136,33 +4216,9 @@ impl Qwen35Inner {
                 report_perf,
                 cb,
                 cancelled,
+                thinking,
             );
         }
-
-        // Compiled path availability check, same pattern as chat_tokens_delta_sync.
-        let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
-        let _compiled_lock = if use_compiled {
-            Some(
-                COMPILED_LIFECYCLE_MUTEX
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()),
-            )
-        } else {
-            None
-        };
-
-        let mut _weight_guard = None;
-        let use_compiled = if use_compiled {
-            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
-            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
-                _weight_guard = Some(guard);
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
 
         let embedding_weight = self.embedding.get_weight();
         let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
@@ -5187,7 +4243,7 @@ impl Qwen35Inner {
         // paged adapter's `LayerKVPool`, NOT in the flat `self.caches`
         // (which only ever received GDN linear conv/recurrent state). A
         // prior NON-streaming paged turn (`send()` → `chat_tokens_delta_sync`
-        // → `chat_sync_core_paged`) therefore leaves `self.caches`'
+        // → `paged_turn_sync_core`) therefore leaves `self.caches`'
         // full-attention slots EMPTY/STALE for the prior turn's tokens.
         // Delta-prefilling only `delta_tokens` on top of that and exporting
         // `self.caches` into the compiled/MTP graph would decode from an
@@ -5213,7 +4269,8 @@ impl Qwen35Inner {
         // session (`paged_adapter.is_none()`, `mtp_takes_dense_path == false`,
         // flag never set) is untouched: it keeps the delta-on-existing-caches
         // prefill below, byte-identical.
-        let rebuild_full_flat_prefill = mtp_takes_dense_path && self.paged_full_attn_caches_dirty;
+        let rebuild_full_flat_prefill = (mtp_takes_dense_path && self.paged_full_attn_caches_dirty)
+            || self.flat_mtp_caches_desynced;
         profiler.set_prompt_tokens(if rebuild_full_flat_prefill {
             full_token_history.len() as u32
         } else {
@@ -5251,6 +4308,8 @@ impl Qwen35Inner {
                 generation_stream,
             )?
         };
+        // caches now reflect the prefilled history
+        self.flat_mtp_caches_desynced = false;
         // The flat full-attention caches now cover the full history (rebuild
         // branch) or were already authoritative (delta branch). We do NOT
         // clear `paged_full_attn_caches_dirty` here: the clear is co-located
@@ -5260,8 +4319,7 @@ impl Qwen35Inner {
         // way the next paged→dense turn still performs the protective one-time
         // full rebuild over the authoritative history rather than trusting
         // half-advanced flat caches paired with a stale `cached_token_history`.
-        // (mtp-reload P2)
-        let seq_len = full_token_history.len() as i64;
+        let _seq_len = full_token_history.len() as i64;
         profiler.end_prefill();
 
         // Save snapshot for save_cache_state_direct (prior history + delta).
@@ -5278,429 +4336,52 @@ impl Qwen35Inner {
         let mut y = sample(&last_logits, p.sampling_config)?;
         MxArray::async_eval_arrays(&[&y]);
 
-        let _compiled_guard = if use_compiled {
-            Some(CompiledResetGuard)
-        } else {
-            None
-        };
-
-        let starts_in_thinking = enable_thinking.unwrap_or(true);
+        let starts_in_thinking = thinking.enabled;
         let mut last_is_reasoning = starts_in_thinking;
-        let mut reasoning_tracker = chat_common::ReasoningTracker::new(
-            starts_in_thinking,
-            p.thinking_token_budget,
-            think_end_id,
-        );
+        let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
 
-        if use_compiled {
-            // Initialize compiled state from prefill — text-only path, no
-            // VLM adjustments.
-            use mlx_sys as sys;
-            let prefill_len = seq_len as i32;
-            let max_kv_len = chat_common::kv_capacity_round_up(prefill_len, p.max_new_tokens)?;
-            let num_layers = self.config.num_layers as usize;
-            let mut cache_ptrs: Vec<*mut sys::mlx_array> =
-                vec![std::ptr::null_mut(); num_layers * 2];
-            if let Some(ref caches) = self.caches {
-                for (i, cache) in caches.iter().enumerate() {
-                    let (p0, p1) = cache.export_ptrs();
-                    cache_ptrs[i * 2] = p0;
-                    cache_ptrs[i * 2 + 1] = p1;
-                }
-            }
-            unsafe {
-                sys::mlx_qwen35_compiled_init_from_prefill(
-                    self.config.num_layers,
-                    self.config.hidden_size,
-                    self.config.num_heads,
-                    self.config.num_kv_heads,
-                    self.config.head_dim,
-                    self.config.rope_theta as f32,
-                    self.config.rope_dims(),
-                    self.config.rms_norm_eps as f32,
-                    self.config.full_attention_interval,
-                    self.config.linear_num_key_heads,
-                    self.config.linear_num_value_heads,
-                    self.config.linear_key_head_dim,
-                    self.config.linear_value_head_dim,
-                    self.config.linear_conv_kernel_dim,
-                    if self.config.tie_word_embeddings {
-                        1
-                    } else {
-                        0
-                    },
-                    max_kv_len,
-                    1,
-                    cache_ptrs.as_mut_ptr(),
-                    prefill_len,
-                );
-            }
-            // Re-apply the saved M-RoPE offset if the session carries
-            // image state. The delta prefill just ran against the live
-            // KV caches, which still encode the prior VLM prefill's
-            // image attention; without re-applying the offset here, the
-            // newly-built compiled graph would use a sequential M-RoPE
-            // position and misposition all decoded tokens relative to
-            // the cached image patches. `cached_rope_deltas` stays
-            // alive across deltas so chained text-only turns on the
-            // same image session keep the offset.
-            if let Some(delta) = self.cached_rope_deltas {
-                unsafe {
-                    mlx_sys::mlx_qwen35_compiled_adjust_offset(delta);
-                }
-            }
+        // Pure-Rust ("eager") dense MTP gate for the FLAT streaming delta path.
+        // Delta is text-only (no `has_images`) by construction; paged sessions
+        // returned earlier. Continuations have a live cache prefix so the
+        // committed-history builds from decode tokens with NO prompt seed
+        // (mirrors the non-stream delta path's `None, None, 0`).
+        let eager_mtp = p.enable_mtp && self.has_mtp_weights() && self.paged_adapter.is_none();
 
-            profiler.set_label("chat_stream_delta_compiled");
+        // Whether the final committed token reached the physical KV/GDN cache;
+        // written by the decode driver so the save below drops it when it was
+        // never forwarded (unforwarded stop token).
+        let mut last_in_cache = true;
 
-            let cond_enable_mtp = p.enable_mtp;
-            let cond_has_mtp_weights = self.has_mtp_weights();
-            let mut cond_init_ok: Option<bool> = None;
-            let mtp_active = cond_enable_mtp && cond_has_mtp_weights && {
-                let prefill_len = seq_len as i32;
-                match chat_common::kv_capacity_round_up(prefill_len, p.max_new_tokens) {
-                    Ok(max_kv_len) => match init_mtp_compiled_from_main(&self.config, max_kv_len) {
-                        Ok(()) => {
-                            cond_init_ok = Some(true);
-                            true
-                        }
-                        Err(e) => {
-                            cond_init_ok = Some(false);
-                            warn!(
-                                "W6 MTP init failed; falling back to single-token decode: {}",
-                                e.reason
-                            );
-                            false
-                        }
-                    },
-                    Err(e) => {
-                        // KV capacity would overflow i32 — disable MTP, fall back to AR
-                        // (the AR primary site above surfaces the same Err via `?`).
-                        cond_init_ok = Some(false);
-                        warn!(
-                            "Qwen3.5 MTP init skipped; KV capacity overflow: {}",
-                            e.reason
-                        );
-                        false
-                    }
-                }
-            };
-            info!(
-                "Qwen3.5 MTP gate (stream_delta): enable_mtp={} has_mtp_weights={} init_ok={:?} \
-                 -> mtp_active={}",
-                cond_enable_mtp, cond_has_mtp_weights, cond_init_ok, mtp_active
-            );
-            if mtp_active {
-                // Reset MTP compiled state on EVERY exit from this
-                // decode path — including the `?`-propagated abort out
-                // of `decode_loop_mtp!` (e.g. a failed
-                // `mlx_qwen35_mtp_compiled_commit`). The explicit
-                // post-macro `mlx_qwen35_mtp_compiled_reset()` only runs
-                // on the normal return; the guard's `Drop` covers the
-                // error path so the next turn always re-inits cleanly.
-                let _mtp_compiled_guard = MtpCompiledResetGuard;
-                // Thread-local CSPRNG; one `random::<f64>()` draw per
-                // emitted token via `accept_with_residual`.
-                let mut rng = rand::rng();
-                let mut mtp_ops = chat_common::MtpOps {
-                    forward_with_hidden: |ids: &MxArray,
-                                          emb: &MxArray|
-                     -> Result<(MxArray, MxArray, bool)> {
-                        let (l, h) = forward_compiled_with_hidden(ids, emb)?;
-                        Ok((l, h, false))
-                    },
-                    draft_step: |prev_hidden: &MxArray,
-                                 prev_emb: &MxArray|
-                     -> Result<(MxArray, MxArray)> {
-                        forward_mtp_draft_compiled(prev_hidden, prev_emb)
-                    },
-                    verify_step: |ids: &MxArray,
-                                  emb: &MxArray,
-                                  depth: usize|
-                     -> Result<chat_common::MtpVerifyOutput> {
-                        // Return (logits, verify-final hidden) so the cycle
-                        // macro can chain into the next cycle's first MTP draft
-                        // and skip Step A's ~150 ms main-model forward.
-                        forward_mtp_verify_compiled_with_hidden(ids, emb, depth as i32)
-                    },
-                    verify_step_argmax_only: Some(Box::new(
-                        |ids: &MxArray,
-                         emb: &MxArray,
-                         depth: usize|
-                         -> Result<chat_common::MtpVerifyOutput> {
-                            forward_mtp_verify_compiled_with_hidden_and_argmax_only(
-                                ids,
-                                emb,
-                                depth as i32,
-                            )
-                        },
-                    )),
-                    verify_step_sparse: Some(Box::new(
-                        |ids: &MxArray,
-                         emb: &MxArray,
-                         depth: usize,
-                         sampling_cfg: &SamplingConfig|
-                         -> Result<chat_common::MtpVerifyOutput> {
-                            forward_mtp_verify_compiled_with_hidden_and_sparse_target(
-                                ids,
-                                emb,
-                                depth as i32,
-                                sampling_cfg,
-                            )
-                        },
-                    )),
-                    rollback: |accepted_drafts: usize, depth: usize| unsafe {
-                        // Committed-history policy: the MTP offset is driven
-                        // ABSOLUTELY by the commit FFI
-                        // (`mlx_qwen35_mtp_compiled_commit` sets
-                        // `g_mtp_offset_int = g_mtp_committed_len`), which
-                        // already ran BEFORE this rollback. No cycle-policy
-                        // `adjust_offset` here — double-adjusting would corrupt
-                        // the absolute offset.
-                        //
-                        // The MAIN path's offset and GDN linear caches are
-                        // still restored via the `snapshot_main_linear` /
-                        // `restore_and_replay_main` pair below.
-                        let _ = (accepted_drafts, depth);
-                        // On full accept the verifier wrote exactly `depth + 1`
-                        // surviving main-cache steps. Replay that full prefix
-                        // from the GDN tape rather than keeping the raw batched
-                        // recurrent state. `_tape_replay` disarms internally.
-                        if accepted_drafts == depth && chat_common::mtp_use_tape_replay() {
-                            mlx_sys::mlx_qwen35_compiled_tape_replay((depth + 1) as i32);
-                        }
-                    },
-                    eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
-                        eval_token_and_compiled_caches(token);
-                        if budget_forced {
-                            logits.eval();
-                        }
-                    },
-                    // Fold the chained `verify_hidden[K]` slice into the same
-                    // async_eval batch as the post-cycle token + compiled
-                    // caches. See the chained-end-of-iteration call in
-                    // `decode_loop_mtp!` (chat_common.rs): without this the
-                    // slice stays lazy across the iteration boundary and the
-                    // next cycle's draft graph build forces a Metal roundtrip
-                    // the Step-A bypass doesn't pay.
-                    eval_step_with_chained_hidden: |token: &MxArray, chained_hidden: &MxArray| {
-                        eval_token_caches_and_chained_hidden(token, chained_hidden);
-                    },
-                    // Reset MTP K/V and re-anchor MTP offset to the main path's
-                    // current offset before each draft cycle. Without this the
-                    // MTP offset drifts 2 behind per cycle (Step A's forward +
-                    // verify[0]'s forward both write to the main path but not
-                    // to the MTP path), so MTP RoPE positions become wrong and
-                    // drafts diverge.
-                    begin_cycle: |chained_anchor: bool| unsafe {
-                        let old_mtp_offset = mlx_sys::mlx_qwen35_mtp_get_offset();
-                        let main_offset = mlx_sys::mlx_qwen35_get_cache_offset();
-                        if chained_anchor {
-                            mlx_sys::mlx_qwen35_mtp_compiled_begin_chained_cycle(main_offset);
-                        } else {
-                            mlx_sys::mlx_qwen35_mtp_compiled_begin_cycle(main_offset);
-                        }
-                        tracing::debug!(
-                            target: "mlx_core::mtp",
-                            old_mtp_offset,
-                            main_offset,
-                            new_mtp_offset = mlx_sys::mlx_qwen35_mtp_get_offset(),
-                            "MTP begin_cycle: cache re-anchored to main offset"
-                        );
-                    },
-                    // Snapshot the main path's GDN linear caches + offset
-                    // BEFORE the verify FFI runs its D+1 sequential forwards.
-                    // Verify mutates `g_compiled_caches` in place; without
-                    // restoring on rejection the GDN recurrent state stays
-                    // polluted with rejected-draft positions and the next Step
-                    // A produces wrong logits.
-                    //
-                    // When tape-replay is ENABLED (default; opt out via
-                    // `MLX_MTP_USE_TAPE_REPLAY=0`), also arm the GDN tape
-                    // recorder so the rollback path can replay accepted
-                    // innovations into the snapshot state via a single Metal
-                    // kernel instead of K+1 main-model forwards. Snapshot is
-                    // still required — the tape replay starts from the snapshot
-                    // state.
-                    snapshot_main_linear: || unsafe {
-                        mlx_sys::mlx_qwen35_compiled_snapshot_linear_caches();
-                        if chat_common::mtp_use_tape_replay() {
-                            mlx_sys::mlx_qwen35_compiled_tape_arm();
-                        }
-                    },
-                    // On rejection: restore linear caches + offset, then replay
-                    // the K accepted drafts via forward_compiled so the main
-                    // linear state matches the committed token stream. Each
-                    // replay call advances the offset by 1; K calls bring the
-                    // main offset to `snapshot_offset + K`.
-                    //
-                    // When tape-replay is ENABLED, replace the K+1 forwards
-                    // with a single `_tape_replay` FFI that applies the
-                    // recorded innovations to the snapshot state.
-                    // `accepted_drafts.len()` is `K + 1` here (the slice
-                    // contains `[last_committed_id, d_0, .., d_{K-1}]` — see
-                    // `run_mtp_cycle_inner`'s `replay_ids` construction).
-                    restore_and_replay_main: |accepted_drafts: &[u32],
-                                              emb: &MxArray|
-                     -> Result<()> {
-                        if chat_common::mtp_use_tape_replay() {
-                            let steps = accepted_drafts.len() as i32;
-                            unsafe {
-                                mlx_sys::mlx_qwen35_compiled_tape_replay(steps);
-                            }
-                            return Ok(());
-                        }
-                        unsafe {
-                            mlx_sys::mlx_qwen35_compiled_restore_linear_caches();
-                        }
-                        for &tok in accepted_drafts {
-                            let id_arr = MxArray::from_int32(&[tok as i32], &[1, 1])?;
-                            let (logits, _hidden) = forward_compiled_with_hidden(&id_arr, emb)?;
-                            // Force eval so the lazy graph chain is
-                            // bounded — mirrors the eval_step closure's
-                            // behaviour on the main decode path.
-                            logits.eval();
-                        }
-                        Ok(())
-                    },
-                    // Committed-history commit hook (dense path). Appends exact
-                    // MTP K/V for this cycle's K+1 committed tokens to the
-                    // persistent MTP cache so the next cycle's drafts attend
-                    // the full committed prefix. Runs unconditionally (full
-                    // accept + reject) — see `run_mtp_cycle_inner`.
-                    commit_mtp: |anchor: chat_common::MtpCommitAnchor,
-                                 seed_hidden: &MxArray,
-                                 verify_hiddens: &MxArray,
-                                 committed_ids: &[u32],
-                                 k_accepted: usize,
-                                 emb: &MxArray|
-                     -> Result<()> {
-                        match anchor {
-                            chat_common::MtpCommitAnchor::IncludeAnchor => commit_mtp_compiled(
-                                seed_hidden,
-                                verify_hiddens,
-                                committed_ids,
-                                k_accepted,
-                                emb,
-                            ),
-                            chat_common::MtpCommitAnchor::SkipAlreadyCommittedAnchor => {
-                                commit_mtp_compiled_from_verify_prefix(
-                                    verify_hiddens,
-                                    committed_ids,
-                                    emb,
-                                )
-                            }
-                        }
-                    },
-                    // Dense committed-history path. Forces the fused-draft path
-                    // OFF (its mask excludes the committed prefix) — see
-                    // `run_mtp_cycle_inner`.
-                    committed_history_active: true,
-                    rollback_unemitted: |_: usize| {},
-                };
-                chat_common::decode_loop_mtp!(
-                    mtp_ops: mtp_ops,
-                    mtp_depth: p.mtp_depth,
-                    mtp_rng: rng,
-                    y: y,
-                    embedding_weight: embedding_weight,
-                    params: p,
-                    reasoning_tracker: reasoning_tracker,
-                    profiler: profiler,
-                    max_new_tokens: p.max_new_tokens,
-                    eos_id: eos_id,
-                    generated_tokens: generated_tokens,
-                    token_history: token_history,
-                    finish_reason: finish_reason,
-                    first_token_instant: first_token_instant,
-                    report_perf: p.report_performance,
-                    generation_stream: generation_stream,
-                    streaming: {
-                        callback: cb,
-                        cancelled: cancelled,
-                        decode_stream: decode_stream,
-                        tokenizer: tokenizer_for_decode,
-                        streamed_text_len: streamed_text_len,
-                        last_is_reasoning: last_is_reasoning
-                    }
-                );
-                unsafe {
-                    mlx_sys::mlx_qwen35_mtp_compiled_reset();
-                }
-            } else {
-                let mut ops = chat_common::DecodeOps {
-                    forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
-                        Ok((forward_compiled(ids, emb)?, false))
-                    },
-                    eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
-                        eval_token_and_compiled_caches(token);
-                        if budget_forced {
-                            logits.eval();
-                        }
-                    },
-                };
-                chat_common::decode_loop!(
-                    ops: ops,
-                    y: y,
-                    embedding_weight: embedding_weight,
-                    params: p,
-                    reasoning_tracker: reasoning_tracker,
-                    profiler: profiler,
-                    max_new_tokens: p.max_new_tokens,
-                    eos_id: eos_id,
-                    generated_tokens: generated_tokens,
-                    token_history: token_history,
-                    finish_reason: finish_reason,
-                    first_token_instant: first_token_instant,
-                    report_perf: p.report_performance,
-                    generation_stream: generation_stream,
-                    streaming: {
-                        callback: cb,
-                        cancelled: cancelled,
-                        decode_stream: decode_stream,
-                        tokenizer: tokenizer_for_decode,
-                        streamed_text_len: streamed_text_len,
-                        last_is_reasoning: last_is_reasoning
-                    }
-                );
-            }
-
-            // Export caches from C++ so the next turn's Rust-side cache
-            // state is consistent with the compiled forward's view.
-            if reuse_cache {
-                let num_layers = self.config.num_layers as usize;
-                let mut export_ptrs: Vec<*mut mlx_sys::mlx_array> =
-                    vec![std::ptr::null_mut(); num_layers * 2];
-                let exported = unsafe {
-                    mlx_sys::mlx_qwen35_export_caches(
-                        export_ptrs.as_mut_ptr(),
-                        (num_layers * 2) as i32,
-                    )
-                };
-                if exported > 0 {
-                    let cache_offset = unsafe { mlx_sys::mlx_qwen35_get_cache_offset() };
-                    let mut new_caches = Vec::with_capacity(num_layers);
-                    for i in 0..num_layers {
-                        let p0 = export_ptrs[i * 2];
-                        let p1 = export_ptrs[i * 2 + 1];
-                        let mut lc = if self.config.is_linear_layer(i) {
-                            Qwen3_5LayerCache::new_linear()
-                        } else {
-                            Qwen3_5LayerCache::new_full_attention()
-                        };
-                        lc.import_ptrs(p0, p1, cache_offset);
-                        new_caches.push(lc);
-                    }
-                    self.caches = Some(new_caches);
-                    // See `chat_with_caches_inner` for rationale: force-eval
-                    // the exported lazy handles before `CompiledResetGuard`
-                    // clears `g_compiled_caches` at end of scope.
-                    eval_layer_caches(&self.caches)?;
-                }
-            }
+        if eager_mtp {
+            self.run_flat_stream_eager_mtp(
+                y,
+                &mut token_history,
+                &mut generated_tokens,
+                &mut finish_reason,
+                &mut reasoning_tracker,
+                &mut profiler,
+                &mut first_token_instant,
+                &mut streamed_text_len,
+                &mut last_is_reasoning,
+                &mut decode_stream,
+                &tokenizer_for_decode,
+                cb,
+                cancelled,
+                embedding_weight,
+                embedding_weight_t,
+                &p,
+                eos_id,
+                p.max_new_tokens,
+                generation_stream,
+                None,
+                None,
+                0,
+                &mut last_in_cache,
+            )?;
         } else {
             profiler.set_label("chat_stream_delta_rust");
 
-            let mut ops = chat_common::DecodeOps {
+            let mut ops = mtp_decode::DecodeOps {
                 forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
                     let logits = forward_inner(
                         ids,
@@ -5717,7 +4398,7 @@ impl Qwen35Inner {
                     MxArray::async_eval_arrays(&[token, logits]);
                 },
             };
-            chat_common::decode_loop!(
+            mtp_decode::decode_loop!(
                 ops: ops,
                 y: y,
                 embedding_weight: embedding_weight,
@@ -5729,6 +4410,7 @@ impl Qwen35Inner {
                 generated_tokens: generated_tokens,
                 token_history: token_history,
                 finish_reason: finish_reason,
+                last_in_cache: last_in_cache,
                 first_token_instant: first_token_instant,
                 report_perf: p.report_performance,
                 generation_stream: generation_stream,
@@ -5748,10 +4430,11 @@ impl Qwen35Inner {
         // consistent for the next turn. Delta continuations preserve
         // `cached_image_key` so the next turn's cache-prefix verify
         // still sees the prior prefill's image state.
-        chat_common::save_cache_state_after_delta(
+        engine::save_cache_state_after_delta(
             p.reuse_cache,
             &generated_tokens,
             &finish_reason,
+            /* drop_last_always */ !last_in_cache,
             &save_tokens,
             &mut self.cached_token_history,
             &mut self.cached_image_key,
@@ -5763,7 +4446,7 @@ impl Qwen35Inner {
         // committed history and the flat caches together, so the one-time
         // protective rebuild is no longer needed until a later paged-core turn
         // re-dirties it. Placing the clear here (not after prefill) guarantees
-        // any mid-turn `?`-error leaves the flag dirty. (mtp-reload P2)
+        // any mid-turn `?`-error leaves the flag dirty.
         self.paged_full_attn_caches_dirty = false;
 
         // Decode the full reply text and emit the final done chunk.
@@ -5802,10 +4485,10 @@ impl Qwen35Inner {
         let num_tokens = generated_tokens.len() as u32;
         let prompt_token_count = delta_tokens.len() as u32;
 
-        let (clean_text, tool_calls, thinking) = chat_common::parse_thinking_and_tools(
+        let (clean_text, tool_calls, thinking) = engine::parse_thinking_and_tools(
             &text,
             &generated_tokens,
-            enable_thinking.unwrap_or(true),
+            starts_in_thinking,
             think_end_id,
             think_end_str.as_deref(),
             p.include_reasoning,
@@ -5838,10 +4521,10 @@ impl Qwen35Inner {
                 num_tokens: Some(num_tokens),
                 prompt_tokens: Some(prompt_token_count),
                 reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
-                raw_text: Some(chat_common::raw_text_with_reasoning_suppressed(
+                raw_text: Some(engine::raw_text_with_reasoning_suppressed(
                     &text,
                     &generated_tokens,
-                    enable_thinking.unwrap_or(true),
+                    starts_in_thinking,
                     think_end_id,
                     think_end_str.as_deref(),
                     p.include_reasoning,
@@ -5860,13 +4543,21 @@ impl Qwen35Inner {
         Ok(())
     }
 
+    /// Whole-turn core for fresh STREAMING turns reached through the
+    /// engine's `vision_turn` (image-bearing) and `mtp_turn`
+    /// (MTP-enabled) probes. The engine already rendered the prompt
+    /// (`tokens`) and extracted the raw image payloads (`images`);
+    /// everything from the MTP-on-paged dispatch onward runs the
+    /// whole-turn pipeline.
     fn chat_stream_sync_inner(
         &mut self,
-        messages: Vec<ChatMessage>,
+        tokens: Vec<u32>,
+        images: &[Vec<u8>],
         config: ChatConfig,
         eos_token_id: u32,
-        cb: &StreamSender,
-        cancelled: &Arc<AtomicBool>,
+        cb: &StreamSender<'_>,
+        cancelled: &AtomicBool,
+        thinking: ThinkingSetup,
     ) -> Result<()> {
         let reuse_cache = config.reuse_cache.unwrap_or(true);
         let report_perf = config.report_performance.unwrap_or(false);
@@ -5877,25 +4568,14 @@ impl Qwen35Inner {
             .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
             .clone();
 
-        let has_images = messages
-            .iter()
-            .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()));
+        let has_images = !images.is_empty();
 
         let think_end_id = tokenizer.think_end_id();
         let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
         let tokenizer_for_decode = tokenizer.clone();
 
-        let tool_defs = config.tools.as_deref();
-        let enable_thinking = chat_common::resolve_enable_thinking(&config);
-        let tokens = tokenizer.apply_chat_template_sync(
-            &messages,
-            Some(true),
-            tool_defs,
-            enable_thinking,
-        )?;
-
-        let p = chat_common::extract_chat_params(&config);
-        let model_id = self.model_id;
+        let mut p = engine::extract_chat_params(&config);
+        p.extra_eos_ids = self.gen_defaults.eos_token_ids.clone();
 
         let generation_start = if report_perf {
             Some(std::time::Instant::now())
@@ -5904,9 +4584,27 @@ impl Qwen35Inner {
         };
         let mut first_token_instant: Option<std::time::Instant> = None;
 
-        // Paged streaming path does not carry an MTP gate;
-        // MTP-on-paged streams continue to fall through to the dense
-        // compiled streaming path. Non-MTP paged streams take the paged
+        // All image turns route to the paged-vision streaming core, which runs
+        // plain autoregressive decode regardless of MTP (the core has no
+        // draft/verify; MTP weights are ignored). This precedes the text-only
+        // MTP-on-paged gate below so an image+MTP stream still reaches the
+        // paged-vision core rather than the text dense fallback.
+        if has_images && self.paged_adapter.is_some() {
+            return self.vision_paged_turn_stream_core(
+                tokens,
+                images,
+                tokenizer_for_decode,
+                eos_token_id,
+                p,
+                report_perf,
+                cb,
+                cancelled,
+                thinking,
+            );
+        }
+
+        // Text-only paged dispatch. MTP-on-paged streams fall through to the
+        // dense (flat) streaming path; non-MTP paged streams take the paged
         // streaming core.
         let mtp_takes_dense_path =
             p.enable_mtp && self.has_mtp_weights() && self.paged_adapter.is_some();
@@ -5920,13 +4618,7 @@ impl Qwen35Inner {
             );
         }
         if self.paged_adapter.is_some() && !mtp_takes_dense_path {
-            if has_images {
-                return Err(Error::from_reason(
-                    "Qwen3.5 paged dispatch is text-only; image-bearing turns require \
-                     use_block_paged_cache=false (text-only turns continue to work).",
-                ));
-            }
-            return self.chat_stream_sync_core_paged(
+            return self.paged_turn_stream_core(
                 tokens,
                 tokenizer_for_decode,
                 eos_token_id,
@@ -5934,62 +4626,28 @@ impl Qwen35Inner {
                 report_perf,
                 cb,
                 cancelled,
+                thinking,
             );
         }
-        if mtp_takes_dense_path && has_images {
+
+        // The dense (flat) streaming fallback is text-only. A dense image turn
+        // requires the block-paged backend; reaching here with images means the
+        // model was loaded without a paged adapter (use_block_paged_cache=false,
+        // non-Metal build, or a sym8 checkpoint).
+        if has_images {
             return Err(Error::from_reason(
-                "Qwen3.5 MTP+paged dispatch is text-only; image-bearing MTP turns require \
-                 use_block_paged_cache=false (text-only turns continue to work).",
+                "qwen3.5 dense image turns require the block-paged KV backend; the model was \
+                 loaded without a paged adapter (use_block_paged_cache=false, non-Metal build, \
+                 or sym8 checkpoint)",
             ));
         }
 
-        // Check compiled path
-        let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
-        let _compiled_lock = if use_compiled {
-            Some(
-                COMPILED_LIFECYCLE_MUTEX
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()),
-            )
-        } else {
-            None
-        };
-
-        let mut _weight_guard = None;
-        let use_compiled = if use_compiled {
-            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
-            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
-                _weight_guard = Some(guard);
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-
         let embedding_weight = self.embedding.get_weight();
 
-        // VLM image processing
-        let sms = self.spatial_merge_size.unwrap_or(2);
-        let (expanded_tokens, current_image_cache_key, vlm_processed) = if has_images {
-            if let (Some(_vision_enc), Some(img_proc)) =
-                (self.vision_encoder.as_ref(), self.image_processor.as_ref())
-            {
-                let all_images = extract_images_from_messages(&messages);
-                let image_refs: Vec<&[u8]> = all_images.iter().map(|v| v.as_slice()).collect();
-                let processed_pre = img_proc.process_many(&image_refs)?;
-                let per_image_token_counts =
-                    compute_image_token_counts_per_image(&processed_pre.grid_thw(), sms)?;
-                let expanded = inject_image_placeholders(&tokens, &per_image_token_counts);
-                let cache_key = compute_image_cache_key(&all_images);
-                (expanded, cache_key, Some(processed_pre))
-            } else {
-                (tokens.clone(), 0u64, None)
-            }
-        } else {
-            (tokens.clone(), 0u64, None)
-        };
+        // Text-only from here: the `has_images` early-return above is the only
+        // image path. These bindings preserve the shared cache-reuse / decode
+        // plumbing (`has_images` is always false on this branch).
+        let (expanded_tokens, current_image_cache_key) = (tokens.clone(), 0u64);
 
         // Cache reuse
         let cached_prefix_len = verify_cache_prefix_direct(
@@ -6032,11 +4690,12 @@ impl Qwen35Inner {
         // so the flag stays dirty and the NEXT paged→dense turn performs the
         // protective one-time full rebuild instead of decoding from an
         // incomplete flat prefix. Mirrors the reviewed delta path.
-        let cached_prefix_len = if self.paged_full_attn_caches_dirty {
-            0
-        } else {
-            cached_prefix_len
-        };
+        let cached_prefix_len =
+            if self.paged_full_attn_caches_dirty || self.flat_mtp_caches_desynced {
+                0
+            } else {
+                cached_prefix_len
+            };
 
         let prefill_tokens = if cached_prefix_len > 0 {
             if has_images {
@@ -6073,7 +4732,7 @@ impl Qwen35Inner {
             tokens.clone()
         };
 
-        // Zero-delta guard. See the matching `chat_sync_core` comment for
+        // Zero-delta guard. See the matching `vision_mtp_whole_turn_core` comment for
         // the design rationale — rewinding a GDN recurrent cache by one
         // token is not possible, so the only safe response to an exact-
         // match prompt is a full reset + re-prefill.
@@ -6120,63 +4779,24 @@ impl Qwen35Inner {
         profiler.set_prompt_tokens(prefill_tokens.len() as u32);
         profiler.snapshot_memory_before();
 
-        // Prompt-prefix MTP prefill (streaming path). Mirrors the
-        // non-streaming `chat_with_caches_inner` logic: when MTP is active for
-        // this turn the prefill runs the hidden-emitting
-        // `chunked_prefill_with_hidden` so the per-prompt-token hiddens can be
-        // committed into the MTP committed-history cache before decode. Gated
-        // OFF on cache-reuse turns (`cached_prefix_len > 0`) — the
-        // prompt-prefill seed requires the FULL prompt's hiddens and the
-        // prefill only processes the uncached suffix there.
-        // `MLX_MTP_NO_PROMPT_PREFILL=1` opts out.
-        let want_prompt_hidden = p.enable_mtp
-            && self.has_mtp_weights()
-            && !chat_common::mtp_no_prompt_prefill()
-            && cached_prefix_len == 0;
-        let mtp_prompt_history = chat_common::mtp_prompt_history_selection(prefill_tokens.len());
+        // Pure-Rust ("eager") dense MTP gate for the FLAT streaming path.
+        // Same preconditions as `chat_with_caches_inner`: per-request /
+        // per-checkpoint enablement, no live paged adapter (paged streams
+        // returned earlier), text-only.
+        let eager_mtp =
+            p.enable_mtp && self.has_mtp_weights() && self.paged_adapter.is_none() && !has_images;
+        // The committed-history v2 seed needs the prompt tail's hiddens, which
+        // only the hidden-emitting prefill produces. Skip on cache-reuse turns
+        // (the captured hidden would cover the SUFFIX, not the full prompt) —
+        // committed-history still runs (it builds from decode tokens).
+        let want_prompt_hidden =
+            eager_mtp && !mtp_decode::mtp_no_prompt_prefill() && cached_prefix_len == 0;
+        let mtp_prompt_history = mtp_decode::mtp_prompt_history_selection(prefill_tokens.len());
         let mut prompt_hidden: Option<MxArray> = None;
 
-        // VLM or text prefill
+        // Text prefill
         profiler.begin_prefill();
-        let (mut last_logits, seq_len, vlm_compiled_init_done) = if has_images
-            && cached_prefix_len == 0
-        {
-            if let Some(vision_enc) = self.vision_encoder.clone() {
-                let final_tokens = &expanded_tokens;
-                let processed = vlm_processed
-                    .as_ref()
-                    .ok_or_else(|| Error::from_reason("VLM processed images missing"))?;
-
-                let input_ids =
-                    MxArray::from_uint32(final_tokens, &[1, final_tokens.len() as i64])?;
-
-                let (logits, rope_deltas, vlm_compiled) = vlm_prefill(
-                    &input_ids,
-                    current_image_cache_key,
-                    processed,
-                    &vision_enc,
-                    sms,
-                    &embedding_weight,
-                    &mut self.layers,
-                    &mut self.caches,
-                    &self.final_norm,
-                    &self.lm_head,
-                    &self.config,
-                    p.max_new_tokens,
-                    generation_stream,
-                    &self.vision_cache,
-                    model_id,
-                )?;
-
-                self.cached_rope_deltas = Some(rope_deltas as i32);
-                let vlm_seq_len = final_tokens.len() as i64;
-                (logits, vlm_seq_len, vlm_compiled)
-            } else {
-                return Err(Error::from_reason(
-                    "VLM prefill requested but vision encoder/processor not loaded",
-                ));
-            }
-        } else {
+        let (mut last_logits, _seq_len) = {
             let prompt = MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
             let last_logits = if want_prompt_hidden {
                 let (logits, ph) = chunked_prefill_with_hidden(
@@ -6205,14 +4825,11 @@ impl Qwen35Inner {
                 )?
             };
 
-            let total_seq_len = if has_images {
-                expanded_tokens.len() as i64
-            } else {
-                tokens.len() as i64
-            };
-            (last_logits, total_seq_len, false)
+            (last_logits, tokens.len() as i64)
         };
         profiler.end_prefill();
+        // caches now reflect the prefilled history
+        self.flat_mtp_caches_desynced = false;
 
         // On a paged→dense-MTP transition the dirty gate
         // forced `cached_prefix_len = 0`, so the prefill above was a full reset
@@ -6226,9 +4843,17 @@ impl Qwen35Inner {
         // trusting half-advanced flat caches against a stale committed history.
         // (No-op on the common non-paged path, where the flag is never set.)
 
-        // Pair the captured prompt hiddens with the exact `prefill_tokens`
-        // whose hiddens they hold. `Some` iff the hidden-emitting prefill ran
-        // above.
+        let mut token_history: Vec<u32> = tokens.clone();
+        last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
+        let mut y = sample(&last_logits, p.sampling_config)?;
+        MxArray::async_eval_arrays(&[&y]);
+
+        let starts_in_thinking = thinking.enabled;
+        let mut last_is_reasoning = starts_in_thinking;
+        let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
+
+        // Pair the captured prompt hidden with the exact prompt tail whose
+        // hiddens it holds (mirrors the non-stream caller at 1708-1717).
         let prompt_hidden_ids: Option<Vec<u32>> = prompt_hidden.as_ref().map(|_| {
             let start = mtp_prompt_history
                 .hidden_start_token_index()
@@ -6240,471 +4865,41 @@ impl Qwen35Inner {
             .map(|_| mtp_prompt_history.position_base)
             .unwrap_or(0);
 
-        let mut token_history: Vec<u32> = tokens.clone();
-        last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
-        let mut y = sample(&last_logits, p.sampling_config)?;
-        MxArray::async_eval_arrays(&[&y]);
+        // Whether the final committed token reached the physical KV/GDN cache;
+        // written by the decode driver so the save below drops it when it was
+        // never forwarded (unforwarded stop token).
+        let mut last_in_cache = true;
 
-        let _compiled_guard = if use_compiled {
-            Some(CompiledResetGuard)
-        } else {
-            None
-        };
-
-        let starts_in_thinking = enable_thinking.unwrap_or(true);
-        let mut last_is_reasoning = starts_in_thinking;
-        let mut reasoning_tracker = chat_common::ReasoningTracker::new(
-            starts_in_thinking,
-            p.thinking_token_budget,
-            think_end_id,
-        );
-
-        if use_compiled {
-            if vlm_compiled_init_done {
-                // VLM prefill already initialized compiled state
-            } else {
-                use mlx_sys as sys;
-                let prefill_len = seq_len as i32;
-                let max_kv_len = chat_common::kv_capacity_round_up(prefill_len, p.max_new_tokens)?;
-                let num_layers = self.config.num_layers as usize;
-                let mut cache_ptrs: Vec<*mut sys::mlx_array> =
-                    vec![std::ptr::null_mut(); num_layers * 2];
-                if let Some(ref caches) = self.caches {
-                    for (i, cache) in caches.iter().enumerate() {
-                        let (p0, p1) = cache.export_ptrs();
-                        cache_ptrs[i * 2] = p0;
-                        cache_ptrs[i * 2 + 1] = p1;
-                    }
-                }
-                unsafe {
-                    sys::mlx_qwen35_compiled_init_from_prefill(
-                        self.config.num_layers,
-                        self.config.hidden_size,
-                        self.config.num_heads,
-                        self.config.num_kv_heads,
-                        self.config.head_dim,
-                        self.config.rope_theta as f32,
-                        self.config.rope_dims(),
-                        self.config.rms_norm_eps as f32,
-                        self.config.full_attention_interval,
-                        self.config.linear_num_key_heads,
-                        self.config.linear_num_value_heads,
-                        self.config.linear_key_head_dim,
-                        self.config.linear_value_head_dim,
-                        self.config.linear_conv_kernel_dim,
-                        if self.config.tie_word_embeddings {
-                            1
-                        } else {
-                            0
-                        },
-                        max_kv_len,
-                        1,
-                        cache_ptrs.as_mut_ptr(),
-                        prefill_len,
-                    );
-                }
-
-                if has_images
-                    && cached_prefix_len > 0
-                    && let Some(delta) = self.cached_rope_deltas
-                {
-                    unsafe {
-                        mlx_sys::mlx_qwen35_compiled_adjust_offset(delta);
-                    }
-                }
-            }
-
-            if !has_images {
-                self.cached_rope_deltas = None;
-            }
-
-            profiler.set_label("chat_stream_compiled");
-
-            let cond_enable_mtp = p.enable_mtp;
-            let cond_has_mtp_weights = self.has_mtp_weights();
-            let mut cond_init_ok: Option<bool> = None;
-            let mtp_active = cond_enable_mtp && cond_has_mtp_weights && {
-                let prefill_len = seq_len as i32;
-                match chat_common::kv_capacity_round_up(prefill_len, p.max_new_tokens) {
-                    Ok(max_kv_len) => match init_mtp_compiled_from_main(&self.config, max_kv_len) {
-                        Ok(()) => {
-                            cond_init_ok = Some(true);
-                            true
-                        }
-                        Err(e) => {
-                            cond_init_ok = Some(false);
-                            warn!(
-                                "W6 MTP init failed; falling back to single-token decode: {}",
-                                e.reason
-                            );
-                            false
-                        }
-                    },
-                    Err(e) => {
-                        // KV capacity would overflow i32 — disable MTP, fall back to AR
-                        // (the AR primary site above surfaces the same Err via `?`).
-                        cond_init_ok = Some(false);
-                        warn!(
-                            "Qwen3.5 MTP init skipped; KV capacity overflow: {}",
-                            e.reason
-                        );
-                        false
-                    }
-                }
-            };
-            info!(
-                "Qwen3.5 MTP gate (stream): enable_mtp={} has_mtp_weights={} init_ok={:?} \
-                 -> mtp_active={}",
-                cond_enable_mtp, cond_has_mtp_weights, cond_init_ok, mtp_active
-            );
-            if mtp_active {
-                // Reset MTP compiled state on EVERY exit from this
-                // decode path — including the `?`-propagated abort out
-                // of `decode_loop_mtp!` (e.g. a failed
-                // `mlx_qwen35_mtp_compiled_commit`). The explicit
-                // post-macro `mlx_qwen35_mtp_compiled_reset()` only runs
-                // on the normal return; the guard's `Drop` covers the
-                // error path so the next turn always re-inits cleanly.
-                let _mtp_compiled_guard = MtpCompiledResetGuard;
-
-                // Prompt-prefix MTP prefill (streaming path). Mirrors the
-                // non-streaming `chat_with_caches_inner` region: with MTP just
-                // inited and `g_mtp_committed_len == 0`, commit the prompt
-                // prefix (+ first sampled token `y`) into the MTP
-                // committed-history cache BEFORE the decode loop so the MTP
-                // heads attend over the prompt from cycle 1. Gated on
-                // `prompt_hidden` being captured by the hidden-emitting prefill
-                // (skipped on cache-reuse turns and when opted out).
-                if let (Some(ph), Some(ph_ids)) =
-                    (prompt_hidden.as_ref(), prompt_hidden_ids.as_ref())
-                {
-                    if !ph_ids.is_empty() {
-                        y.eval();
-                        let y_id = y.item_at_int32(0)? as u32;
-                        prefill_mtp_commit(
-                            ph,
-                            ph_ids,
-                            y_id,
-                            &embedding_weight,
-                            prompt_hidden_position_base,
-                        )?;
-                        info!(
-                            "Qwen3.5 MTP prompt-prefill (stream): committed prefix \
-                             ({} prompt-tail tokens + y, position_base={}) into MTP cache",
-                            ph_ids.len(),
-                            prompt_hidden_position_base,
-                        );
-                    } else {
-                        debug!(
-                            "Qwen3.5 MTP prompt-prefill (stream): prompt too short \
-                             ({} tokens) — skipped",
-                            ph_ids.len(),
-                        );
-                    }
-                }
-
-                // Thread-local CSPRNG; one `random::<f64>()` draw per
-                // emitted token via `accept_with_residual`.
-                let mut rng = rand::rng();
-                let mut mtp_ops = chat_common::MtpOps {
-                    forward_with_hidden: |ids: &MxArray,
-                                          emb: &MxArray|
-                     -> Result<(MxArray, MxArray, bool)> {
-                        let (l, h) = forward_compiled_with_hidden(ids, emb)?;
-                        Ok((l, h, false))
-                    },
-                    draft_step: |prev_hidden: &MxArray,
-                                 prev_emb: &MxArray|
-                     -> Result<(MxArray, MxArray)> {
-                        forward_mtp_draft_compiled(prev_hidden, prev_emb)
-                    },
-                    verify_step: |ids: &MxArray,
-                                  emb: &MxArray,
-                                  depth: usize|
-                     -> Result<chat_common::MtpVerifyOutput> {
-                        // Return (logits, verify-final hidden) so the cycle
-                        // macro can chain into the next cycle's first MTP draft
-                        // and skip Step A's ~150 ms main-model forward.
-                        forward_mtp_verify_compiled_with_hidden(ids, emb, depth as i32)
-                    },
-                    verify_step_argmax_only: Some(Box::new(
-                        |ids: &MxArray,
-                         emb: &MxArray,
-                         depth: usize|
-                         -> Result<chat_common::MtpVerifyOutput> {
-                            forward_mtp_verify_compiled_with_hidden_and_argmax_only(
-                                ids,
-                                emb,
-                                depth as i32,
-                            )
-                        },
-                    )),
-                    verify_step_sparse: Some(Box::new(
-                        |ids: &MxArray,
-                         emb: &MxArray,
-                         depth: usize,
-                         sampling_cfg: &SamplingConfig|
-                         -> Result<chat_common::MtpVerifyOutput> {
-                            forward_mtp_verify_compiled_with_hidden_and_sparse_target(
-                                ids,
-                                emb,
-                                depth as i32,
-                                sampling_cfg,
-                            )
-                        },
-                    )),
-                    rollback: |accepted_drafts: usize, depth: usize| unsafe {
-                        // Committed-history policy: the MTP offset is driven
-                        // ABSOLUTELY by the commit FFI
-                        // (`mlx_qwen35_mtp_compiled_commit` sets
-                        // `g_mtp_offset_int = g_mtp_committed_len`), which
-                        // already ran BEFORE this rollback. No cycle-policy
-                        // `adjust_offset` here — double-adjusting would corrupt
-                        // the absolute offset.
-                        //
-                        // The MAIN path's offset and GDN linear caches are
-                        // still restored via the `snapshot_main_linear` /
-                        // `restore_and_replay_main` pair below.
-                        let _ = (accepted_drafts, depth);
-                        // On full accept the verifier wrote exactly `depth + 1`
-                        // surviving main-cache steps. Replay that full prefix
-                        // from the GDN tape rather than keeping the raw batched
-                        // recurrent state. `_tape_replay` disarms internally.
-                        if accepted_drafts == depth && chat_common::mtp_use_tape_replay() {
-                            mlx_sys::mlx_qwen35_compiled_tape_replay((depth + 1) as i32);
-                        }
-                    },
-                    eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
-                        eval_token_and_compiled_caches(token);
-                        if budget_forced {
-                            logits.eval();
-                        }
-                    },
-                    // Fold the chained `verify_hidden[K]` slice into the same
-                    // async_eval batch as the post-cycle token + compiled
-                    // caches. See the chained-end-of-iteration call in
-                    // `decode_loop_mtp!` (chat_common.rs): without this the
-                    // slice stays lazy across the iteration boundary and the
-                    // next cycle's draft graph build forces a Metal roundtrip
-                    // the Step-A bypass doesn't pay.
-                    eval_step_with_chained_hidden: |token: &MxArray, chained_hidden: &MxArray| {
-                        eval_token_caches_and_chained_hidden(token, chained_hidden);
-                    },
-                    // Reset MTP K/V and re-anchor MTP offset to the main path's
-                    // current offset before each draft cycle. Without this the
-                    // MTP offset drifts 2 behind per cycle (Step A's forward +
-                    // verify[0]'s forward both write to the main path but not
-                    // to the MTP path), so MTP RoPE positions become wrong and
-                    // drafts diverge.
-                    begin_cycle: |chained_anchor: bool| unsafe {
-                        let old_mtp_offset = mlx_sys::mlx_qwen35_mtp_get_offset();
-                        let main_offset = mlx_sys::mlx_qwen35_get_cache_offset();
-                        if chained_anchor {
-                            mlx_sys::mlx_qwen35_mtp_compiled_begin_chained_cycle(main_offset);
-                        } else {
-                            mlx_sys::mlx_qwen35_mtp_compiled_begin_cycle(main_offset);
-                        }
-                        tracing::debug!(
-                            target: "mlx_core::mtp",
-                            old_mtp_offset,
-                            main_offset,
-                            new_mtp_offset = mlx_sys::mlx_qwen35_mtp_get_offset(),
-                            "MTP begin_cycle: cache re-anchored to main offset"
-                        );
-                    },
-                    // Snapshot the main path's GDN linear caches + offset
-                    // BEFORE the verify FFI runs its D+1 sequential forwards.
-                    // Verify mutates `g_compiled_caches` in place; without
-                    // restoring on rejection the GDN recurrent state stays
-                    // polluted with rejected-draft positions and the next Step
-                    // A produces wrong logits.
-                    //
-                    // When tape-replay is ENABLED (default; opt out via
-                    // `MLX_MTP_USE_TAPE_REPLAY=0`), also arm the GDN tape
-                    // recorder so the rollback path can replay accepted
-                    // innovations into the snapshot state via a single Metal
-                    // kernel instead of K+1 main-model forwards. Snapshot is
-                    // still required — the tape replay starts from the snapshot
-                    // state.
-                    snapshot_main_linear: || unsafe {
-                        mlx_sys::mlx_qwen35_compiled_snapshot_linear_caches();
-                        if chat_common::mtp_use_tape_replay() {
-                            mlx_sys::mlx_qwen35_compiled_tape_arm();
-                        }
-                    },
-                    // On rejection: restore linear caches + offset, then replay
-                    // the K accepted drafts via forward_compiled so the main
-                    // linear state matches the committed token stream. Each
-                    // replay call advances the offset by 1; K calls bring the
-                    // main offset to `snapshot_offset + K`.
-                    //
-                    // When tape-replay is ENABLED, replace the K+1 forwards
-                    // with a single `_tape_replay` FFI that applies the
-                    // recorded innovations to the snapshot state.
-                    // `accepted_drafts.len()` is `K + 1` here (the slice
-                    // contains `[last_committed_id, d_0, .., d_{K-1}]` — see
-                    // `run_mtp_cycle_inner`'s `replay_ids` construction).
-                    restore_and_replay_main: |accepted_drafts: &[u32],
-                                              emb: &MxArray|
-                     -> Result<()> {
-                        if chat_common::mtp_use_tape_replay() {
-                            let steps = accepted_drafts.len() as i32;
-                            unsafe {
-                                mlx_sys::mlx_qwen35_compiled_tape_replay(steps);
-                            }
-                            return Ok(());
-                        }
-                        unsafe {
-                            mlx_sys::mlx_qwen35_compiled_restore_linear_caches();
-                        }
-                        for &tok in accepted_drafts {
-                            let id_arr = MxArray::from_int32(&[tok as i32], &[1, 1])?;
-                            let (logits, _hidden) = forward_compiled_with_hidden(&id_arr, emb)?;
-                            // Force eval so the lazy graph chain is
-                            // bounded — mirrors the eval_step closure's
-                            // behaviour on the main decode path.
-                            logits.eval();
-                        }
-                        Ok(())
-                    },
-                    // Committed-history commit hook (dense path). Appends exact
-                    // MTP K/V for this cycle's K+1 committed tokens to the
-                    // persistent MTP cache so the next cycle's drafts attend
-                    // the full committed prefix. Runs unconditionally (full
-                    // accept + reject) — see `run_mtp_cycle_inner`.
-                    commit_mtp: |anchor: chat_common::MtpCommitAnchor,
-                                 seed_hidden: &MxArray,
-                                 verify_hiddens: &MxArray,
-                                 committed_ids: &[u32],
-                                 k_accepted: usize,
-                                 emb: &MxArray|
-                     -> Result<()> {
-                        match anchor {
-                            chat_common::MtpCommitAnchor::IncludeAnchor => commit_mtp_compiled(
-                                seed_hidden,
-                                verify_hiddens,
-                                committed_ids,
-                                k_accepted,
-                                emb,
-                            ),
-                            chat_common::MtpCommitAnchor::SkipAlreadyCommittedAnchor => {
-                                commit_mtp_compiled_from_verify_prefix(
-                                    verify_hiddens,
-                                    committed_ids,
-                                    emb,
-                                )
-                            }
-                        }
-                    },
-                    // Dense committed-history path. Forces the fused-draft path
-                    // OFF (its mask excludes the committed prefix) — see
-                    // `run_mtp_cycle_inner`.
-                    committed_history_active: true,
-                    rollback_unemitted: |_: usize| {},
-                };
-                chat_common::decode_loop_mtp!(
-                    mtp_ops: mtp_ops,
-                    mtp_depth: p.mtp_depth,
-                    mtp_rng: rng,
-                    y: y,
-                    embedding_weight: embedding_weight,
-                    params: p,
-                    reasoning_tracker: reasoning_tracker,
-                    profiler: profiler,
-                    max_new_tokens: p.max_new_tokens,
-                    eos_id: eos_id,
-                    generated_tokens: generated_tokens,
-                    token_history: token_history,
-                    finish_reason: finish_reason,
-                    first_token_instant: first_token_instant,
-                    report_perf: p.report_performance,
-                    generation_stream: generation_stream,
-                    streaming: {
-                        callback: cb,
-                        cancelled: cancelled,
-                        decode_stream: decode_stream,
-                        tokenizer: tokenizer_for_decode,
-                        streamed_text_len: streamed_text_len,
-                        last_is_reasoning: last_is_reasoning
-                    }
-                );
-                unsafe {
-                    mlx_sys::mlx_qwen35_mtp_compiled_reset();
-                }
-            } else {
-                let mut ops = chat_common::DecodeOps {
-                    forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
-                        Ok((forward_compiled(ids, emb)?, false))
-                    },
-                    eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
-                        eval_token_and_compiled_caches(token);
-                        if budget_forced {
-                            logits.eval();
-                        }
-                    },
-                };
-                chat_common::decode_loop!(
-                    ops: ops,
-                    y: y,
-                    embedding_weight: embedding_weight,
-                    params: p,
-                    reasoning_tracker: reasoning_tracker,
-                    profiler: profiler,
-                    max_new_tokens: p.max_new_tokens,
-                    eos_id: eos_id,
-                    generated_tokens: generated_tokens,
-                    token_history: token_history,
-                    finish_reason: finish_reason,
-                    first_token_instant: first_token_instant,
-                    report_perf: p.report_performance,
-                    generation_stream: generation_stream,
-                    streaming: {
-                        callback: cb,
-                        cancelled: cancelled,
-                        decode_stream: decode_stream,
-                        tokenizer: tokenizer_for_decode,
-                        streamed_text_len: streamed_text_len,
-                        last_is_reasoning: last_is_reasoning
-                    }
-                );
-            }
-
-            // Export caches
-            if reuse_cache {
-                let num_layers = self.config.num_layers as usize;
-                let mut export_ptrs: Vec<*mut mlx_sys::mlx_array> =
-                    vec![std::ptr::null_mut(); num_layers * 2];
-                let exported = unsafe {
-                    mlx_sys::mlx_qwen35_export_caches(
-                        export_ptrs.as_mut_ptr(),
-                        (num_layers * 2) as i32,
-                    )
-                };
-                if exported > 0 {
-                    let cache_offset = unsafe { mlx_sys::mlx_qwen35_get_cache_offset() };
-                    let mut new_caches = Vec::with_capacity(num_layers);
-                    for i in 0..num_layers {
-                        let p0 = export_ptrs[i * 2];
-                        let p1 = export_ptrs[i * 2 + 1];
-                        let mut lc = if self.config.is_linear_layer(i) {
-                            Qwen3_5LayerCache::new_linear()
-                        } else {
-                            Qwen3_5LayerCache::new_full_attention()
-                        };
-                        lc.import_ptrs(p0, p1, cache_offset);
-                        new_caches.push(lc);
-                    }
-                    self.caches = Some(new_caches);
-                    // See `chat_with_caches_inner` for rationale: force-eval
-                    // the exported lazy handles before `CompiledResetGuard`
-                    // clears `g_compiled_caches` at end of scope.
-                    eval_layer_caches(&self.caches)?;
-                }
-            }
+        if eager_mtp {
+            self.run_flat_stream_eager_mtp(
+                y,
+                &mut token_history,
+                &mut generated_tokens,
+                &mut finish_reason,
+                &mut reasoning_tracker,
+                &mut profiler,
+                &mut first_token_instant,
+                &mut streamed_text_len,
+                &mut last_is_reasoning,
+                &mut decode_stream,
+                &tokenizer_for_decode,
+                cb,
+                cancelled,
+                embedding_weight,
+                embedding_weight_t,
+                &p,
+                eos_id,
+                p.max_new_tokens,
+                generation_stream,
+                prompt_hidden,
+                prompt_hidden_ids,
+                prompt_hidden_position_base,
+                &mut last_in_cache,
+            )?;
         } else {
             profiler.set_label("chat_stream_rust");
 
-            let mut ops = chat_common::DecodeOps {
+            let mut ops = mtp_decode::DecodeOps {
                 forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
                     let logits = forward_inner(
                         ids,
@@ -6721,7 +4916,7 @@ impl Qwen35Inner {
                     MxArray::async_eval_arrays(&[token, logits]);
                 },
             };
-            chat_common::decode_loop!(
+            mtp_decode::decode_loop!(
                 ops: ops,
                 y: y,
                 embedding_weight: embedding_weight,
@@ -6733,6 +4928,7 @@ impl Qwen35Inner {
                 generated_tokens: generated_tokens,
                 token_history: token_history,
                 finish_reason: finish_reason,
+                last_in_cache: last_in_cache,
                 first_token_instant: first_token_instant,
                 report_perf: p.report_performance,
                 generation_stream: generation_stream,
@@ -6753,6 +4949,7 @@ impl Qwen35Inner {
             has_images,
             &generated_tokens,
             &finish_reason,
+            /* drop_last_always */ !last_in_cache,
             &tokens,
             Some(&expanded_tokens),
             current_image_cache_key,
@@ -6768,7 +4965,6 @@ impl Qwen35Inner {
         // paged-core turn re-dirties it. Placing the clear here (not after
         // prefill) guarantees any mid-turn `?`-error — prefill OR decode —
         // leaves the flag dirty so the next paged→dense turn rebuilds.
-        // (mtp-reload P2)
         self.paged_full_attn_caches_dirty = false;
 
         let text = tokenizer_for_decode
@@ -6811,10 +5007,10 @@ impl Qwen35Inner {
             tokens.len() as u32
         };
 
-        let (clean_text, tool_calls, thinking) = chat_common::parse_thinking_and_tools(
+        let (clean_text, tool_calls, thinking) = engine::parse_thinking_and_tools(
             &text,
             &generated_tokens,
-            enable_thinking.unwrap_or(true),
+            starts_in_thinking,
             think_end_id,
             think_end_str.as_deref(),
             p.include_reasoning,
@@ -6848,10 +5044,10 @@ impl Qwen35Inner {
                 num_tokens: Some(num_tokens),
                 prompt_tokens: Some(prompt_token_count),
                 reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
-                raw_text: Some(chat_common::raw_text_with_reasoning_suppressed(
+                raw_text: Some(engine::raw_text_with_reasoning_suppressed(
                     &text,
                     &generated_tokens,
-                    enable_thinking.unwrap_or(true),
+                    starts_in_thinking,
                     think_end_id,
                     think_end_str.as_deref(),
                     p.include_reasoning,
@@ -6903,14 +5099,29 @@ impl Qwen35Inner {
         let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
         let last_logits = last_logits.squeeze(Some(&[1]))?;
 
+        // Request value wins; otherwise fall back to the checkpoint's
+        // generation_config.json default; otherwise the sampler's builtin.
+        // When the request omits temperature, a `do_sample:false` in
+        // generation_config.json forces greedy decoding (temperature 0),
+        // overriding any gen-config temperature (HuggingFace transformers
+        // semantics) — `effective_temperature()` folds that rule in.
+        // This raw `generate` surface exposes only the four SamplingConfig
+        // fields (no repetition/presence/frequency penalty), so a
+        // generation_config repetition_penalty is honored on the ChatSession
+        // path but intentionally not here. ChatSession is the full-parity surface.
         let sampling_config = Some(SamplingConfig {
-            temperature: config.temperature,
-            top_k: config.top_k,
-            top_p: config.top_p,
-            min_p: config.min_p,
+            temperature: config
+                .temperature
+                .or(self.gen_defaults.effective_temperature()),
+            top_k: config.top_k.or(self.gen_defaults.top_k),
+            top_p: config.top_p.or(self.gen_defaults.top_p),
+            min_p: config.min_p.or(self.gen_defaults.min_p),
         });
 
         let eos_id = self.config.eos_token_id as u32;
+        // Extra stop ids from generation_config.json (e.g. a second EOS).
+        let extra_eos_ids = self.gen_defaults.eos_token_ids.clone();
+        let is_eos = |t: u32| t == eos_id || extra_eos_ids.contains(&t);
         let mut generated_tokens: Vec<u32> = Vec::new();
         let mut y = sample(&last_logits, sampling_config)?;
 
@@ -6919,7 +5130,7 @@ impl Qwen35Inner {
             let token_id = y.item_at_int32(0)? as u32;
             generated_tokens.push(token_id);
 
-            if token_id == eos_id {
+            if is_eos(token_id) {
                 break;
             }
 
@@ -6946,13 +5157,10 @@ impl Qwen35Inner {
             }
         }
 
+        let stopped_on_eos = generated_tokens.last().is_some_and(|&t| is_eos(t));
         self.reset_caches_sync()?;
 
-        let finish_reason = if generated_tokens.last().is_some_and(|&t| t == eos_id) {
-            "stop"
-        } else {
-            "length"
-        };
+        let finish_reason = if stopped_on_eos { "stop" } else { "length" };
 
         let text = if let Some(ref tok) = tokenizer {
             tok.decode_sync(&generated_tokens, true).unwrap_or_default()
@@ -6971,7 +5179,8 @@ impl Qwen35Inner {
     // ========== Training methods (run on model thread) ==========
 
     /// Initialize training state with optimizer and configuration.
-    fn init_training_sync(
+    /// Inherent body of [`TrainBackend::init_training_sync`].
+    fn init_training_sync_impl(
         &mut self,
         config: crate::grpo::engine::GRPOEngineConfig,
         _model_type: crate::training_model::ModelType,
@@ -7009,14 +5218,16 @@ impl Qwen35Inner {
         Ok(())
     }
 
-    fn save_optimizer_state_sync(&self, path: String) -> Result<()> {
+    /// Inherent body of [`TrainBackend::save_optimizer_state_sync`].
+    fn save_optimizer_state_sync_impl(&self, path: String) -> Result<()> {
         let ts = self.training_state.as_ref().ok_or_else(|| {
             napi::Error::from_reason("Training state not initialized. Call InitTraining first.")
         })?;
         ts.save_optimizer_state_sync(&path)
     }
 
-    fn load_optimizer_state_sync(&mut self, path: String) -> Result<()> {
+    /// Inherent body of [`TrainBackend::load_optimizer_state_sync`].
+    fn load_optimizer_state_sync_impl(&mut self, path: String) -> Result<()> {
         let ts = self.training_state.as_mut().ok_or_else(|| {
             napi::Error::from_reason("Training state not initialized. Call InitTraining first.")
         })?;
@@ -7028,7 +5239,8 @@ impl Qwen35Inner {
     /// Tokenizes prompts using Jinja2 chat template, generates completions,
     /// caches MxArray results in training_state for the subsequent training step,
     /// and returns plain data across the thread boundary.
-    fn generate_for_training_thread_sync(
+    /// Inherent body of [`TrainBackend::generate_for_training_thread_sync`].
+    fn generate_for_training_thread_sync_impl(
         &mut self,
         prompts: Vec<Vec<ChatMessage>>,
         group_size: usize,
@@ -7184,9 +5396,9 @@ impl Qwen35Inner {
         // changing behavior for valid budgets — the buffer still grows to hold
         // every generated token.
         let mut generated_tokens: Vec<u32> =
-            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens));
+            Vec::with_capacity(engine::generated_capacity_hint(max_new_tokens));
         let mut generated_logprobs: Vec<f32> = if return_logprobs {
-            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens))
+            Vec::with_capacity(engine::generated_capacity_hint(max_new_tokens))
         } else {
             Vec::new()
         };
@@ -7356,7 +5568,8 @@ impl Qwen35Inner {
     /// Consumes cached MxArrays from the generation phase, computes loss and
     /// gradients via autograd, validates and clips gradients, accumulates them,
     /// and applies the optimizer step when accumulation is complete.
-    fn train_step_grpo_sync(
+    /// Inherent body of [`TrainBackend::train_step_grpo_sync`].
+    fn train_step_grpo_sync_impl(
         &mut self,
         rewards: Vec<f64>,
         group_size: i32,
@@ -7573,8 +5786,8 @@ impl Qwen35Inner {
                     let scale_arr = MxArray::from_float32(&[scale], &[])?;
                     scaled_grads = grads
                         .iter()
-                        .map(|(name, grad)| (name.clone(), grad.mul(&scale_arr).unwrap()))
-                        .collect();
+                        .map(|(name, grad)| Ok((name.clone(), grad.mul(&scale_arr)?)))
+                        .collect::<Result<HashMap<_, _>>>()?;
                     &scaled_grads
                 } else {
                     &grads
@@ -7594,15 +5807,21 @@ impl Qwen35Inner {
                     grad_refs,
                 )?;
 
+                // `update_batch` above has already committed the optimizer's step
+                // counter and moment tensors. If this fallible delta build (or the
+                // atomic apply below) errors, the optimizer is left one step ahead
+                // of the still-unchanged model params (all deltas are built before
+                // any are applied). Accepted over panicking; such `?` failures are
+                // fatal device errors that abort the run.
                 // Create deltas: delta = param - updated (so param - 1.0 * delta = updated)
                 let delta_map: HashMap<String, MxArray> = param_names_vec
                     .iter()
                     .enumerate()
                     .map(|(i, name)| {
-                        let delta = param_refs[i].sub(&updated[i]).unwrap();
-                        (name.clone(), delta)
+                        let delta = param_refs[i].sub(&updated[i])?;
+                        Ok((name.clone(), delta))
                     })
-                    .collect();
+                    .collect::<Result<HashMap<_, _>>>()?;
 
                 let delta_refs: HashMap<String, &MxArray> =
                     delta_map.iter().map(|(k, v)| (k.clone(), v)).collect();
@@ -7689,7 +5908,8 @@ impl Qwen35Inner {
     /// Receives plain data (Vec<i32> + shape) from the SFT engine, reconstructs
     /// MxArrays on the model thread, computes SFT loss + gradients, validates,
     /// clips, accumulates, and applies optimizer step when accumulation is complete.
-    fn train_step_sft_sync(
+    /// Inherent body of [`TrainBackend::train_step_sft_sync`].
+    fn train_step_sft_sync_impl(
         &mut self,
         input_ids: Vec<i32>,
         input_shape: Vec<i64>,
@@ -7877,8 +6097,8 @@ impl Qwen35Inner {
                     let scale_arr = MxArray::from_float32(&[scale], &[])?;
                     scaled_grads = grads
                         .iter()
-                        .map(|(name, grad)| (name.clone(), grad.mul(&scale_arr).unwrap()))
-                        .collect();
+                        .map(|(name, grad)| Ok((name.clone(), grad.mul(&scale_arr)?)))
+                        .collect::<Result<HashMap<_, _>>>()?;
                     &scaled_grads
                 } else {
                     &grads
@@ -7898,14 +6118,20 @@ impl Qwen35Inner {
                     grad_refs,
                 )?;
 
+                // `update_batch` above has already committed the optimizer's step
+                // counter and moment tensors. If this fallible delta build (or the
+                // atomic apply below) errors, the optimizer is left one step ahead
+                // of the still-unchanged model params (all deltas are built before
+                // any are applied). Accepted over panicking; such `?` failures are
+                // fatal device errors that abort the run.
                 let delta_map: HashMap<String, MxArray> = param_names_vec
                     .iter()
                     .enumerate()
                     .map(|(i, name)| {
-                        let delta = param_refs[i].sub(&updated[i]).unwrap();
-                        (name.clone(), delta)
+                        let delta = param_refs[i].sub(&updated[i])?;
+                        Ok((name.clone(), delta))
                     })
-                    .collect();
+                    .collect::<Result<HashMap<_, _>>>()?;
 
                 let delta_refs: HashMap<String, &MxArray> =
                     delta_map.iter().map(|(k, v)| (k.clone(), v)).collect();
@@ -8225,60 +6451,1607 @@ impl Qwen35Inner {
     }
 }
 
-/// Wrapper around `StreamTx` that provides a `.call()` method matching the
-/// `ThreadsafeFunction` interface expected by the `decode_loop!` macro.
+/// Adapter giving the engine's [`ChunkSink`] the `.call()` shape the
+/// `decode_loop!` macro and the engine's `run_mtp_turn` loop (and the
+/// streaming cores behind the whole-turn probes) expect from a
+/// `ThreadsafeFunction`-like callback.
 ///
-/// This allows the macro to work unchanged for both:
-/// - MoE model: passes a real `ThreadsafeFunction`
-/// - Dense model: passes this `StreamSender` (dedicated-thread path)
-struct StreamSender(StreamTx<ChatStreamChunk>);
+/// The engine owns the channel and hands the probes a `&dyn ChunkSink`,
+/// so the wrapper forwards `.call()` to [`ChunkSink::send`]; the call
+/// mode is meaningless on the mpsc path and is dropped.
+struct StreamSender<'a>(&'a dyn ChunkSink);
 
-impl StreamSender {
+impl StreamSender<'_> {
     fn call(&self, result: napi::Result<ChatStreamChunk>, _mode: ThreadsafeFunctionCallMode) {
-        let _ = self.0.send(result);
+        self.0.send(result);
     }
 }
 
-/// RAII guard that calls `mlx_qwen35_compiled_reset()` on drop.
-///
-/// Ensures C++ compiled state is always cleaned up, even if the decode
-/// loop returns early via `?` operator. Without this, an error during decode
-/// would leave stale compiled state that corrupts the next generation call.
-struct CompiledResetGuard;
+/// Paged decode stepper for qwen3_5 dense (compiled-paged hybrid — the paged
+/// analog of the FLAT [`Qwen35Decode`]). Drives
+/// [`crate::engine::decode::run_decode_loop`] through the generic
+/// [`crate::engine::paged_turn::run_paged_turn`]: each `forward` runs the
+/// compiled C++ paged step when seeded, else the pure-Rust eager paged step.
+/// Created by `<Qwen35Inner as PagedBackend>::begin_paged_decode` (which armed
+/// the guards + seeded the C++ paged session), consumed across the whole decode
+/// loop, dropped at loop exit (the `CompiledResetGuard` resets the C++ paged
+/// globals on EVERY exit path).
+pub(crate) struct Qwen35PagedDecode<'a> {
+    inner: &'a mut Qwen35Inner,
+}
 
-impl Drop for CompiledResetGuard {
+impl DecodeStep for Qwen35PagedDecode<'_> {
+    fn forward(&mut self, input_ids: &MxArray) -> Result<(MxArray, bool)> {
+        // NOT on the hot path — the engine drives decode via
+        // `forward_with_token` (which hands the scalar the loop already read).
+        // Kept only to satisfy the trait; extract then delegate.
+        let token_id = input_ids.item_at_int32(0)? as u32;
+        self.forward_with_token(input_ids, token_id)
+    }
+
+    fn forward_with_token(
+        &mut self,
+        _input_ids: &MxArray,
+        token_id: u32,
+    ) -> Result<(MxArray, bool)> {
+        // Pure-Rust eager paged decode step.
+        //
+        // PERF: `token_id` is HANDED by the engine (already read once at the
+        // loop top via `y.item_at_int32`), so we do NOT re-`item_at_int32` the
+        // fresh `_input_ids` reshape — that redundant second per-step eval/sync
+        // measurably regressed decode. `_input_ids` is unused (kept for
+        // signature parity).
+        let logits = {
+            let embed = self.inner.embedding.clone();
+            let embedding_weight = embed.get_weight();
+            let layer_kinds = super::decoder_layer::compute_layer_kinds(
+                self.inner.config.num_layers as usize,
+                |i| self.inner.config.is_linear_layer(i),
+            );
+            let caches_ref = self.inner.caches.as_mut().ok_or_else(|| {
+                Error::from_reason("Qwen35PagedDecode::forward: caches dropped mid-decode")
+            })?;
+            let adapter = self.inner.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("Qwen35PagedDecode::forward: paged_adapter dropped mid-decode")
+            })?;
+            super::paged_forward::run_paged_decode_step(
+                token_id,
+                &embed,
+                &mut self.inner.layers,
+                caches_ref,
+                &self.inner.final_norm,
+                &self.inner.lm_head,
+                &embedding_weight,
+                &layer_kinds,
+                adapter,
+            )?
+            .squeeze(Some(&[1]))?
+        };
+
+        // `run_paged_decode_step` returns [1, 1, vocab]; the `squeeze([1])`
+        // above already collapses to [1, vocab], so `needs_squeeze = FALSE`.
+        Ok((logits, false))
+    }
+
+    fn eval_step(&mut self, next_token: &MxArray, _logits: &MxArray, _budget_forced: bool) {
+        // Single SYNCHRONOUS eval of `next_token`: the compiled-paged forward
+        // is bandwidth-bound, so an async two-wait (bottom `async_eval` +
+        // loop-top `y.eval`) would buy ZERO overlap. One `y.eval()` per sample
+        // is the cheapest correct cadence.
+        next_token.eval();
+    }
+
+    fn maintain_cache(&mut self, step: i32) {
+        // Per-step paged cache-clear cadence.
+        crate::array::maybe_clear_cache_for_paged_step(step);
+    }
+
+    // `materialize_final` — DO NOT override (default no-op). CRITICAL: dense
+    // paged drops the last token UNCONDITIONALLY (see `save_paged_history`).
+    // The adapter only advanced for the tokens the loop actually forwarded;
+    // re-running a decode step here for the final length-exit token would
+    // record a token the GDN/adapter state never advanced → recurrent-state
+    // desync vs the saved drop-last history.
+}
+
+/// qwen3_5 dense paged prefix state — the effective prefix/suffix split from
+/// `prepare_turn_with_max_cache_hit_tokens`, PLUS the full prompt tokens and
+/// the GDN-prime flag.
+///
+/// `full_tokens` is needed because the engine hands `paged_prefill` ONLY the
+/// suffix (`tokens[effective_cached_prefix_len..]`), but
+/// `run_paged_prefill_chunk` needs the FULL prompt for the GDN pre-pass over
+/// the cached prefix. `gdn_prefix_already_primed` is the dense-specific bit the
+/// prime resolves (the GDN recurrent state was already populated live / from a
+/// checkpoint / via replay) and `paged_prefill` threads into
+/// `run_paged_prefill_chunk` so the prefill skips re-priming the GDN prefix.
+pub(crate) struct Qwen35PrefixState {
+    effective_cached_prefix_len: usize,
+    suffix_len: usize,
+    full_tokens: Vec<u32>,
+    gdn_prefix_already_primed: bool,
+}
+
+impl PagedPrefix for Qwen35PrefixState {
+    fn effective_cached_prefix_len(&self) -> usize {
+        self.effective_cached_prefix_len
+    }
+    fn suffix_len(&self) -> usize {
+        self.suffix_len
+    }
+}
+
+impl PagedBackend for Qwen35Inner {
+    type PagedDecode<'a>
+        = Qwen35PagedDecode<'a>
+    where
+        Self: 'a;
+    type PrefixState = Qwen35PrefixState;
+
+    fn prime_prefix_state(
+        &mut self,
+        plan: &[u32],
+        _reuse_cache: bool,
+        _block_size: usize,
+        _extra_keys: &[u64],
+        cache_salt: u64,
+    ) -> Result<Self::PrefixState> {
+        // The `prepare_turn_…` + `prepare_dense_gdn_prefix_state` block that
+        // opens a dense paged turn.
+        let trace_enabled = inference_trace_enabled();
+        let total_budget = plan.len() as u32;
+        // vLLM exact-prefix cap: leave at least one prompt token to prefill so
+        // the decoder always has something to consume.
+        let max_cache_hit_tokens = total_budget.saturating_sub(1);
+        let seq_id: u32 = 0;
+        let block_size = {
+            let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
+                Error::from_reason(
+                    "prime_prefix_state: paged_adapter is None — caller must check \
+                     use_block_paged_cache before dispatch",
+                )
+            })?;
+            adapter.block_size()
+        };
+        // Per-block extra_keys for the GDN prefix-checkpoint lookup. text-only
+        // paged dispatch builds an all-empty per-block vec which is bit-equal to
+        // passing `&[]` to the adapter's uniform `prepare_turn` API; VLM-paged
+        // would replace the empty positions with real (token_pos, image_hash).
+        let lookup_extra_keys = engine::build_paged_extra_keys(plan.len(), block_size, &[]);
+
+        // Adapter-owned warm/cold lifecycle. The [MLX_TRACE] line below
+        // reads the PRE-turn live state, so probe the adapter immutably FIRST
+        // (prepare_turn mutates request_tokens via continue_turn/reset). The
+        // adapter re-reads the same state internally, so live_* is identical to
+        // what prepare_turn decides on. reuse_cache=true literal: continuation
+        // eligibility carries no reuse term (the engine's reuse_cache drives
+        // finalize/save instead). Suffix blocks are allocated inside
+        // prepare_turn.
+        let live_ready;
+        let live_prefix_match;
+        let live_tokens_len;
+        let mut live_mismatch = TokenPrefixMismatchTrace::default();
+        {
+            let adapter = self
+                .paged_adapter
+                .as_ref()
+                .ok_or_else(|| Error::from_reason("prime_prefix_state: paged_adapter is None"))?;
+            live_ready = adapter.is_live_for_continue();
+            let live_tokens = adapter.request_tokens();
+            live_tokens_len = live_tokens.len();
+            live_prefix_match = plan.starts_with(live_tokens);
+            if trace_enabled && live_ready && !live_prefix_match {
+                live_mismatch = token_prefix_mismatch_trace(plan, live_tokens);
+            }
+        }
+        let turn_plan = self
+            .paged_adapter
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("prime_prefix_state: paged_adapter is None"))?
+            .prepare_turn_with_max_cache_hit_tokens(
+                seq_id,
+                plan,
+                total_budget,
+                true,
+                &[],
+                cache_salt,
+                false,
+                max_cache_hit_tokens,
+            )
+            .map_err(Error::from_reason)?;
+        let cached_prefix_len = turn_plan.cached_prefix_len;
+        let continued_live_prefix = turn_plan.continued_live_prefix;
+        if trace_enabled {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] qwen3.5-dense paged_prefix_lookup prompt_tokens={} \
+                 cached_prefix_tokens={} continued_live_prefix={} live_ready={} \
+                 live_match={} live_tokens={} live_mismatch_at={} prompt_token={} live_token={}",
+                plan.len(),
+                cached_prefix_len,
+                continued_live_prefix,
+                live_ready,
+                live_prefix_match,
+                live_tokens_len,
+                live_mismatch.index,
+                live_mismatch.prompt_token,
+                live_mismatch.cached_token
+            ));
+        }
+
+        // GDN recurrent-state prime (live / checkpoint / replay). No qwen3/lfm2
+        // analog — dense carries GDN recurrent state across turns.
+        let gdn_prefix_preparation = self.prepare_dense_gdn_prefix_state(
+            plan,
+            cached_prefix_len,
+            block_size,
+            &lookup_extra_keys,
+            cache_salt,
+            continued_live_prefix,
+        )?;
+        let gdn_prefix_already_primed = gdn_prefix_preparation.already_primed;
+        // Clear the per-turn session state here (history is re-set in
+        // `save_paged_history`; rope deltas + image key are reset because the
+        // paged path does not carry them across turns).
+        self.cached_token_history.clear();
+        self.cached_image_key = None;
+        self.cached_rope_deltas = None;
+
+        let suffix_len = total_budget.checked_sub(cached_prefix_len).ok_or_else(|| {
+            Error::from_reason("prime_prefix_state: cached_prefix_len > total_prompt_tokens")
+        })? as usize;
+
+        Ok(Qwen35PrefixState {
+            effective_cached_prefix_len: cached_prefix_len as usize,
+            suffix_len,
+            full_tokens: plan.to_vec(),
+            gdn_prefix_already_primed,
+        })
+    }
+
+    fn paged_prefill(
+        &mut self,
+        suffix_tokens: &[u32],
+        prefix: &Self::PrefixState,
+        _stream: Stream,
+    ) -> Result<MxArray> {
+        // The NON-hidden paged prefill. `run_paged_prefill_chunk` writes K/V
+        // into the adapter pool, populates the GDN linear caches, runs the GDN
+        // pre-pass over the cached prefix from `full_tokens` (skipped when
+        // `gdn_prefix_already_primed`), then the full forward over the suffix,
+        // folding in the last-token slice (returns `[vocab]`). The engine fires
+        // the post-prefill `synchronize_and_clear_cache` AFTER this returns
+        // (NOT here). The MTP `_with_hidden` variant is NOT used here — MTP
+        // turns route through `paged_turn_sync_core`, not the engine.
+        let layer_kinds =
+            super::decoder_layer::compute_layer_kinds(self.config.num_layers as usize, |i| {
+                self.config.is_linear_layer(i)
+            });
+        let embed = self.embedding.clone();
+        let embedding_weight = embed.get_weight();
+        let caches_ref = self
+            .caches
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("paged_prefill: caches not initialized"))?;
+        let adapter = self
+            .paged_adapter
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("paged_prefill: paged_adapter dropped"))?;
+        super::paged_forward::run_paged_prefill_chunk(
+            &prefix.full_tokens,
+            suffix_tokens,
+            prefix.effective_cached_prefix_len as u32,
+            prefix.gdn_prefix_already_primed,
+            &embed,
+            &mut self.layers,
+            caches_ref,
+            &self.final_norm,
+            &self.lm_head,
+            &embedding_weight,
+            &layer_kinds,
+            adapter,
+        )
+    }
+
+    fn begin_paged_decode(&mut self, _setup: &PagedTurnSetup<'_>) -> Result<Self::PagedDecode<'_>> {
+        // Pure-Rust eager paged decode: the stepper drives
+        // `run_paged_decode_step` against the live post-prefill adapter pools +
+        // GDN caches. No compiled-graph seeding / lifecycle locks needed.
+        Ok(Qwen35PagedDecode { inner: self })
+    }
+
+    fn finalize_paged_turn(&mut self, reuse_cache: bool) {
+        // Terminal lifecycle block of a paged turn. Success: keep the request
+        // live across turns when reuse is on, using PER-BLOCK extra keys (NOT
+        // qwen3's empty `&[]`), so the next turn's continue builds on the
+        // partial trailing block's live K/V; otherwise register full blocks
+        // for reuse + release. Infallible (`let _ =` every call — a teardown
+        // failure must not mask the turn result).
+        if let Some(adapter) = self.paged_adapter.as_mut() {
+            if reuse_cache {
+                let total_for_finalize = adapter.request_tokens().len();
+                let block_size = adapter.block_size();
+                let finalize_extra_keys =
+                    engine::build_paged_extra_keys(total_for_finalize, block_size, &[]);
+                let _ = adapter.finalize_turn_keep_live_per_block(&finalize_extra_keys, 0);
+            } else {
+                let _ = adapter.register_full_blocks_for_reuse(&[], 0);
+                let _ = adapter.release_request();
+            }
+        }
+    }
+
+    fn abort_paged_turn(&mut self) {
+        // Error-path teardown: release fully, partial block_table state is
+        // unsafe to keep. Release ONLY — never register / keep live. Infallible
+        // (`let _ =` — must not mask the turn's error).
+        if let Some(adapter) = self.paged_adapter.as_mut() {
+            let _ = adapter.release_request();
+        }
+    }
+
+    fn paged_decode_stream(&self, _generation_stream: Stream) -> Stream {
+        // Run the compiled-paged DECODE on the canonical DEFAULT stream, NOT the
+        // per-turn `generation_stream`. dense's compiled forward + every
+        // `y.eval()` run on the MLX DEFAULT stream; running the forward on a
+        // queue separate from the shared loop's top-of-iteration `y.eval()`
+        // (always on the default stream) would force a cross-queue
+        // completion-wait every token (~5% on bandwidth-bound decode).
+        // `paged_prefill` still runs on `generation_stream`. See the
+        // `PagedBackend::paged_decode_stream` doc for the full mechanism.
+        Stream::default(crate::stream::DeviceType::Gpu)
+    }
+
+    fn save_paged_history(
+        &mut self,
+        save_tokens: &[u32],
+        generated: &[u32],
+        _keep_all: bool,
+        reuse_cache: bool,
+    ) -> Result<()> {
+        // dense paged ALWAYS drops the last token, regardless of the engine's
+        // `keep_all` (length-exit) signal — the paged decode loop NEVER forwards
+        // the LAST sampled token (the engine's forward gate skips it AND
+        // `materialize_final` is a no-op for dense), so the last `generated`
+        // entry is NOT in the adapter / GDN caches and must be dropped to keep
+        // the saved history aligned with the live cache state. Ordering:
+        // finalize → set history (drop-last, last_token_in_cache=false) → GDN
+        // checkpoint → clear image key. PRESERVE THIS EXACT ORDER — it is the
+        // most delicate part for T=0 byte-equality.
+        if !reuse_cache {
+            self.cached_token_history.clear();
+            self.cached_image_key = None;
+            return Ok(());
+        }
+        let mut full_history = save_tokens.to_vec();
+        if !generated.is_empty() {
+            // last_token_in_cache == false → drop-last UNCONDITIONAL.
+            let upto = generated.len().saturating_sub(1);
+            full_history.extend_from_slice(&generated[..upto]);
+        }
+        self.cached_token_history = full_history;
+        // GDN history checkpoint — must run AFTER the history is set (it
+        // snapshots the live recurrent caches keyed on `cached_token_history`),
+        // BEFORE clearing the image key. A checkpoint/eval failure here
+        // PROPAGATES (`?`) to abort the turn: a half-snapshotted or
+        // failed-eval GDN state must NOT be published as a reusable
+        // warm-continue checkpoint, or the next turn reads corrupt
+        // recurrent state.
+        let store = self.remember_dense_gdn_history_checkpoint()?;
+        if inference_trace_enabled() {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] qwen3.5-dense gdn_history_checkpoint stored={} tokens={} \
+                 eval_ms={:.1} clone_ms={:.1} token_clone_ms={:.1} update_ms={:.1} \
+                 total_ms={:.1}",
+                store.stored,
+                self.cached_token_history.len(),
+                store.eval_ms,
+                store.clone_ms,
+                store.token_clone_ms,
+                store.update_ms,
+                store.total_ms
+            ));
+        }
+        self.cached_image_key = None;
+        Ok(())
+    }
+
+    fn reconcile_paged_request_tokens(
+        &mut self,
+        prompt_len: usize,
+        generated: &[u32],
+        _keep_all: bool,
+    ) -> bool {
+        // dense ALWAYS drops the last token (see `save_paged_history`), so the
+        // to-be-saved history length is `prompt_len + (generated.len() - 1)` (or
+        // `prompt_len` when nothing was generated). Roll the adapter back to that
+        // length so the next turn's warm-continue gate
+        // (`prompt.starts_with(request_tokens())`) is not defeated by a trailing
+        // token the pipelined loop recorded at the loop top before the
+        // stop-check. `_keep_all` is intentionally ignored (qwen3 signal).
+        //
+        // Token accounting: on BOTH length and early-stop exits the to-be-saved
+        // history equals the adapter cursor (the final/terminal forward was
+        // skipped), so `surplus` is 0 and this is a true no-op for dense — but
+        // the rollback is kept as the defensive contract the trait mandates.
+        let Some(adapter) = self.paged_adapter.as_mut() else {
+            return true;
+        };
+        let history_len = if generated.is_empty() {
+            0
+        } else {
+            generated.len() - 1
+        };
+        let target_len = prompt_len + history_len;
+        let surplus = adapter.request_tokens().len().saturating_sub(target_len);
+        if surplus > 0
+            && let Err(e) = adapter.rollback_last_tokens(surplus as u32)
+        {
+            tracing::warn!(
+                target: "mlx_core::qwen3_5::paged",
+                "reconcile_paged_request_tokens: rollback_last_tokens({surplus}) failed \
+                 (finalize releases the request; next turn cold-prefills): {e}",
+            );
+            return false;
+        }
+        true
+    }
+}
+
+impl Qwen35Inner {
+    /// Whole-turn dense dispatch behind the engine's `vision_turn` and
+    /// `mtp_turn` probes.
+    ///
+    /// Routes the four turn shapes onto the whole-turn cores:
+    /// fresh sync → [`Self::vision_mtp_whole_turn_core`], delta sync →
+    /// [`Self::chat_tokens_delta_sync`], fresh streaming →
+    /// [`Self::chat_stream_sync_inner`], delta streaming →
+    /// [`Self::chat_stream_tokens_delta_sync_inner`]. These cores own
+    /// every dense-path subtlety the generic flow does not model: VLM
+    /// prefill + M-RoPE deltas, the MTP gate (compiled-init fallback to
+    /// AR), the MTP-on-paged `mtp_takes_dense_path` release/rebuild
+    /// dance, and the paged-text-only rejection for image turns.
+    ///
+    /// Delta turns recover the raw delta from the engine-composed
+    /// `args.tokens` (`cached_history + delta` by construction — the
+    /// probes run before any state mutation).
+    fn dense_whole_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        // Fold generation_config.json defaults into the config the whole-turn
+        // cores re-extract params from, so VLM/MTP turns honor the same
+        // sampling defaults as the generic AR path (whose `args.params`
+        // already had them applied via `resolve_params`). No-op when the
+        // checkpoint ships no defaults (`gen_defaults` all-None).
+        let mut config = args.config.clone();
+        crate::engine::apply_generation_defaults(&mut config, &self.gen_defaults);
+        let thinking = args.thinking;
+        match (args.sink, args.cancelled) {
+            (Some(sink), Some(cancelled)) => {
+                let cb = StreamSender(sink);
+                if args.is_delta {
+                    let delta_start = self.cached_token_history.len().min(args.tokens.len());
+                    let delta_tokens = args.tokens[delta_start..].to_vec();
+                    self.chat_stream_tokens_delta_sync_inner(
+                        delta_tokens,
+                        config,
+                        &cb,
+                        cancelled,
+                        thinking,
+                    )?;
+                } else {
+                    self.chat_stream_sync_inner(
+                        args.tokens.to_vec(),
+                        args.images,
+                        config,
+                        args.eos_id,
+                        &cb,
+                        cancelled,
+                        thinking,
+                    )?;
+                }
+                Ok(TurnOutput::Streamed)
+            }
+            _ => {
+                let result = if args.is_delta {
+                    let delta_start = self.cached_token_history.len().min(args.tokens.len());
+                    let delta_tokens = args.tokens[delta_start..].to_vec();
+                    self.chat_tokens_delta_sync(delta_tokens, config, thinking)?
+                } else {
+                    self.vision_mtp_whole_turn_core(
+                        args.tokens.to_vec(),
+                        args.images,
+                        config,
+                        args.eos_id,
+                        thinking,
+                    )?
+                };
+                Ok(TurnOutput::Complete(Box::new(result)))
+            }
+        }
+    }
+
+    /// Whole-turn block-paged dispatch behind [`ChatBackend::paged_turn`].
+    ///
+    /// Conditional router (dense differs from MoE here — `run_decode_loop` has
+    /// NO MTP gate, so MTP turns must NOT route through it):
+    ///   * MTP turns (`enable_mtp && has_mtp_weights`) take the native
+    ///     paged-MTP path. The streaming-MTP probe declined earlier
+    ///     (routed to `mtp_turn` → `dense_whole_turn`), so only SYNC reaches
+    ///     here with MTP on; `paged_turn_sync_core` self-handles the
+    ///     compiled-availability check + MTP gate + silent AR fallback. The
+    ///     `(sink, cancelled)` match is preserved so any future MTP-stream
+    ///     entry still finds its dispatch target.
+    ///   * NON-MTP turns (sync or stream) → the new generic AR+paged path via
+    ///     `engine::paged_turn::run_paged_turn`, which drives the adapter
+    ///     lifecycle through [`PagedBackend`] and reuses `run_decode_loop`.
+    fn paged_whole_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        // The MTP cores re-derive `p` from config (`extract_chat_params`). To
+        // match the engine's default `resolve_params`, fold
+        // generation_config.json defaults in first so the paged-MTP path
+        // honors them too (no-op when the checkpoint ships none).
+        let mut config = args.config.clone();
+        crate::engine::apply_generation_defaults(&mut config, &self.gen_defaults);
+        let mut p = extract_chat_params(&config);
+        p.extra_eos_ids = self.gen_defaults.eos_token_ids.clone();
+        if p.enable_mtp && self.has_mtp_weights() {
+            let report_perf = args.config.report_performance.unwrap_or(false);
+            let tokenizer = args.tokenizer.clone();
+            let thinking = args.thinking;
+            return match (args.sink, args.cancelled) {
+                (Some(sink), Some(cancelled)) => {
+                    let cb = StreamSender(sink);
+                    self.paged_turn_stream_core(
+                        args.tokens.to_vec(),
+                        tokenizer,
+                        args.eos_id,
+                        p,
+                        report_perf,
+                        &cb,
+                        cancelled,
+                        thinking,
+                    )?;
+                    Ok(TurnOutput::Streamed)
+                }
+                _ => {
+                    let result = self.paged_turn_sync_core(
+                        args.tokens.to_vec(),
+                        tokenizer,
+                        args.eos_id,
+                        p,
+                        report_perf,
+                        thinking,
+                    )?;
+                    Ok(TurnOutput::Complete(Box::new(result)))
+                }
+            };
+        }
+
+        // NON-MTP (sync or stream) → the generic AR+paged engine path.
+        //
+        // This paged turn writes full-attention K/V into the paged adapter
+        // pool, NOT the flat `self.caches`, so the flat full-attention slots no
+        // longer reflect the conversation. A later streaming dense-MTP fallback
+        // must rebuild the flat caches before decoding. The MTP paged cores
+        // set this at their core entry; this is the set-site for the
+        // generic path. See `paged_full_attn_caches_dirty`.
+        self.paged_full_attn_caches_dirty = true;
+        crate::engine::paged_turn::run_paged_turn(self, args)
+    }
+}
+
+/// Per-turn decode stepper for the engine's generic (text-only,
+/// non-paged, non-MTP) flow on Qwen3.5 dense
+/// ([`ChatBackend::begin_decode`]).
+///
+/// Carries the compiled-vs-eager dispatch: the compiled arm drives
+/// `forward_compiled` against the C++ graph seeded by `begin_decode`,
+/// the eager arm drives the pure-Rust `forward_inner` over the flat
+/// caches.
+pub(crate) struct Qwen35Decode<'a> {
+    inner: &'a mut Qwen35Inner,
+    embedding_weight: MxArray,
+    embedding_weight_t: MxArray,
+    /// Decode-path profiler relabel (`chat_rust` and its
+    /// `chat_stream[_delta]_*` streaming variants), resolved in
+    /// `begin_decode` from the turn's streaming-ness.
+    relabel: &'static str,
+}
+
+impl DecodeStep for Qwen35Decode<'_> {
+    fn forward(&mut self, input_ids: &MxArray) -> Result<(MxArray, bool)> {
+        let inner = &mut *self.inner;
+        let logits = forward_inner(
+            input_ids,
+            &self.embedding_weight,
+            &mut inner.layers,
+            &mut inner.caches,
+            &inner.final_norm,
+            &inner.lm_head,
+            Some(&self.embedding_weight_t),
+        )?;
+        // `true` == the eager Rust forward returns `[1, 1, vocab]`;
+        // the loop squeezes axis 1.
+        Ok((logits, true))
+    }
+
+    fn eval_step(&mut self, next_token: &MxArray, logits: &MxArray, _budget_forced: bool) {
+        MxArray::async_eval_arrays(&[next_token, logits]);
+    }
+
+    fn profiler_relabel(&self) -> Option<&'static str> {
+        Some(self.relabel)
+    }
+}
+
+/// Per-turn pure-Rust ("eager") dense MTP stepper the engine-owned
+/// [`crate::engine::mtp_turn::run_mtp_turn`] drives.
+///
+/// The 11 `MtpOps` closures of the old `chat_with_caches_inner` eager-MTP
+/// block become [`MtpStepper`] methods; the per-cycle scratch the closures
+/// captured in `RefCell`/`Cell` (the GDN tape, the pre-verify snapshot, the
+/// stashed replay error, the desync latch, the committed-history bookkeeping)
+/// becomes PLAIN struct fields — the engine calls the methods strictly
+/// sequentially and non-nested, so the interior mutability the closures needed
+/// to share `&mut self` is gone.
+///
+/// Drives BOTH the FLAT and the block-PAGED dense MTP turn, selected by
+/// [`MtpStepMode`]: the flat mode runs the eager pre-norm forwards against
+/// `inner.caches`; the paged mode routes the main Step-A / verify forwards
+/// through the captured [`PagedKVCacheAdapter`]
+/// ([`super::paged_forward::run_paged_step_with_hidden`] /
+/// [`super::paged_forward::run_paged_verify_step`]) while the GDN recurrent
+/// state stays FLAT in `inner.caches` Linear slots. Only four methods
+/// (`forward_with_hidden`, `verify_step`, `rollback`, `rollback_unemitted`)
+/// branch on the mode; every other method is mode-identical (the drafter and
+/// the committed-history commit are paged-agnostic). The paged adapter is moved
+/// into the stepper at [`MtpBackend::begin_mtp_decode`] and restored into
+/// `inner.paged_adapter` by [`Drop`] so the post-turn paged-history save finds
+/// it, on EVERY exit path of `run_mtp_turn`.
+pub(crate) struct DenseMtpStepper<'a> {
+    /// The model — owns layers / caches / mtp / final_norm / lm_head and the
+    /// `flat_mtp_caches_desynced` latch. == the closures'
+    /// `inner_cell.borrow_mut()`.
+    inner: &'a mut Qwen35Inner,
+    /// Drafter K/V caches. == the closures' `mtp_caches_cell`. v2
+    /// committed-history mode holds the persistent committed prefix; v1
+    /// cycle-history mode is reset fresh by `begin_cycle`.
+    mtp_caches: Vec<Qwen3_5LayerCache>,
+    /// Eager analogue of `g_mtp_committed_len`: committed tokens whose exact
+    /// K/V live in `mtp_caches`. == the closures' `committed_len` cell.
+    committed_len: i32,
+    /// Committed-history active iff the prompt tail's hiddens start at
+    /// absolute position 0. == the closures' `use_committed`.
+    use_committed: bool,
+    /// Pre-verify snapshot of the main caches, taken in
+    /// `snapshot_main_linear`, consumed by `rollback`. == the closures'
+    /// `snap_cell`.
+    snap: Option<Result<Vec<super::layer_cache::Qwen3_5LayerSnapshot>>>,
+    /// GDN tape recorded by `verify_step`, consumed by `rollback`. == the
+    /// closures' `tape_cell`.
+    tape: Vec<Option<super::gated_delta_net::GdnLayerTape>>,
+    /// Error stashed by the infallible `rollback` replay, surfaced by
+    /// `take_replay_error`. == the closures' `replay_err_cell`.
+    replay_err: Option<Error>,
+    /// Mid-cycle-stop desync latch (set by `rollback_unemitted`), reported by
+    /// `into_desynced`. == the closures' `mtp_desynced` cell.
+    mtp_desynced: bool,
+    /// The model's embedding table. == the closures' `embedding_weight` /
+    /// `emb_capture`.
+    embedding_weight: MxArray,
+    /// Transposed embedding for the tied-LM-head projection. ==
+    /// `Some(&embedding_weight_t)` (`emb_t_ref`) in the closures.
+    embedding_weight_t: MxArray,
+    /// Config clone for the per-cycle drafter cache reset/fresh build. == the
+    /// closures' captured `config`.
+    config: Qwen3_5Config,
+    /// Flat vs. paged main-forward routing. `Paged` owns the turn's
+    /// [`PagedKVCacheAdapter`] (moved in at `begin_mtp_decode`, restored into
+    /// `inner.paged_adapter` by [`Drop`]).
+    mode: MtpStepMode,
+    /// Per-layer attention/linear classification consumed by the paged
+    /// forwards. Empty on the flat path (unused there).
+    layer_kinds: Vec<super::decoder_layer::Qwen3_5LayerKind>,
+}
+
+/// Main-forward routing for [`DenseMtpStepper`]: `Flat` runs the eager
+/// pre-norm forwards against `inner.caches`; `Paged` routes full-attention
+/// K/V through the owned adapter while GDN state stays flat. The adapter is
+/// boxed so the unit `Flat` variant does not pad out to the adapter's size.
+enum MtpStepMode {
+    Flat,
+    Paged(Box<PagedKVCacheAdapter>),
+}
+
+impl Drop for DenseMtpStepper<'_> {
     fn drop(&mut self) {
-        unsafe {
-            mlx_sys::mlx_qwen35_compiled_reset();
+        // Restore the paged adapter into the model so the post-turn
+        // paged-history save (which runs AFTER `run_mtp_turn` returns) finds
+        // `inner.paged_adapter == Some`. Firing in `Drop` covers EVERY exit
+        // path of `run_mtp_turn` — the `Ok` tail, the `take_replay_error`
+        // early return, and any mid-loop `?` propagation. Idempotent: the
+        // adapter is taken out of `mode` here, so a second drop is a no-op.
+        if let MtpStepMode::Paged(adapter) = std::mem::replace(&mut self.mode, MtpStepMode::Flat) {
+            self.inner.paged_adapter = Some(*adapter);
         }
     }
 }
 
-/// RAII guard that tears down the MTP compiled state on EVERY exit from
-/// a dense MTP decode path — the normal return AND the error/abort path.
-///
-/// The dense MTP decode (`decode_loop_mtp!`) propagates `Err` via `?`
-/// (e.g. a non-zero `mlx_qwen35_mtp_compiled_commit` status surfaced by
-/// `commit_mtp_compiled`). On that abort the explicit
-/// `mlx_qwen35_mtp_compiled_reset()` call placed AFTER the macro is
-/// skipped, leaving `g_mtp_compile_inited`, the MTP K/V caches, offsets,
-/// and `g_mtp_committed_len` resident from the partial cycle — the next
-/// chat turn would then re-init on top of stale MTP globals.
-/// `CompiledResetGuard` only resets the MAIN compiled state, so a
-/// dedicated guard is required for the MTP globals.
-///
-/// Created right after `init_mtp_compiled_from_main` succeeds; its
-/// `Drop` runs `mlx_qwen35_mtp_compiled_reset()` whether the decode
-/// returns `Ok` or `Err`. The explicit post-macro reset is retained as
-/// a harmless no-op (reset is idempotent) so the success path's reset
-/// timing is unchanged relative to the surrounding cache export logic.
-struct MtpCompiledResetGuard;
+impl MtpStepper for DenseMtpStepper<'_> {
+    fn embedding_weight(&self) -> &MxArray {
+        &self.embedding_weight
+    }
 
-impl Drop for MtpCompiledResetGuard {
-    fn drop(&mut self) {
-        unsafe {
-            mlx_sys::mlx_qwen35_mtp_compiled_reset();
+    fn committed_history_active(&self) -> bool {
+        self.use_committed
+    }
+
+    fn profiler_relabel(&self) -> Option<&'static str> {
+        // The eager dense MTP path set the turn label via
+        // `profiler.set_label("mtp_eager")` at the migration site; the engine
+        // applies this relabel once at turn entry instead.
+        Some("mtp_eager")
+    }
+
+    // Step A main forward: eager pre-norm + final-norm + project. Returns
+    // `hidden` shaped `[1, hidden]` (squeeze the time axis) to match the
+    // compiled contract; `logits` stays `[1, 1, vocab]` with
+    // `needs_squeeze = true`.
+    fn forward_with_hidden(
+        &mut self,
+        ids: &MxArray,
+        emb: &MxArray,
+    ) -> Result<(MxArray, MxArray, bool)> {
+        match &mut self.mode {
+            MtpStepMode::Flat => {
+                let inner = &mut *self.inner;
+                let pre = forward_pre_norm_inner(ids, emb, &mut inner.layers, &mut inner.caches)?;
+                let h3 = inner.final_norm.forward(&pre)?;
+                let logits = project_logits_from_hidden(
+                    &h3,
+                    &inner.lm_head,
+                    emb,
+                    Some(&self.embedding_weight_t),
+                )?;
+                let hidden = h3.squeeze(Some(&[1]))?;
+                Ok((logits, hidden, true))
+            }
+            MtpStepMode::Paged(adapter) => {
+                ids.eval();
+                let token_id = ids.item_at_int32(0)? as u32;
+                let inner = &mut *self.inner;
+                let caches = inner.caches.as_mut().ok_or_else(|| {
+                    Error::from_reason("eager paged MTP forward_with_hidden: caches is None")
+                })?;
+                let (logits, hidden) = super::paged_forward::run_paged_step_with_hidden(
+                    token_id,
+                    &inner.embedding,
+                    &mut inner.layers,
+                    caches,
+                    &inner.final_norm,
+                    &inner.lm_head,
+                    emb,
+                    Some(&self.embedding_weight_t),
+                    &self.layer_kinds,
+                    adapter,
+                )?;
+                Ok((logits, hidden, true))
+            }
         }
+    }
+
+    // One MTP draft step on the eager drafter. `h_next` is `[1, 1, hidden]`;
+    // project to `draft_logits` `[1, 1, vocab]` then squeeze the time axis to
+    // `[1, vocab]`.
+    fn draft_step(
+        &mut self,
+        prev_hidden: &MxArray,
+        prev_emb: &MxArray,
+    ) -> Result<(MxArray, MxArray)> {
+        let inner = &mut *self.inner;
+        let mtp_caches = &mut self.mtp_caches;
+        let mtp = inner.mtp.as_mut().ok_or_else(|| {
+            Error::from_reason(
+                "eager MTP draft_step: inner.mtp is None despite \
+                 has_mtp_weights() gate",
+            )
+        })?;
+        let h_next = mtp.forward(prev_hidden, prev_emb, Some(mtp_caches))?;
+        let dl3 = project_logits_from_hidden(
+            &h_next,
+            &inner.lm_head,
+            &self.embedding_weight,
+            Some(&self.embedding_weight_t),
+        )?;
+        let draft_logits = dl3.squeeze(Some(&[1]))?;
+        Ok((h_next, draft_logits))
+    }
+
+    // Batched verify: run the K+1 verify ids through the main stack,
+    // advancing `inner.caches` by K+1, recording the GDN tape.
+    fn verify_step(
+        &mut self,
+        ids: &MxArray,
+        emb: &MxArray,
+        depth: usize,
+    ) -> Result<mtp_decode::MtpVerifyOutput> {
+        match &mut self.mode {
+            MtpStepMode::Flat => {
+                let _ = depth;
+                let inner = &mut *self.inner;
+                let tape = &mut self.tape;
+                eager_verify_step(
+                    &mut inner.layers,
+                    &mut inner.caches,
+                    &inner.final_norm,
+                    &inner.lm_head,
+                    ids,
+                    emb,
+                    Some(&self.embedding_weight_t),
+                    Some(tape),
+                )
+            }
+            MtpStepMode::Paged(adapter) => {
+                // Slice `ids` to exactly `depth+1` defensively so the adapter
+                // records exactly K+1 tokens — the rollback count depends on it.
+                let id_window = ids.to_int32().map_err(|e| {
+                    Error::from_reason(format!(
+                        "eager paged MTP verify_step: ids to_int32: {}",
+                        e.reason
+                    ))
+                })?;
+                if id_window.len() < depth + 1 {
+                    return Err(Error::from_reason(format!(
+                        "eager paged MTP verify_step: ids has {} elements, need {}",
+                        id_window.len(),
+                        depth + 1
+                    )));
+                }
+                let id_slice: Vec<i32> = id_window.iter().take(depth + 1).copied().collect();
+                let verify_in = MxArray::from_int32(&id_slice, &[1, (depth + 1) as i64])?;
+                let inner = &mut *self.inner;
+                let caches = inner.caches.as_mut().ok_or_else(|| {
+                    Error::from_reason("eager paged MTP verify_step: caches is None")
+                })?;
+                let tape = &mut self.tape;
+                super::paged_forward::run_paged_verify_step(
+                    &verify_in,
+                    &inner.embedding,
+                    &mut inner.layers,
+                    caches,
+                    &inner.final_norm,
+                    &inner.lm_head,
+                    emb,
+                    Some(&self.embedding_weight_t),
+                    &self.layer_kinds,
+                    adapter,
+                    tape,
+                )
+            }
+        }
+    }
+
+    // No native argmax-only / sparse verify on the eager path — the accept
+    // loop falls back to dense-logits accept. (Defaults `None`.)
+
+    // Snapshot the main caches before verify mutates them. Stash the fallible
+    // result; surfaced in `rollback` / `restore_and_replay_main`.
+    fn snapshot_main_linear(&mut self) {
+        // On the paged backend the FullAttention K/V lives in the paged pool,
+        // not `inner.caches`, so its flat slot is an empty shell. Snapshot
+        // paged-aware so we capture only the GDN (Linear) state and skip the
+        // shells — `rollback` rewinds those via the adapter and never reads
+        // their snapshot.
+        let paged = matches!(self.mode, MtpStepMode::Paged(_));
+        let inner = &*self.inner;
+        let snap = match inner.caches.as_ref() {
+            Some(caches) => super::layer_cache::snapshot_all_mtp(caches, paged),
+            None => Err(Error::from_reason(
+                "eager MTP snapshot_main_linear: inner.caches is None",
+            )),
+        };
+        self.snap = Some(snap);
+    }
+
+    // Pure-Rust GDN tape replay — the correctness keystone. Fires on BOTH
+    // full and partial accept. Infallible signature: any error is stashed in
+    // `self.replay_err` and surfaced later.
+    fn rollback(&mut self, accepted_drafts: usize, depth: usize) {
+        if self.replay_err.is_some() {
+            return;
+        }
+        // Paged path rewinds the full-attention K/V (which lives in the paged
+        // pool, not `inner.caches`) by `rejected` tokens before the shared GDN
+        // tape replay. On full accept `rejected == 0` (no-op). Flat layers keep
+        // their full-attention K/V in `inner.caches` and rewind it via `kv.trim`
+        // inside the replay loop instead.
+        let paged = matches!(self.mode, MtpStepMode::Paged(_));
+        if let MtpStepMode::Paged(adapter) = &mut self.mode {
+            let rejected = depth.saturating_sub(accepted_drafts);
+            if rejected > 0
+                && let Err(e) = adapter.rollback_last_tokens(rejected as u32)
+            {
+                tracing::warn!(
+                    target: "mlx_core::qwen3_5::paged",
+                    "eager MTP-paged rollback_last_tokens({rejected}) failed \
+                     (ignored): {e}",
+                );
+            }
+        }
+        let accepted_steps = accepted_drafts + 1;
+        let result: Result<()> = (|| {
+            let snap = match self.snap.as_ref() {
+                Some(Ok(s)) => s,
+                Some(Err(e)) => {
+                    return Err(Error::from_reason(format!(
+                        "eager MTP rollback: snapshot failed: {}",
+                        e.reason
+                    )));
+                }
+                None => {
+                    return Err(Error::from_reason(
+                        "eager MTP rollback: snapshot missing (snapshot_main_linear \
+                         did not run)",
+                    ));
+                }
+            };
+            let tape = &self.tape;
+            let inner = &mut *self.inner;
+            let caches = inner
+                .caches
+                .as_mut()
+                .ok_or_else(|| Error::from_reason("eager MTP rollback: inner.caches is None"))?;
+            if caches.len() != snap.len() || caches.len() != tape.len() {
+                return Err(Error::from_reason(format!(
+                    "eager MTP rollback: length mismatch (caches {}, snapshot {}, \
+                     tape {})",
+                    caches.len(),
+                    snap.len(),
+                    tape.len(),
+                )));
+            }
+            for (idx, cache) in caches.iter_mut().enumerate() {
+                let Some(layer_tape) = tape[idx].as_ref() else {
+                    if paged {
+                        // Full-attention layer on the paged path: K/V lives in
+                        // the paged pool and was already rewound by
+                        // `adapter.rollback_last_tokens` above. The
+                        // `inner.caches` FullAttention slot is unused on the
+                        // paged path, so skip it.
+                        continue;
+                    }
+                    // Full-attention layer: rewind the offset to
+                    // `snapshot_offset + accepted_steps` so the next forward
+                    // overwrites the rejected drafts. No-op on full accept.
+                    match &snap[idx] {
+                        super::layer_cache::Qwen3_5LayerSnapshot::FullAttention { offset } => {
+                            let kv = cache.as_kv_cache_mut().ok_or_else(|| {
+                                Error::from_reason(format!(
+                                    "eager MTP rollback: layer {idx} has a \
+                                     FullAttention snapshot but its cache slot is \
+                                     not FullAttention",
+                                ))
+                            })?;
+                            let target = *offset + accepted_steps as i32;
+                            kv.trim(target);
+                        }
+                        super::layer_cache::Qwen3_5LayerSnapshot::Linear { .. } => {
+                            return Err(Error::from_reason(format!(
+                                "eager MTP rollback: layer {idx} has no GDN tape \
+                                 but a Linear snapshot",
+                            )));
+                        }
+                    }
+                    continue;
+                };
+                let arrays = cache.as_arrays_cache_mut().ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "eager MTP rollback: layer {idx} has a GDN tape but its \
+                         cache slot is not Linear",
+                    ))
+                })?;
+                let (snap_conv, snap_rec) = match &snap[idx] {
+                    super::layer_cache::Qwen3_5LayerSnapshot::Linear {
+                        conv_state,
+                        recurrent_state,
+                    } => (conv_state.as_ref(), recurrent_state.as_ref()),
+                    super::layer_cache::Qwen3_5LayerSnapshot::FullAttention { .. } => {
+                        return Err(Error::from_reason(format!(
+                            "eager MTP rollback: layer {idx} GDN tape but \
+                             FullAttention snapshot",
+                        )));
+                    }
+                };
+                let window = layer_tape.kernel.window_len()? as usize;
+                if accepted_steps > window {
+                    return Err(Error::from_reason(format!(
+                        "eager MTP rollback: accepted_steps {accepted_steps} \
+                         exceeds recorded window {window} at layer {idx}",
+                    )));
+                }
+                layer_tape.replay_into(arrays, snap_conv, snap_rec, accepted_steps)?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            self.replay_err = Some(e);
+        }
+    }
+
+    // On rejection (partial accept): the GDN tape replay in `rollback`
+    // already reconstructed the AR-exact main cache state, so no re-forward
+    // loop is needed. This only surfaces a stashed replay error and clears
+    // the per-cycle snapshot + tape.
+    fn restore_and_replay_main(&mut self, _accepted: &[u32], _emb: &MxArray) -> Result<()> {
+        self.snap = None;
+        self.tape.clear();
+        if let Some(e) = self.replay_err.take() {
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    // Committed-history commit.
+    //
+    // v1 (`!use_committed`): no-op.
+    //
+    // v2 (`use_committed`): append the M newly committed tokens' EXACT K/V to
+    // the persistent MTP cache via one multi-token drafter forward.
+    fn commit_mtp(
+        &mut self,
+        anchor: mtp_decode::MtpCommitAnchor,
+        seed_hidden: &MxArray,
+        verify_hiddens: &MxArray,
+        committed_ids: &[u32],
+        _k_accepted: usize,
+        emb: &MxArray,
+    ) -> Result<()> {
+        if !self.use_committed {
+            return Ok(());
+        }
+        let m = committed_ids.len();
+        if m == 0 {
+            return Ok(());
+        }
+        let hidden_dim = verify_hiddens.shape_at(2)?;
+
+        // Assemble hidden_seq [1, M, hidden] per anchor.
+        let hidden_seq = match anchor {
+            mtp_decode::MtpCommitAnchor::IncludeAnchor => {
+                // seed_hidden ++ verify_hiddens[:, 0..M-1, :].
+                let vh_prefix =
+                    verify_hiddens.slice(&[0, 0, 0], &[1, (m - 1) as i64, hidden_dim])?;
+                MxArray::concatenate(seed_hidden, &vh_prefix, 1)?
+            }
+            mtp_decode::MtpCommitAnchor::SkipAlreadyCommittedAnchor => {
+                // verify_hiddens[:, 0..M, :].
+                verify_hiddens.slice(&[0, 0, 0], &[1, m as i64, hidden_dim])?
+            }
+        };
+
+        // Gather the M committed-token input embeddings → [1, M, hidden].
+        let ids_i32: Vec<i32> = committed_ids.iter().map(|&v| v as i32).collect();
+        let ids_arr = MxArray::from_int32(&ids_i32, &[m as i64])?;
+        let gathered = emb.take(&ids_arr, 0)?;
+        let emb_seq = gathered.reshape(&[1, m as i64, hidden_dim])?;
+
+        // Drop this cycle's draft K/V (written past committed_len by the draft
+        // steps), then write the exact committed K/V via one multi-token
+        // forward.
+        let inner = &mut *self.inner;
+        let mtp = inner.mtp.as_mut().ok_or_else(|| {
+            Error::from_reason(
+                "eager MTP commit_mtp: inner.mtp is None despite \
+                 has_mtp_weights() gate",
+            )
+        })?;
+        let caches = &mut self.mtp_caches;
+        for c in caches.iter_mut() {
+            if let Some(kv) = c.as_kv_cache_mut() {
+                kv.trim(self.committed_len);
+            }
+        }
+        let _ = mtp.forward(&hidden_seq, &emb_seq, Some(caches))?;
+        self.committed_len += m as i32;
+        Ok(())
+    }
+
+    // Re-anchor the drafter cache at the start of each cycle.
+    //
+    // v1 (`!use_committed`): reset to a fresh cache.
+    //
+    // v2 (`use_committed`): the cache is PERSISTENT; truncate the prior
+    // cycle's draft tail back to the re-anchor target. `chained_anchor`
+    // cycles anchor one slot earlier (`committed_len - 1`); Step-A cycles at
+    // `committed_len`.
+    fn begin_cycle(&mut self, chained_anchor: bool) {
+        if !self.use_committed {
+            self.mtp_caches = Qwen3_5MTPModule::fresh_caches(&self.config);
+            return;
+        }
+        let target = if chained_anchor {
+            (self.committed_len - 1).max(0)
+        } else {
+            self.committed_len
+        };
+        for c in self.mtp_caches.iter_mut() {
+            if let Some(kv) = c.as_kv_cache_mut() {
+                kv.trim(target);
+            }
+        }
+    }
+
+    // Bound the lazy graph: materialize the token plus the main GDN/full-attn
+    // caches; on a budget-forced step also the logits.
+    fn eval_step(&self, token: &MxArray, logits: &MxArray, budget_forced: bool) {
+        async_eval_layer_caches(&self.inner.caches);
+        token.eval();
+        if budget_forced {
+            logits.eval();
+        }
+    }
+
+    // Chained end-of-iteration eval: keep the chained `verify_hidden[K]` slice
+    // materialized alongside the token and the main caches so the next cycle's
+    // draft graph does not force a separate Metal roundtrip.
+    fn eval_step_with_chained_hidden(&self, token: &MxArray, chained_hidden: &MxArray) {
+        async_eval_layer_caches(&self.inner.caches);
+        MxArray::async_eval_arrays(&[token, chained_hidden]);
+    }
+
+    fn rollback_unemitted(&mut self, unemitted: usize) {
+        match &mut self.mode {
+            MtpStepMode::Flat => {
+                if unemitted > 0 {
+                    self.mtp_desynced = true;
+                }
+            }
+            MtpStepMode::Paged(adapter) => {
+                // Truncate the live paged adapter by the accepted-but-unemitted
+                // tokens; the paged path never sets the FLAT desync latch.
+                if let Err(e) = adapter.rollback_last_tokens(unemitted as u32) {
+                    tracing::warn!(
+                        target: "mlx_core::qwen3_5::paged",
+                        "eager MTP-paged rollback_unemitted({unemitted}) failed \
+                         (ignored): {e}",
+                    );
+                }
+            }
+        }
+    }
+
+    fn take_replay_error(&mut self) -> Option<Error> {
+        self.replay_err.take()
+    }
+
+    fn into_desynced(self) -> bool {
+        // Paged truncates its adapter in `rollback_unemitted` and never touches
+        // the FLAT desync latch, so it always reports `false`. The adapter is
+        // restored into `inner.paged_adapter` by the `Drop` impl that runs as
+        // `self` falls out of scope here. (`self` is consumed by value rather
+        // than destructured because the `Drop` impl forbids moving fields out.)
+        match self.mode {
+            MtpStepMode::Flat => self.mtp_desynced,
+            MtpStepMode::Paged(_) => false,
+        }
+    }
+}
+
+impl MtpBackend for Qwen35Inner {
+    type MtpDecode<'a>
+        = DenseMtpStepper<'a>
+    where
+        Self: 'a;
+
+    fn begin_mtp_decode(&mut self, setup: &MtpTurnSetup<'_>) -> Result<Self::MtpDecode<'_>> {
+        // Turn-constant captures the eager-MTP block built before the loop:
+        // the embedding table (+ its transpose for the tied projection) and a
+        // config clone for the per-cycle drafter cache reset.
+        let embedding_weight = self.embedding.get_weight();
+        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
+        let config = self.config.clone();
+
+        // Committed-history is only correct when the prompt tail's hiddens
+        // start at absolute position 0 (the eager drafter derives RoPE purely
+        // from the local cache offset). Continuation/delta turns
+        // (`position_base != 0`) fall back to v1 cycle-history.
+        let use_committed = setup.prompt_hidden_position_base == 0;
+
+        // Auto-select the main-forward routing: the paged cores leave a paged
+        // adapter on `self`, so `take()` moves it into the stepper for the turn
+        // (restored by `Drop`); the flat cores have none and run flat. The
+        // paged forwards need the per-layer kind classification (unused flat).
+        let (mode, layer_kinds) = match self.paged_adapter.take() {
+            Some(adapter) => {
+                let layer_kinds = super::decoder_layer::compute_layer_kinds(
+                    self.config.num_layers as usize,
+                    |i| self.config.is_linear_layer(i),
+                );
+                (MtpStepMode::Paged(Box::new(adapter)), layer_kinds)
+            }
+            None => (MtpStepMode::Flat, Vec::new()),
+        };
+
+        let mut stepper = DenseMtpStepper {
+            inner: self,
+            mtp_caches: Qwen3_5MTPModule::fresh_caches(&config),
+            committed_len: 0,
+            use_committed,
+            snap: None,
+            tape: Vec::new(),
+            replay_err: None,
+            mtp_desynced: false,
+            embedding_weight,
+            embedding_weight_t,
+            config,
+            mode,
+            layer_kinds,
+        };
+
+        // Prompt-prefix seed (v2 committed-history only). Mirror the compiled
+        // `prefill_mtp_commit`: commit the contiguous run
+        // `[prompt_hidden_ids[1..], y]` (length P, token 0 skipped, the first
+        // sampled token `y` appended) into the persistent MTP cache so the
+        // drafter attends the prompt from cycle 1. Each committed token `x` is
+        // paired with `prompt_hidden[:, idx, :]` = h(token before `x`). Chunk
+        // into pieces of size <= 7 and run the SAME multi-token eager KV-writer
+        // as `commit_mtp` per chunk. `position_base == 0` is guaranteed by
+        // `use_committed`, so RoPE (= local cache offset) aligns with absolute
+        // position.
+        if use_committed
+            && let (Some(ph), Some(ph_ids)) = (setup.prompt_hidden, setup.prompt_hidden_ids)
+            && !ph_ids.is_empty()
+        {
+            let prompt_len = ph_ids.len();
+            let hidden_dim = ph.shape_at(2)?;
+            let hidden_len = ph.shape_at(1)? as usize;
+            if hidden_len != prompt_len {
+                return Err(Error::from_reason(format!(
+                    "eager MTP prompt-seed: prompt_hidden length {hidden_len} \
+                     does not match prompt_hidden_ids length {prompt_len}"
+                )));
+            }
+            // The first sampled token `y` is supplied by the engine via the
+            // setup so the prompt seed can commit `[prompt_ids[1..], y]`.
+            let y_id = setup.first_sampled_token;
+
+            // Committed run = [prompt_ids[1..prompt_len], y] (length P).
+            let mut committed_ids: Vec<i32> = Vec::with_capacity(prompt_len);
+            committed_ids.extend(ph_ids[1..prompt_len].iter().map(|&v| v as i32));
+            committed_ids.push(y_id as i32);
+
+            let chunk_sizes = partition_prefill_chunks(prompt_len);
+            let mut cursor: usize = 0;
+            for &chunk in &chunk_sizes {
+                let chunk_i64 = chunk as i64;
+                let start = cursor as i64;
+                // hidden_seq = prompt_hidden[:, cursor..cursor+chunk, :].
+                let hidden_seq = ph.slice(&[0, start, 0], &[1, start + chunk_i64, hidden_dim])?;
+                // emb_seq = gather embedding rows for the chunk's ids.
+                let ids_arr =
+                    MxArray::from_int32(&committed_ids[cursor..cursor + chunk], &[chunk_i64])?;
+                let gathered = stepper.embedding_weight.take(&ids_arr, 0)?;
+                let emb_seq = gathered.reshape(&[1, chunk_i64, hidden_dim])?;
+
+                let inner = &mut *stepper.inner;
+                let mtp = inner.mtp.as_mut().ok_or_else(|| {
+                    Error::from_reason(
+                        "eager MTP prompt-seed: inner.mtp is None despite \
+                         has_mtp_weights() gate",
+                    )
+                })?;
+                let caches = &mut stepper.mtp_caches;
+                let _ = mtp.forward(&hidden_seq, &emb_seq, Some(caches))?;
+                stepper.committed_len += chunk as i32;
+                cursor += chunk;
+            }
+        }
+
+        Ok(stepper)
+    }
+}
+
+impl ChatBackend for Qwen35Inner {
+    fn tokenizer(&self) -> Result<Arc<Qwen3Tokenizer>> {
+        self.tokenizer
+            .clone()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))
+    }
+
+    fn family_name(&self) -> &'static str {
+        "qwen3_5"
+    }
+
+    fn session_eos_id(&self, tok: &Qwen3Tokenizer) -> Result<u32> {
+        tok.im_end_id()
+            .ok_or_else(|| Error::from_reason("Tokenizer missing <|im_end|> special token"))
+    }
+
+    fn generation_defaults(&self) -> Option<&crate::engine::ModelGenerationDefaults> {
+        Some(&self.gen_defaults)
+    }
+
+    fn extra_eos_ids(&self) -> Vec<u32> {
+        self.gen_defaults.eos_token_ids.clone()
+    }
+
+    // thinking: engine default `policy()` == `ThinkingPolicy::TemplateHonoring`
+    // → `thinking_setup` resolves to
+    // `{enabled: resolve_enable_thinking(config).unwrap_or(true),
+    //   budget: config.thinking_token_budget}`.
+
+    fn cached_token_history(&self) -> &[u32] {
+        &self.cached_token_history
+    }
+
+    fn reset_caches(&mut self, scope: ResetScope) -> Result<()> {
+        match scope {
+            // Prefix-miss reset: reset each live layer cache, then install a
+            // fresh hybrid cache vec. PRESERVES `cached_token_history` /
+            // `cached_image_key` / `cached_rope_deltas` (the end-of-turn
+            // save overwrites them) and the GDN checkpoints (paged-path
+            // state the flat reset never touches).
+            ResetScope::PrefixMiss => {
+                if let Some(ref mut caches) = self.caches {
+                    for cache in caches.iter_mut() {
+                        cache.reset();
+                    }
+                }
+                self.caches = Some(fresh_dense_layer_caches(&self.config));
+                Ok(())
+            }
+            // Full clear including history, image key, rope deltas, GDN
+            // checkpoints, via `reset_caches_sync`.
+            ResetScope::Command => {
+                self.reset_caches_sync()?;
+                // The EXPLICIT command reset must restore a fully cold
+                // state. `reset_caches_sync` clears the flat caches +
+                // reuse/GDN state but leaves the paged request's FULL
+                // blocks content-addressed in the per-instance
+                // BlockAllocator's prefix cache, so a reset-then-rerun of
+                // the same prompt would take the prefix-hit suffix-prefill
+                // path (`verify_cache_prefix_direct` > 0) — a different
+                // bf16 reduction order than the cold full prefill, enough
+                // to flip a greedy near-tie (observed on the lfm2 sibling:
+                // "says," vs "said" at token ~6; qwen3.5 shares the
+                // identical adapter lifecycle).
+                // Releasing the live request AND purging the prefix cache
+                // makes the next turn replay the cold prefill byte-for-byte.
+                if let Some(adapter) = self.paged_adapter.as_mut() {
+                    adapter
+                        .release_request_and_purge_prefix_cache()
+                        .map_err(|e| {
+                            Error::from_reason(format!(
+                                "qwen3_5 reset_caches: paged prefix-cache purge failed: {e}"
+                            ))
+                        })?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// All-or-nothing prefix match (NO exact-match rewind — the GDN
+    /// recurrent state cannot rewind one slot; the engine's
+    /// exact-match-as-miss handling performs a full reset + re-prefill on a
+    /// zero-delta hit). Text-only by construction: the
+    /// generic flow never carries images (the vision probe owns those
+    /// turns), so the expanded-token / image-key inputs collapse to the
+    /// plain prompt.
+    fn verify_cache_prefix(&self, tokens: &[u32], reuse_cache: bool) -> usize {
+        verify_cache_prefix_direct(
+            reuse_cache,
+            false,
+            tokens,
+            tokens,
+            0,
+            &self.cached_token_history,
+            &self.cached_image_key,
+            self.caches.is_some(),
+        )
+    }
+
+    fn flat_caches_desynced(&self) -> bool {
+        self.flat_mtp_caches_desynced
+    }
+
+    fn clear_flat_caches_desynced(&mut self) {
+        self.flat_mtp_caches_desynced = false;
+    }
+
+    fn save_cache_state(&mut self, args: SaveStateArgs<'_>) {
+        // Delta continuations preserve `cached_image_key` — the KV cache
+        // still holds the prior prefill's image attention state even
+        // though this turn was text-only. Fresh turns (re)set the key
+        // from the turn's (always-false here) `has_images`.
+        //
+        // `drop_last_always = true`: this is the generic `run_decode_loop`
+        // flow (flat, non-MTP, non-image dense turns), which never forwards
+        // the final committed token into the physical cache on ANY exit
+        // kind. The GDN recurrent state is non-invertible, so we drop that
+        // token (rather than materialize it) to keep
+        // `cached_token_history.len() == physical_cache_len`.
+        if args.is_delta {
+            engine::save_cache_state_after_delta(
+                args.reuse_cache,
+                args.generated_tokens,
+                args.finish_reason,
+                /* drop_last_always */ true,
+                args.save_tokens,
+                &mut self.cached_token_history,
+                &mut self.cached_image_key,
+                &mut self.cached_rope_deltas,
+                &mut self.caches,
+            );
+        } else {
+            save_cache_state_direct(
+                args.reuse_cache,
+                args.has_images,
+                args.generated_tokens,
+                args.finish_reason,
+                /* drop_last_always */ true,
+                args.save_tokens,
+                args.save_expanded_tokens,
+                args.image_cache_key,
+                &mut self.cached_token_history,
+                &mut self.cached_image_key,
+                &mut self.cached_rope_deltas,
+                &mut self.caches,
+            );
+        }
+    }
+
+    fn eval_caches(&self) -> Result<()> {
+        // No post-prefill cache sync on qwen3.5's reference paths:
+        // `chunked_prefill` evals internally per chunk and the decode
+        // loop schedules async evals. A blocking sync here would
+        // introduce an unnecessary stall.
+        Ok(())
+    }
+
+    fn prefill(&mut self, prompt_tokens: &[u32], stream: Stream) -> Result<MxArray> {
+        // Text-only prefill block (the engine's reset-or-delta split already
+        // ran; `self.caches` holds either fresh caches or the live session
+        // state).
+        let embedding_weight = self.embedding.get_weight();
+        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
+        let prompt = MxArray::from_uint32(prompt_tokens, &[1, prompt_tokens.len() as i64])?;
+        chunked_prefill(
+            &prompt,
+            &embedding_weight,
+            &mut self.layers,
+            &mut self.caches,
+            &self.final_norm,
+            &self.lm_head,
+            Some(&embedding_weight_t),
+            stream,
+        )
+    }
+
+    type Decode<'a>
+        = Qwen35Decode<'a>
+    where
+        Self: 'a;
+
+    fn begin_decode(&mut self, turn: &TurnSetup<'_>) -> Result<Self::Decode<'_>> {
+        let p = turn.params;
+
+        let is_streaming = self.turn_is_streaming.get();
+
+        // Decode-entry trace (sync paths only — the streaming cores never
+        // logged it). `enable_mtp && has_mtp_weights` turns route through
+        // `mtp_turn`, so the MTP branch string is unreachable here.
+        if !is_streaming {
+            let prefill_len = turn.total_seq_len as i32;
+            let max_kv_len_estimate =
+                engine::kv_capacity_round_up_saturating(prefill_len, p.max_new_tokens);
+            let has_mtp = self.has_mtp_weights();
+            let branch = if !p.enable_mtp {
+                "AR (enable_mtp=false)"
+            } else if !has_mtp {
+                "AR (no MTP weights on model)"
+            } else {
+                "AR"
+            };
+            info!(
+                "Qwen3.5 chat_decode entry: prompt_len={} max_new_tokens={} enable_mtp={} \
+                 mtp_depth={} prefill_seq_len={} max_kv_len={} has_mtp_weights={} \
+                 is_delta={} has_images={} branch=\"{}\"",
+                turn.total_seq_len,
+                p.max_new_tokens,
+                p.enable_mtp,
+                p.mtp_depth,
+                prefill_len,
+                max_kv_len_estimate,
+                has_mtp,
+                turn.is_delta,
+                turn.has_images,
+                branch,
+            );
+        }
+
+        let embedding_weight = self.embedding.get_weight();
+        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
+
+        let relabel = match (is_streaming, turn.is_delta) {
+            (false, _) => "chat_rust",
+            (true, false) => "chat_stream_rust",
+            (true, true) => "chat_stream_delta_rust",
+        };
+
+        Ok(Qwen35Decode {
+            inner: self,
+            embedding_weight,
+            embedding_weight_t,
+            relabel,
+        })
+    }
+
+    fn has_paged_adapter(&self) -> bool {
+        self.paged_adapter.is_some()
+    }
+
+    fn supports_images(&self) -> bool {
+        // Unconditionally true: the vision probe owns ALL image-bearing
+        // fresh turns; a checkpoint loaded without the vision
+        // encoder/processor surfaces the "VLM prefill requested but vision
+        // encoder/processor not loaded" / paged-text-only errors from inside
+        // the whole-turn cores.
+        true
+    }
+
+    fn wired_limit_bytes(&self) -> Option<usize> {
+        // Per-turn wired-memory limit = the model's estimated footprint.
+        Some(self.config.estimate_memory_bytes() as usize)
+    }
+
+    fn profiler_label(&self, is_delta: bool, is_streaming: bool) -> &'static str {
+        // Record the turn's streaming-ness for `begin_decode`'s relabel
+        // (`TurnSetup` does not carry it). The session core calls this
+        // hook exactly once per generic-flow turn, before
+        // `begin_decode`; whole-turn override paths return from the
+        // probes earlier and never consult either hook. The labels are
+        // the engine defaults.
+        self.turn_is_streaming.set(is_streaming);
+        match (is_streaming, is_delta) {
+            (false, false) => "chat",
+            (false, true) => "chat_delta",
+            (true, false) => "chat_stream",
+            (true, true) => "chat_stream_delta",
+        }
+    }
+
+    fn has_live_session(&self) -> bool {
+        // Delta guard: `self.caches.is_none()` means there is no
+        // initialized session to continue.
+        self.caches.is_some()
+    }
+
+    fn session_holds_images(&self) -> bool {
+        self.cached_image_key.is_some()
+    }
+
+    fn paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
+        // Both SYNC and STREAMING turns take the paged core. The paged
+        // cores self-handle MTP via the `eager_mtp_paged` arm
+        // (`paged_turn_sync_core_inner` / `paged_turn_stream_core_inner`),
+        // the streaming eager-MTP path.
+        Some(self.paged_whole_turn(args))
+    }
+
+    fn mtp_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
+        // `p.enable_mtp && has_mtp_weights` turns run the dense cores whose
+        // internal MTP gate does the compiled-availability check,
+        // `init_mtp_compiled…`, and the silent AR fallback on init failure.
+        // Everything beyond this entry condition stays inside those cores.
+        if !(args.params.enable_mtp && self.has_mtp_weights()) {
+            return None;
+        }
+        Some(self.dense_whole_turn(args))
+    }
+
+    fn vision_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
+        // The probe is gated on `!images.is_empty()`; the dense cores own
+        // the full image pipeline (VLM prefill, M-RoPE deltas,
+        // paged-text-only rejection, missing-encoder error).
+        Some(self.dense_whole_turn(args))
     }
 }
 
@@ -8307,181 +8080,9 @@ pub struct Qwen3_5GenerationResult {
     pub finish_reason: String,
 }
 
-/// Unified chat configuration shared by all model variants (Qwen3, Qwen3.5, Qwen3.5 MoE).
-#[napi(object)]
-#[derive(Debug, Clone, Default)]
-pub struct ChatConfig {
-    #[napi(ts_type = "number | undefined")]
-    pub max_new_tokens: Option<i32>,
-    #[napi(ts_type = "number | undefined")]
-    pub temperature: Option<f64>,
-    #[napi(ts_type = "number | undefined")]
-    pub top_k: Option<i32>,
-    #[napi(ts_type = "number | undefined")]
-    pub top_p: Option<f64>,
-    #[napi(ts_type = "number | undefined")]
-    pub min_p: Option<f64>,
-    /// Repetition penalty (1.0 = disabled). Penalizes tokens already in context.
-    #[napi(ts_type = "number | undefined")]
-    pub repetition_penalty: Option<f64>,
-    /// Size of the context window for repetition penalty (default: 256)
-    #[napi(ts_type = "number | undefined")]
-    pub repetition_context_size: Option<i32>,
-    /// Presence penalty (0.0 = disabled). Subtracts a flat penalty from logits of any
-    /// token that appeared at least once in context. Matches OpenAI API semantics.
-    #[napi(ts_type = "number | undefined")]
-    pub presence_penalty: Option<f64>,
-    /// Number of recent tokens to consider for presence penalty (default: 20)
-    #[napi(ts_type = "number | undefined")]
-    pub presence_context_size: Option<i32>,
-    /// Frequency penalty (0.0 = disabled). Subtracts penalty * occurrence_count from
-    /// logits of each token in context. Matches OpenAI API semantics.
-    #[napi(ts_type = "number | undefined")]
-    pub frequency_penalty: Option<f64>,
-    /// Number of recent tokens to consider for frequency penalty (default: 20)
-    #[napi(ts_type = "number | undefined")]
-    pub frequency_context_size: Option<i32>,
-    /// Max consecutive identical tokens before stopping (default: 16, 0 = disabled)
-    #[napi(ts_type = "number | undefined")]
-    pub max_consecutive_tokens: Option<i32>,
-    /// Max n-gram repetitions before stopping (default: 3, 0 = disabled)
-    #[napi(ts_type = "number | undefined")]
-    pub max_ngram_repeats: Option<i32>,
-    /// Max pattern size for n-gram repetition detection (default: 64)
-    #[napi(ts_type = "number | undefined")]
-    pub ngram_size: Option<i32>,
-    #[napi(ts_type = "Array<ToolDefinition>")]
-    pub tools: Option<Vec<ToolDefinition>>,
-    /// Reasoning effort level. Controls whether the model thinks before answering.
-    /// - "none" / "low": thinking disabled (template injects closed think block).
-    ///   "none" also sets includeReasoning to false by default.
-    /// - "medium" / "high": thinking enabled (default behavior).
-    /// - Not set: thinking enabled (model thinks naturally).
-    #[napi(ts_type = "string | undefined")]
-    pub reasoning_effort: Option<String>,
-    /// Maximum number of thinking tokens before forcing </think>.
-    /// When the model has generated this many tokens while in thinking mode,
-    /// the next token is forced to be the think_end token. None = unlimited.
-    #[napi(ts_type = "number | undefined")]
-    pub thinking_token_budget: Option<i32>,
-    /// Whether to include reasoning/thinking content in the output.
-    /// When false, the `thinking` field of ChatResult/ChatStreamChunk will always be None.
-    /// Default: true (false when reasoningEffort is "none").
-    #[napi(ts_type = "boolean | undefined")]
-    pub include_reasoning: Option<bool>,
-    /// When true, include performance metrics (TTFT, prefill tok/s, decode tok/s) in the result
-    #[napi(ts_type = "boolean | undefined")]
-    pub report_performance: Option<bool>,
-    /// Reuse KV cache across chat-session turns for incremental prefill. Default: true.
-    /// When true, the model preserves its KV cache after generation. On the next
-    /// `chatSessionStart` / `chatSessionContinue` call, it prefix-matches the new
-    /// token sequence against the cached tokens and only prefills the delta —
-    /// avoiding redundant computation for multi-turn conversations.
-    #[napi(ts_type = "boolean | undefined")]
-    pub reuse_cache: Option<bool>,
-    /// MTP: opt-in flag enabling the Multi-Token Prediction speculative decode
-    /// loop on the dense compiled path. Requires the model checkpoint to carry
-    /// an MTP head (otherwise silently ignored). Default: `false`.
-    #[napi(ts_type = "boolean | undefined")]
-    pub enable_mtp: Option<bool>,
-    /// MTP: number of draft tokens per speculative cycle. Clamped to `[1, 5]`
-    /// by the verify FFI contract. Default: 1.
-    ///
-    /// When `mtpAdaptiveDepth` is `true`, this value is used as the
-    /// throughput-policy seed and the expected-value policy's max depth.
-    /// Adaptive depth is opt-in; set `mtpAdaptiveDepth: true` explicitly to
-    /// enable it.
-    #[napi(ts_type = "number | undefined")]
-    pub mtp_depth: Option<i32>,
-    /// MTP: when true, the decode loop runs the adaptive
-    /// depth policy. Default mode is a per-depth EMA hill-climb plus
-    /// DFlash-style 3-state machine `full | reduced | probe`.
-    /// `MLX_MTP_ADAPTIVE_DEPTH_MODE=expected-value` instead uses the
-    /// MTPLX-style intra-cycle expected-value gate, which deepens toward
-    /// `mtpDepth` by default (T=0 byte-parity verified); set
-    /// `MLX_MTP_EV_ALLOW_DEEPEN=0` to pin the base depth.
-    /// When false, the loop pins `mtpDepth` for every cycle.
-    ///
-    /// Default: false. An explicit value always wins over the default.
-    #[napi(ts_type = "boolean | undefined")]
-    pub mtp_adaptive_depth: Option<bool>,
-}
-
-/// Unified chat result shared by all model variants (Qwen3, Qwen3.5, Qwen3.5 MoE).
-#[napi(object)]
-#[derive(Debug, Clone)]
-pub struct ChatResult {
-    pub text: String,
-    pub tool_calls: Vec<ToolCallResult>,
-    pub thinking: Option<String>,
-    pub num_tokens: u32,
-    pub prompt_tokens: u32,
-    pub reasoning_tokens: u32,
-    pub finish_reason: String,
-    pub raw_text: String,
-    /// Number of prompt tokens served from the reused KV-cache prefix.
-    ///
-    /// When the native prefix-cache machinery successfully matches the new
-    /// prompt against the cached conversation history (via
-    /// `verify_cache_prefix_direct`), only the trailing delta is re-prefilled
-    /// and this field reports the length of the reused prefix. `0` when
-    /// the cache was missed or disabled and the full prompt had to be
-    /// re-prefilled.
-    pub cached_tokens: u32,
-    /// Performance metrics (present when `reportPerformance: true` in config)
-    pub performance: Option<crate::profiling::PerformanceMetrics>,
-}
-
-/// A single chunk emitted during streaming chat generation.
-#[napi(object)]
-#[derive(Debug, Clone)]
-pub struct ChatStreamChunk {
-    pub text: String,
-    pub done: bool,
-    pub finish_reason: Option<String>,
-    pub tool_calls: Option<Vec<ToolCallResult>>,
-    pub thinking: Option<String>,
-    pub num_tokens: Option<u32>,
-    pub prompt_tokens: Option<u32>,
-    pub reasoning_tokens: Option<u32>,
-    pub raw_text: Option<String>,
-    /// Number of prompt tokens served from the reused KV-cache prefix on
-    /// this turn. Populated on the terminal chunk (`done == true`) only;
-    /// `None` on mid-stream delta chunks.
-    ///
-    /// Zero on a cache miss or disabled reuse; equal to the matched
-    /// prefix length on a hit. Mirrors `ChatResult.cached_tokens`
-    /// verbatim so session-aware streaming consumers can observe
-    /// prefix-cache reuse without round-tripping to the non-streaming
-    /// path. Non-terminal chunks always carry `None` — only the
-    /// terminal chunk is authoritative.
-    #[napi(ts_type = "number | undefined")]
-    pub cached_tokens: Option<u32>,
-    /// Performance metrics (only present in the final chunk when `reportPerformance: true`)
-    pub performance: Option<crate::profiling::PerformanceMetrics>,
-    /// Whether this delta chunk contains reasoning/thinking content.
-    /// true = reasoning (inside <think>...</think>), false = content (after </think>).
-    /// Only present on intermediate (non-final) chunks.
-    #[napi(ts_type = "boolean | undefined")]
-    pub is_reasoning: Option<bool>,
-}
-
-/// Handle returned by the streaming chat-session entry points
-/// (`chat_stream_session_start`, `chat_stream_session_continue`,
-/// `chat_stream_session_continue_tool`) to control an in-progress
-/// streaming generation.
-#[napi]
-pub struct ChatStreamHandle {
-    pub(crate) cancelled: Arc<AtomicBool>,
-}
-
-#[napi]
-impl ChatStreamHandle {
-    #[napi]
-    pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Relaxed);
-    }
-}
+// Shared chat types live in the model-neutral engine module; import them for
+// internal use (no re-export — consumers import from `crate::engine::types`).
+use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
 
 /// Qwen3.5 Model -- hybrid linear/full attention with optional MoE.
 ///
@@ -8495,12 +8096,12 @@ pub struct Qwen3_5Model {
     /// Cloned from inner for pure-getter NAPI methods (no command dispatch needed).
     pub(crate) config: Qwen3_5Config,
     /// Snapshot of `Qwen35Inner::paged_adapter.is_some()` captured at
-    /// construction time. Currently default-OFF on Qwen3.5 (parity-pending
-    /// — see CLAUDE.md and `Qwen3_5Config::use_block_paged_cache`).
-    /// VLM checkpoints can load with the adapter on for text-only
-    /// inference; image-bearing chat turns are rejected at runtime by
-    /// the chat-entry sites. Surfaced through the
-    /// `hasBlockPagedCache()` NAPI method.
+    /// construction time. Text-only checkpoints default-OFF on Qwen3.5
+    /// (parity-pending — see CLAUDE.md and
+    /// `Qwen3_5Config::use_block_paged_cache`). VLM checkpoints default the
+    /// adapter ON: dense image turns ONLY run on the paged-vision core, and a
+    /// vision turn that reaches a None adapter errors at dispatch. Surfaced
+    /// through the `hasBlockPagedCache()` NAPI method.
     pub(crate) paged_active: bool,
     /// Snapshot of `Qwen35Inner::has_mtp_weights()` captured
     /// at construction time, mirroring `paged_active`. Surfaced through
@@ -8516,22 +8117,16 @@ pub struct Qwen3_5Model {
 
 #[napi]
 impl Qwen3_5Model {
-    /// Reset all caches.
-    #[napi]
-    pub fn reset_caches(&self) -> Result<()> {
-        crate::model_thread::send_and_block(&self.thread, |reply| Qwen35Cmd::ResetCaches { reply })
-    }
-
     /// Whether the block-paged KV cache adapter is active on this model
     /// instance.
     ///
     /// `true` iff `Qwen35Inner::paged_adapter` was successfully
     /// constructed at load time (driven by
-    /// `Qwen3_5Config::use_block_paged_cache`, currently default-OFF
-    /// because parity is pending real-weights validation). On VLM
-    /// checkpoints the adapter can still be active for text-only
-    /// inference; image-bearing chat turns are rejected at runtime by
-    /// the chat-entry sites. Surfaced through this NAPI method so
+    /// `Qwen3_5Config::use_block_paged_cache`, default-OFF for text-only
+    /// checkpoints because parity is pending real-weights validation, and
+    /// default-ON for VLM checkpoints). On VLM checkpoints dense image turns
+    /// ONLY run on the paged-vision core; a vision turn that reaches a None
+    /// adapter errors at dispatch. Surfaced through this NAPI method so
     /// server endpoints can branch on it without round-tripping through
     /// the model thread.
     #[napi]
@@ -8592,397 +8187,6 @@ impl Qwen3_5Model {
         .await
     }
 
-    /// Start a new chat session.
-    ///
-    /// Runs the full jinja chat template once and uses `<|im_end|>` as
-    /// its stop token so the cached KV state ends on a clean ChatML
-    /// boundary. Image support is conditional on the loaded
-    /// checkpoint: a Qwen3.5-VL dense model loaded with vision weights
-    /// accepts images in `messages` (the vision encoder handles
-    /// prefill), while a plain text Qwen3.5 checkpoint rejects them
-    /// with a runtime error. Subsequent turns in the same session MUST
-    /// go through `chatSessionContinue` so the caller appends raw
-    /// ChatML deltas on top of the live caches without rerunning the
-    /// jinja template; a mid-session image change requires a fresh
-    /// `chatSessionStart` call. The session is owned end-to-end by
-    /// the `chatSession*` surface.
-    ///
-    /// This method is the production entry point used by the TypeScript
-    /// `ChatSession` wrapper for turn 1 of a multi-round conversation.
-    #[napi]
-    pub async fn chat_session_start(
-        &self,
-        messages: Vec<ChatMessage>,
-        config: Option<ChatConfig>,
-    ) -> Result<ChatResult> {
-        let config = config.unwrap_or(ChatConfig {
-            max_new_tokens: None,
-            temperature: None,
-            top_k: None,
-            top_p: None,
-            min_p: None,
-            repetition_penalty: None,
-            repetition_context_size: None,
-            presence_penalty: None,
-            presence_context_size: None,
-            frequency_penalty: None,
-            frequency_context_size: None,
-            max_consecutive_tokens: None,
-            max_ngram_repeats: None,
-            ngram_size: None,
-            tools: None,
-            thinking_token_budget: None,
-            include_reasoning: None,
-            reasoning_effort: None,
-            report_performance: None,
-            reuse_cache: None,
-            enable_mtp: None,
-            mtp_depth: None,
-            mtp_adaptive_depth: None,
-        });
-
-        crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::ChatSessionStart {
-            messages,
-            config,
-            reply,
-        })
-        .await
-    }
-
-    /// Continue an existing chat session with a new user message.
-    ///
-    /// Appends a raw ChatML user/assistant delta to the session's cached
-    /// KV state, then decodes the assistant reply. Stops on `<|im_end|>`
-    /// so the cache remains on a clean boundary for the next turn.
-    ///
-    /// Requires a live session started via `chatSessionStart`. Errors
-    /// if the session is empty, carries image state, or if
-    /// `config.reuse_cache` is explicitly set to `false`.
-    ///
-    /// `images` is an opt-in guard parameter: when non-empty, the native
-    /// side returns an error whose message begins with
-    /// `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
-    /// `ChatSession` layer can catch the prefix and route image-changes
-    /// back through a fresh `chatSessionStart`.
-    #[napi(
-        ts_args_type = "userMessage: string, images: Uint8Array[] | null | undefined, config: ChatConfig | null | undefined"
-    )]
-    pub async fn chat_session_continue(
-        &self,
-        user_message: String,
-        images: Option<Vec<Uint8Array>>,
-        config: Option<ChatConfig>,
-    ) -> Result<ChatResult> {
-        let config = config.unwrap_or(ChatConfig {
-            max_new_tokens: None,
-            temperature: None,
-            top_k: None,
-            top_p: None,
-            min_p: None,
-            repetition_penalty: None,
-            repetition_context_size: None,
-            presence_penalty: None,
-            presence_context_size: None,
-            frequency_penalty: None,
-            frequency_context_size: None,
-            max_consecutive_tokens: None,
-            max_ngram_repeats: None,
-            ngram_size: None,
-            tools: None,
-            thinking_token_budget: None,
-            include_reasoning: None,
-            reasoning_effort: None,
-            report_performance: None,
-            reuse_cache: None,
-            enable_mtp: None,
-            mtp_depth: None,
-            mtp_adaptive_depth: None,
-        });
-
-        crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::ChatSessionContinue {
-            user_message,
-            images,
-            config,
-            reply,
-        })
-        .await
-    }
-
-    /// Continue an existing chat session with a tool-result turn.
-    ///
-    /// Builds a ChatML `<tool_response>`-wrapped delta from `content` and
-    /// prefills it on top of the live session caches, then decodes the
-    /// assistant reply. Stops on `<|im_end|>` so the cache stays on a
-    /// clean boundary for the next turn.
-    ///
-    /// The `tool_call_id` is currently dropped by the wire format —
-    /// Qwen3.5's chat template identifies tool responses by position +
-    /// wrapper tags, not an explicit id. Callers may still log it for
-    /// their own bookkeeping.
-    ///
-    /// `is_error` is the structured tool-error signal. When `Some(true)`,
-    /// the renderer prepends the shared
-    /// [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-    /// `<tool_response>` wrapper so the model receives a clear text-level
-    /// cue. `None` / `Some(false)` keep the wire bytes byte-equal to the
-    /// pre-feature output.
-    ///
-    /// Requires a live session started via `chatSessionStart`.
-    #[napi]
-    pub async fn chat_session_continue_tool(
-        &self,
-        tool_call_id: String,
-        content: String,
-        config: Option<ChatConfig>,
-        is_error: Option<bool>,
-    ) -> Result<ChatResult> {
-        let config = config.unwrap_or(ChatConfig {
-            max_new_tokens: None,
-            temperature: None,
-            top_k: None,
-            top_p: None,
-            min_p: None,
-            repetition_penalty: None,
-            repetition_context_size: None,
-            presence_penalty: None,
-            presence_context_size: None,
-            frequency_penalty: None,
-            frequency_context_size: None,
-            max_consecutive_tokens: None,
-            max_ngram_repeats: None,
-            ngram_size: None,
-            tools: None,
-            thinking_token_budget: None,
-            include_reasoning: None,
-            reasoning_effort: None,
-            report_performance: None,
-            reuse_cache: None,
-            enable_mtp: None,
-            mtp_depth: None,
-            mtp_adaptive_depth: None,
-        });
-
-        crate::model_thread::send_and_await(&self.thread, |reply| {
-            Qwen35Cmd::ChatSessionContinueTool {
-                tool_call_id,
-                content,
-                is_error,
-                config,
-                reply,
-            }
-        })
-        .await
-    }
-
-    /// Streaming variant of `chatSessionStart`.
-    ///
-    /// Dispatches to the dedicated model thread. Behaviourally identical
-    /// to `chatSessionStart` (resets caches, uses `<|im_end|>` as
-    /// eos, inherits the same VLM-vs-text image-support contract) but
-    /// streams token deltas through the JS callback instead of
-    /// returning a `ChatResult`. Used by the TypeScript
-    /// `ChatSession.sendStream()` for turn 1 of a multi-round streaming
-    /// conversation.
-    #[napi(
-        ts_args_type = "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
-    )]
-    pub async fn chat_stream_session_start(
-        &self,
-        messages: Vec<ChatMessage>,
-        config: Option<ChatConfig>,
-        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
-    ) -> Result<ChatStreamHandle> {
-        let config = config.unwrap_or(ChatConfig {
-            max_new_tokens: None,
-            temperature: None,
-            top_k: None,
-            top_p: None,
-            min_p: None,
-            repetition_penalty: None,
-            repetition_context_size: None,
-            presence_penalty: None,
-            presence_context_size: None,
-            frequency_penalty: None,
-            frequency_context_size: None,
-            max_consecutive_tokens: None,
-            max_ngram_repeats: None,
-            ngram_size: None,
-            tools: None,
-            thinking_token_budget: None,
-            include_reasoning: None,
-            reasoning_effort: None,
-            report_performance: None,
-            reuse_cache: None,
-            enable_mtp: None,
-            mtp_depth: None,
-            mtp_adaptive_depth: None,
-        });
-
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancelled_inner = cancelled.clone();
-        let (stream_tx, mut stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
-
-        self.thread.send(Qwen35Cmd::ChatStreamSessionStart {
-            messages,
-            config,
-            stream_tx,
-            cancelled: cancelled_inner,
-        })?;
-
-        let callback = Arc::new(callback);
-        tokio::spawn(async move {
-            while let Some(result) = stream_rx.recv().await {
-                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
-            }
-        });
-
-        Ok(ChatStreamHandle { cancelled })
-    }
-
-    /// Streaming variant of `chatSessionContinue`.
-    ///
-    /// Appends a ChatML user/assistant delta on top of the live session
-    /// caches and streams the decoded reply. Requires a live session
-    /// started via `chatStreamSessionStart` (or the non-streaming
-    /// `chatSessionStart`). Used by the TypeScript
-    /// `ChatSession.sendStream()` for turns 2..N of a multi-round
-    /// streaming conversation.
-    ///
-    /// `images` is an opt-in guard parameter: when non-empty, the
-    /// streaming path emits an error chunk whose message begins with
-    /// `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
-    /// `ChatSession` layer can route image-changes through a fresh
-    /// session start.
-    #[napi(
-        ts_args_type = "userMessage: string, images: Uint8Array[] | null | undefined, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
-    )]
-    pub async fn chat_stream_session_continue(
-        &self,
-        user_message: String,
-        images: Option<Vec<Uint8Array>>,
-        config: Option<ChatConfig>,
-        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
-    ) -> Result<ChatStreamHandle> {
-        let config = config.unwrap_or(ChatConfig {
-            max_new_tokens: None,
-            temperature: None,
-            top_k: None,
-            top_p: None,
-            min_p: None,
-            repetition_penalty: None,
-            repetition_context_size: None,
-            presence_penalty: None,
-            presence_context_size: None,
-            frequency_penalty: None,
-            frequency_context_size: None,
-            max_consecutive_tokens: None,
-            max_ngram_repeats: None,
-            ngram_size: None,
-            tools: None,
-            thinking_token_budget: None,
-            include_reasoning: None,
-            reasoning_effort: None,
-            report_performance: None,
-            reuse_cache: None,
-            enable_mtp: None,
-            mtp_depth: None,
-            mtp_adaptive_depth: None,
-        });
-
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancelled_inner = cancelled.clone();
-        let (stream_tx, mut stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
-
-        self.thread.send(Qwen35Cmd::ChatStreamSessionContinue {
-            user_message,
-            images,
-            config,
-            stream_tx,
-            cancelled: cancelled_inner,
-        })?;
-
-        let callback = Arc::new(callback);
-        tokio::spawn(async move {
-            while let Some(result) = stream_rx.recv().await {
-                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
-            }
-        });
-
-        Ok(ChatStreamHandle { cancelled })
-    }
-
-    /// Streaming variant of `chatSessionContinueTool`.
-    ///
-    /// Builds a ChatML tool-response delta on top of the live session
-    /// caches and streams the decoded reply. Requires a live session
-    /// started via `chatSessionStart` / `chatStreamSessionStart`.
-    /// `is_error` mirrors the non-streaming entry point — when
-    /// `Some(true)`, the renderer prepends the shared
-    /// [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-    /// `<tool_response>` wrapper.
-    #[napi(
-        ts_args_type = "toolCallId: string, content: string, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void, isError?: boolean | null | undefined"
-    )]
-    pub async fn chat_stream_session_continue_tool(
-        &self,
-        tool_call_id: String,
-        content: String,
-        config: Option<ChatConfig>,
-        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
-        is_error: Option<bool>,
-    ) -> Result<ChatStreamHandle> {
-        let config = config.unwrap_or(ChatConfig {
-            max_new_tokens: None,
-            temperature: None,
-            top_k: None,
-            top_p: None,
-            min_p: None,
-            repetition_penalty: None,
-            repetition_context_size: None,
-            presence_penalty: None,
-            presence_context_size: None,
-            frequency_penalty: None,
-            frequency_context_size: None,
-            max_consecutive_tokens: None,
-            max_ngram_repeats: None,
-            ngram_size: None,
-            tools: None,
-            thinking_token_budget: None,
-            include_reasoning: None,
-            reasoning_effort: None,
-            report_performance: None,
-            reuse_cache: None,
-            enable_mtp: None,
-            mtp_depth: None,
-            mtp_adaptive_depth: None,
-        });
-
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancelled_inner = cancelled.clone();
-        let (stream_tx, mut stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
-
-        self.thread.send(Qwen35Cmd::ChatStreamSessionContinueTool {
-            tool_call_id,
-            content,
-            is_error,
-            config,
-            stream_tx,
-            cancelled: cancelled_inner,
-        })?;
-
-        let callback = Arc::new(callback);
-        tokio::spawn(async move {
-            while let Some(result) = stream_rx.recv().await {
-                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
-            }
-        });
-
-        Ok(ChatStreamHandle { cancelled })
-    }
-
     // ---------------------------------------------------------------
     // Test-only helpers: streaming session entry points that bypass
     // ThreadsafeFunction and expose the mpsc receiver directly. Used
@@ -9010,12 +8214,13 @@ impl Qwen3_5Model {
         let cancelled_inner = cancelled.clone();
         let (stream_tx, stream_rx) =
             tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
-        self.thread.send(Qwen35Cmd::ChatStreamSessionStart {
-            messages,
-            config,
-            stream_tx,
-            cancelled: cancelled_inner,
-        })?;
+        self.thread
+            .send(Qwen35Cmd::Chat(ChatCmd::StreamSessionStart {
+                messages,
+                config,
+                stream_tx,
+                cancelled: cancelled_inner,
+            }))?;
         Ok((ChatStreamHandle { cancelled }, stream_rx))
     }
 
@@ -9036,13 +8241,14 @@ impl Qwen3_5Model {
         let cancelled_inner = cancelled.clone();
         let (stream_tx, stream_rx) =
             tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
-        self.thread.send(Qwen35Cmd::ChatStreamSessionContinue {
-            user_message,
-            images,
-            config,
-            stream_tx,
-            cancelled: cancelled_inner,
-        })?;
+        self.thread
+            .send(Qwen35Cmd::Chat(ChatCmd::StreamSessionContinue {
+                user_message,
+                images,
+                config,
+                stream_tx,
+                cancelled: cancelled_inner,
+            }))?;
         Ok((ChatStreamHandle { cancelled }, stream_rx))
     }
 
@@ -9107,6 +8313,16 @@ impl Qwen3_5Model {
         })?;
         Ok(promise)
     }
+}
+
+crate::models::chat_napi::chat_napi_surface! {
+    class: Qwen3_5Model,
+    thread_cmd: Qwen35Cmd,
+    thread: direct,
+    image_guard: none,
+    ts_stream_start: "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
+    ts_stream_continue: "userMessage: string, images: Uint8Array[] | null | undefined, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
+    ts_stream_continue_tool: "toolCallId: string, content: string, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void, isError?: boolean | null | undefined",
 }
 
 /// Default prefill chunk size (tokens per chunk).
@@ -9446,6 +8662,42 @@ fn forward_pre_norm_inner(
     Ok(h)
 }
 
+/// Tape-recording variant of [`forward_pre_norm_inner`] for the eager MTP
+/// verify forward.
+///
+/// Identical to `forward_pre_norm_inner` except it records a per-layer
+/// [`GdnLayerTape`] for every GDN (`Linear`) layer into `tape`, indexed by
+/// ABSOLUTE layer index (`tape[i]` is `Some` for GDN layers, stays `None` for
+/// full-attention layers). `tape` is pre-sized to `layers.len()` by the caller.
+/// Recording is by lazy `.clone()` (no eval), so it stays inside the fused MLX
+/// graph that `eval_step`/`async_eval_layer_caches` materializes.
+fn forward_pre_norm_inner_with_tape(
+    input_ids: &MxArray,
+    embedding_weight: &MxArray,
+    layers: &mut [DecoderLayer],
+    caches: &mut Option<Vec<Qwen3_5LayerCache>>,
+    tape: &mut [Option<super::gated_delta_net::GdnLayerTape>],
+) -> Result<MxArray> {
+    let embedding = Embedding::from_weight(embedding_weight)?;
+    let hidden_states = embedding.forward(input_ids)?;
+    let mut h = hidden_states.clone();
+
+    let num_layers = layers.len();
+    debug_assert_eq!(
+        tape.len(),
+        num_layers,
+        "forward_pre_norm_inner_with_tape: tape length must equal layer count"
+    );
+    for i in 0..num_layers {
+        let cache = caches.as_mut().map(|c| &mut c[i]);
+        let mut slot: Option<super::gated_delta_net::GdnLayerTape> = None;
+        h = layers[i].forward_with_tape(&h, None, cache, None, true, Some(&mut slot))?;
+        tape[i] = slot;
+    }
+
+    Ok(h)
+}
+
 fn project_logits_from_hidden(
     hidden: &MxArray,
     lm_head: &Option<Linear>,
@@ -9464,6 +8716,48 @@ fn project_logits_from_hidden(
     }
 }
 
+/// Eager (pure-Rust) MTP verify step.
+///
+/// Translation of the compiled `forward_mtp_verify_compiled_with_hidden`
+/// FFI: runs the `verify_ids` (`[1, K+1]` int32) through the SAME main-model
+/// stack the AR path uses (`forward_pre_norm_inner` + `final_norm` +
+/// `project_logits_from_hidden`), advancing `inner.caches` by `K+1` positions.
+///
+/// Returns `MtpVerifyOutput::logits_only(logits, hiddens)` where:
+///   * `logits` is `[1, K+1, vocab]` (the verifier target distribution at
+///     every verify position),
+///   * `hiddens` is `[1, K+1, hidden]` — the post-final-norm hidden at every
+///     verify position (the chained-seed and commit context).
+///
+/// `emb` is the embedding table; `emb_t` is its precomputed transpose for the
+/// tied-embedding projection (passed straight through to
+/// `project_logits_from_hidden`).
+#[allow(clippy::too_many_arguments)]
+fn eager_verify_step(
+    layers: &mut [DecoderLayer],
+    caches: &mut Option<Vec<Qwen3_5LayerCache>>,
+    final_norm: &RMSNorm,
+    lm_head: &Option<Linear>,
+    verify_ids: &MxArray,
+    emb: &MxArray,
+    emb_t: Option<&MxArray>,
+    tape: Option<&mut Vec<Option<super::gated_delta_net::GdnLayerTape>>>,
+) -> Result<mtp_decode::MtpVerifyOutput> {
+    let pre = match tape {
+        Some(tape) => {
+            // Record a per-layer GDN tape during the verify forward so the
+            // rollback replay can reconstruct the AR-exact carried state.
+            tape.clear();
+            tape.resize(layers.len(), None);
+            forward_pre_norm_inner_with_tape(verify_ids, emb, layers, caches, tape)?
+        }
+        None => forward_pre_norm_inner(verify_ids, emb, layers, caches)?,
+    };
+    let hiddens = final_norm.forward(&pre)?;
+    let logits = project_logits_from_hidden(&hiddens, lm_head, emb, emb_t)?;
+    Ok(mtp_decode::MtpVerifyOutput::logits_only(logits, hiddens))
+}
+
 fn project_last_logits_from_pre_norm_hidden(
     hidden: &MxArray,
     final_norm: &RMSNorm,
@@ -9479,600 +8773,8 @@ fn project_last_logits_from_pre_norm_hidden(
     logits.squeeze(Some(&[1]))
 }
 
-/// Compiled single-token decode step using mlx::core::compile().
-///
-/// On the first call, MLX traces the 64-layer forward pass and caches the graph.
-/// All subsequent calls reuse the cached graph via compile_replace — no re-tracing.
-/// This eliminates per-step graph reconstruction overhead (~5358 nodes).
-///
-/// State is held in C++ globals (g_compiled_caches, g_compiled_offset).
-/// Must call `mlx_qwen35_compiled_init_from_prefill` before the decode loop.
-fn forward_compiled(input_ids: &MxArray, embedding_weight: &MxArray) -> Result<MxArray> {
-    use mlx_sys as sys;
-
-    let mut output_ptr: *mut sys::mlx_array = std::ptr::null_mut();
-    unsafe {
-        sys::mlx_qwen35_forward_compiled(
-            input_ids.as_raw_ptr(),
-            embedding_weight.as_raw_ptr(),
-            &mut output_ptr,
-            std::ptr::null_mut(),
-        );
-    }
-
-    if output_ptr.is_null() {
-        return Err(Error::from_reason(
-            "C++ compiled forward step returned null — check stderr for exception details",
-        ));
-    }
-
-    MxArray::from_handle(output_ptr, "compiled_forward_logits")
-}
-
-/// Evaluate next_token and all compiled cache arrays to prevent graph accumulation.
-///
-/// Called after each compiled decode step. mlx::core::compile reuses the graph
-/// structure across steps, but we still need to eval to materialize output arrays
-/// and break lazy dependency chains (preventing O(N²) graph growth).
-fn eval_token_and_compiled_caches(next_token: &MxArray) {
-    unsafe {
-        mlx_sys::mlx_qwen35_eval_token_and_compiled_caches(next_token.as_raw_ptr());
-    }
-}
-
-/// Evaluate `next_token`, the `chained_hidden` slice, and all compiled cache
-/// arrays in a SINGLE `async_eval` batch. Used by the chained-cycles MTP path
-/// at end-of-iteration so the chained `verify_hidden[K]` slice becomes a
-/// sibling of the next-cycle draft's first inputs — mirroring the Step-A
-/// bypass's fused `(logits, hidden)` dispatch and eliminating the mid-cycle
-/// Metal command-buffer roundtrip the lazy slice would otherwise force when the
-/// next cycle's draft graph reads `prev_hidden`.
-///
-/// `chained_hidden` is `[1, 1, hidden]` bf16 — the `verify_hiddens[:, K, :]`
-/// slice produced by `run_mtp_cycle_inner`.
-fn eval_token_caches_and_chained_hidden(next_token: &MxArray, chained_hidden: &MxArray) {
-    unsafe {
-        mlx_sys::mlx_qwen35_eval_token_caches_and_extra(
-            next_token.as_raw_ptr(),
-            chained_hidden.as_raw_ptr(),
-        );
-    }
-}
-
-/// One compiled forward step that ALSO exports the post-final-norm hidden of
-/// the decoded token. Calls `forward_compiled` first, then asks the C++ side
-/// for the stashed hidden from that step.
-///
-/// Returns `(logits, hidden)` where `logits` is `[1, vocab]` and
-/// `hidden` is `[1, hidden_size]` bf16. The hidden state is the
-/// pre-LM-head input — the exact tensor MTP draft's `prev_hidden`
-/// expects, after a `reshape(&[1, 1, hidden])` to match the
-/// `[B, T, hidden]` MTP-draft contract.
-///
-/// Caller MUST hold `DENSE_COMPILED_MUTEX` and the
-/// `COMPILED_WEIGHTS_RWLOCK` read guard for the whole call — the
-/// hidden is stashed in a process-wide `g_last_hidden` global on
-/// the C++ side and is only valid until the next main-path forward
-/// or reset.
-// The chat-session integration is the only intended caller.
-pub(super) fn forward_compiled_with_hidden(
-    input_ids: &MxArray,
-    embedding_weight: &MxArray,
-) -> Result<(MxArray, MxArray)> {
-    use mlx_sys as sys;
-
-    let logits = forward_compiled(input_ids, embedding_weight)?;
-
-    let mut hidden_ptr: *mut sys::mlx_array = std::ptr::null_mut();
-    unsafe { sys::mlx_qwen35_export_last_hidden(&mut hidden_ptr) };
-    if hidden_ptr.is_null() {
-        return Err(Error::from_reason(
-            "forward_compiled_with_hidden: C++ returned null hidden — \
-             check that forward_compiled succeeded and g_compile_inited is true",
-        ));
-    }
-    let hidden = MxArray::from_handle(hidden_ptr, "compiled_forward_last_hidden")?;
-    Ok((logits, hidden))
-}
-
-/// Export the post-final-norm hidden captured by the most
-/// recent `mlx_qwen35_forward_paged` invocation. Wraps the C++ FFI and
-/// converts a null return into a structured `Err` so the paged-MTP gate
-/// can surface seeding failures cleanly instead of crashing.
-///
-/// Locking contract: caller MUST hold the same locks as the
-/// surrounding `forward_dense_cpp_paged` call (`DENSE_COMPILED_MUTEX`
-/// + `COMPILED_WEIGHTS_RWLOCK` read) — the export reads
-///   `g_last_hidden_paged` and `g_dense_paged_inited`, both protected by
-///   those mutexes in production.
-fn export_last_hidden_paged() -> Result<MxArray> {
-    use mlx_sys as sys;
-
-    let mut hidden_ptr: *mut sys::mlx_array = std::ptr::null_mut();
-    unsafe { sys::mlx_qwen35_export_last_hidden_paged(&mut hidden_ptr) };
-    if hidden_ptr.is_null() {
-        return Err(Error::from_reason(
-            "export_last_hidden_paged: C++ returned null hidden — check that \
-             a paged forward has run since the last reset and \
-             g_dense_paged_inited is true",
-        ));
-    }
-    MxArray::from_handle(hidden_ptr, "paged_forward_last_hidden")
-}
-
-// ============================================================================
-// Compiled C++ MTP (Multi-Token Prediction) wrappers (dense).
-//
-// Companions to `forward_compiled` / `eval_token_and_compiled_caches`.
-// The C++ side lives in `crates/mlx-sys/src/mlx_qwen35_mtp_compiled.cpp`
-// and shares `g_weights()` / `g_compiled_caches` with the main path.
-//
-// Locking contract:
-//   - Production callers (chat-session loop) MUST hold
-//     `DENSE_COMPILED_MUTEX` and `COMPILED_WEIGHTS_RWLOCK` (read) across
-//     the entire draft+verify cycle — the verify FFI mutates the main
-//     compiled state in place, so any concurrent main-path forward would
-//     race.
-//   - Tests in `compiled_ffi_tests` (in `mtp.rs`) cannot lock
-//     `DENSE_COMPILED_MUTEX` directly because it is `static` (private)
-//     to this module. They instead serialise on `FFI_LOCK`, which is
-//     sufficient in the absence of concurrent main-path forward calls.
-//
-// Integration contract:
-//   1. After `mlx_qwen35_compiled_init_from_prefill(...)` succeeds for
-//      the current turn, call `init_mtp_compiled_from_main(...)` ONCE
-//      with the same config / max_kv_len.
-//   2. For each draft+verify cycle:
-//      a. Snapshot caches and main offset.
-//      b. Call `forward_mtp_draft_compiled(...)` D times.
-//      c. Call `forward_mtp_verify_compiled(...)` ONCE.
-//      d. Accept / reject per the sampler. On reject, rewind the main
-//         offset via `mlx_qwen35_compiled_adjust_offset` AND the MTP
-//         offset via `mlx_qwen35_mtp_compiled_adjust_offset` to keep
-//         the two paths in lock-step.
-//   3. On turn end, call `mlx_qwen35_mtp_compiled_reset()` (FFI).
-// ============================================================================
-
-/// Initialize the MTP compiled path from the main path's current state.
-///
-/// Must be called AFTER `mlx_qwen35_compiled_init_from_prefill`. The
-/// MTP path allocates fresh per-layer KV caches sized to `max_kv_len`
-/// (zeros) — it does NOT seed from the main path's prefill caches
-/// because MTP draft layers attend to their own draft KV history, not
-/// the committed-prefix history.
-///
-/// Returns `Ok(())` on success. Returns `Err` on `n_mtp_layers <= 0`,
-/// missing MTP weights, or any C++ exception. On error the MTP state
-/// is left uninitialised and subsequent draft/verify calls become
-/// null-pointer no-ops so the caller can fall back to the eager Rust
-/// MTP forward.
-// The chat-session integration is the only intended caller.
-pub(super) fn init_mtp_compiled_from_main(config: &Qwen3_5Config, max_kv_len: i32) -> Result<()> {
-    use mlx_sys as sys;
-
-    if config.n_mtp_layers != 1 {
-        return Err(Error::from_reason(format!(
-            "init_mtp_compiled_from_main: committed-history MTP commit currently supports \
-             exactly one MTP layer (got {})",
-            config.n_mtp_layers
-        )));
-    }
-
-    let status = unsafe {
-        sys::mlx_qwen35_mtp_compiled_init_from_main(
-            config.num_layers,
-            config.hidden_size,
-            config.num_heads,
-            config.num_kv_heads,
-            config.head_dim,
-            config.rope_theta as f32,
-            config.rope_dims(),
-            config.rms_norm_eps as f32,
-            config.full_attention_interval,
-            config.linear_num_key_heads,
-            config.linear_num_value_heads,
-            config.linear_key_head_dim,
-            config.linear_value_head_dim,
-            config.linear_conv_kernel_dim,
-            if config.tie_word_embeddings { 1 } else { 0 },
-            max_kv_len,
-            1,
-            config.n_mtp_layers,
-        )
-    };
-
-    if status != 0 {
-        return Err(Error::from_reason(format!(
-            "init_mtp_compiled_from_main: C++ returned status {status} — \
-             check stderr for diagnostic"
-        )));
-    }
-
-    // Eagerly compile the batched verify graphs for all
-    // depths in {1..5} for both `WithTape=false` and `WithTape=true`. The
-    // FFI is best-effort: any failure inside is logged to stderr and
-    // swallowed, leaving the verify path to fall back to lazy compile on
-    // first use. We DON'T propagate errors here — prewarm is purely a
-    // latency optimization, not a correctness gate.
-    unsafe {
-        sys::mlx_qwen35_mtp_compiled_prewarm_verify();
-    }
-
-    Ok(())
-}
-
-/// One MTP draft step on the compiled path.
-///
-/// Inputs are `[1, 1, hidden]` bf16: `prev_hidden` is the post-norm
-/// hidden state from the previous step (or the committed-prefix
-/// hidden on the first step), and `prev_emb` is the embedding of
-/// the previously-committed-or-drafted token (caller picks).
-///
-/// Returns `(h_next, draft_logits)` where `h_next` is `[1, 1, hidden]`
-/// (feed to next draft step's `prev_hidden`) and `draft_logits` is
-/// `[1, vocab]` (sampler input). Mutates the MTP KV caches in place
-/// and advances the MTP offset by 1.
-///
-/// Returns `Err` if the C++ side returns null pointers (init not
-/// done, exception). On `Err` the MTP state is left as-is — the
-/// caller should fall back to the eager Rust MTP forward.
-// The chat-session integration is the only intended caller.
-pub(super) fn forward_mtp_draft_compiled(
-    prev_hidden: &MxArray,
-    prev_emb: &MxArray,
-) -> Result<(MxArray, MxArray)> {
-    use mlx_sys as sys;
-
-    let mut h_next_ptr: *mut sys::mlx_array = std::ptr::null_mut();
-    let mut logits_ptr: *mut sys::mlx_array = std::ptr::null_mut();
-    unsafe {
-        sys::mlx_qwen35_mtp_draft_compiled(
-            prev_hidden.as_raw_ptr(),
-            prev_emb.as_raw_ptr(),
-            &mut h_next_ptr,
-            &mut logits_ptr,
-        );
-    }
-
-    if h_next_ptr.is_null() || logits_ptr.is_null() {
-        // Clean up the half-allocated output if only one side succeeded.
-        if !h_next_ptr.is_null() {
-            unsafe { sys::mlx_array_delete(h_next_ptr) };
-        }
-        if !logits_ptr.is_null() {
-            unsafe { sys::mlx_array_delete(logits_ptr) };
-        }
-        return Err(Error::from_reason(
-            "forward_mtp_draft_compiled: C++ returned null — check stderr",
-        ));
-    }
-
-    let h_next = MxArray::from_handle(h_next_ptr, "mtp_draft_h_next")?;
-    let logits = MxArray::from_handle(logits_ptr, "mtp_draft_logits")?;
-    Ok((h_next, logits))
-}
-
-/// Committed-history commit. Append exact MTP K/V for the
-/// FULL `K+2` committed token sequence of this cycle to the persistent
-/// MTP cache so the next cycle's drafts attend over the full committed
-/// prefix.
-///
-/// The committed sequence emitted by one outer iteration is
-/// `[last_committed_id, d_0..d_{K-1}, boundary]` — exactly `M = K+2`
-/// tokens (`committed_ids`). The MTP head contract is
-/// `MTP(h(t), emb(t+1))` predicting `t+2`: the slot for committed token
-/// `x` must hold attention K/V computed from
-/// `fc([e_norm(emb(x)), h_norm(h(prev(x)))])` — embedding of `x`,
-/// hidden of the token BEFORE `x`. So the M hidden rows fed to the
-/// commit are:
-///   slot 0 (`last_committed_id`) ← `seed_hidden` (the cycle's Step-A
-///       hidden = h(token before `last_committed_id`)).
-///   slot i, 1≤i≤K (`d_{i-1}`)   ← `verify_hiddens[:, i-1, :]`.
-///   slot K+1 (`boundary`)       ← `verify_hiddens[:, K, :]`.
-/// i.e. `[seed_hidden] ++ verify_hiddens[:, 0:K+1, :]` (length K+2),
-/// paired against `emb(committed_ids)` (length K+2).
-///
-/// `verify_hiddens` is `[1, depth+1, hidden]` bf16 (the verify
-/// forward's post-final-norm hidden at every verify position).
-/// `seed_hidden` is `[1, 1, hidden]` bf16. `committed_ids` has length
-/// `K+2`. `embedding_weight` is the model's embedding table.
-///
-/// Assembles the two `[1, K+2, hidden]` arrays Rust-side (concatenate
-/// `seed_hidden` with `verify_hiddens[:, 0:K+1, :]`; gather the K+2
-/// embedding rows) and invokes `mlx_qwen35_mtp_compiled_commit`, which
-/// writes the K/V and advances the persistent committed-prefix counter
-/// by `M = K+2`.
-///
-/// Errors propagate via `Result` — no `unwrap` on the decode hot path.
-pub(super) fn commit_mtp_compiled(
-    seed_hidden: &MxArray,
-    verify_hiddens: &MxArray,
-    committed_ids: &[u32],
-    k_accepted: usize,
-    embedding_weight: &MxArray,
-) -> Result<()> {
-    use mlx_sys as sys;
-
-    // M = K+2 committed tokens. `committed_ids` =
-    // `[last_committed_id, d_0..d_{K-1}, boundary]`.
-    let m = committed_ids.len();
-    if m < 2 {
-        return Err(Error::from_reason(
-            "commit_mtp_compiled: committed_ids must have at least 2 elements",
-        ));
-    }
-    if m != k_accepted + 2 {
-        return Err(Error::from_reason(
-            "commit_mtp_compiled: committed_ids length must equal k_accepted + 2",
-        ));
-    }
-    let hidden_dim = verify_hiddens.shape_at(2)?;
-
-    // Hidden sequence: [seed_hidden] ++ verify_hiddens[:, 0:K+1, :].
-    // `verify_hiddens` is [1, depth+1, hidden]; we take the first K+1
-    // time rows (slots for d_0..d_{K-1} + boundary) and prepend the
-    // Step-A seed hidden along the time axis → [1, K+2, hidden].
-    let vh_prefix = verify_hiddens.slice(&[0, 0, 0], &[1, (m - 1) as i64, hidden_dim])?;
-    let hidden_seq = MxArray::concatenate(seed_hidden, &vh_prefix, 1)?;
-
-    // Embedding sequence: gather the K+2 committed-token rows from the
-    // embedding table → [K+2, hidden] → [1, K+2, hidden]. Passing
-    // pre-gathered rows avoids a quantized-embedding edge case inside
-    // the commit graph.
-    let ids_i32: Vec<i32> = committed_ids.iter().map(|&v| v as i32).collect();
-    let ids_arr = MxArray::from_int32(&ids_i32, &[m as i64])?;
-    let gathered = embedding_weight.take(&ids_arr, 0)?;
-    let gathered_embs = gathered.reshape(&[1, m as i64, hidden_dim])?;
-
-    // The FFI returns 0 on success and a non-zero code on any failure
-    // (capacity overflow, exception, not-inited). On a non-zero status
-    // `g_mtp_committed_len` is NOT advanced — the persistent MTP cache
-    // and the committed-prefix counter are now desynced. Propagate as
-    // an `Err` so the `?` at the call site aborts decode cleanly with a
-    // diagnostic; a silent fallback would anchor the next cycle's
-    // drafts to a stale committed length and corrupt all later output.
-    let before_committed = unsafe { sys::mlx_qwen35_mtp_get_committed_len() };
-    let status = unsafe {
-        sys::mlx_qwen35_mtp_compiled_commit(
-            hidden_seq.as_raw_ptr(),
-            gathered_embs.as_raw_ptr(),
-            m as i32,
-        )
-    };
-    if status != 0 {
-        return Err(Error::from_reason(format!(
-            "MTP committed-history commit failed (status {status}) — cache desync"
-        )));
-    }
-    let after_committed = unsafe { sys::mlx_qwen35_mtp_get_committed_len() };
-    let expected_committed = before_committed + m as i32;
-    if after_committed != expected_committed {
-        return Err(Error::from_reason(format!(
-            "MTP committed-history commit advanced committed_len to {after_committed}, \
-             expected {expected_committed}"
-        )));
-    }
-    tracing::trace!(
-        target: "mlx_core::mtp",
-        before_committed,
-        after_committed,
-        committed = m,
-        "MTP committed-history commit advanced committed_len"
-    );
-    Ok(())
-}
-
-/// Chained-cycle committed-history commit.
-///
-/// The chained path uses the prior cycle's boundary token as the next
-/// cycle anchor. That anchor is already present in the persistent MTP
-/// cache, so this helper commits only the newly emitted tokens
-/// (`accepted_tokens`) using hidden rows from the current verify pass:
-/// `verify_hiddens[:, 0:m, :]`.
-pub(super) fn commit_mtp_compiled_from_verify_prefix(
-    verify_hiddens: &MxArray,
-    committed_ids: &[u32],
-    embedding_weight: &MxArray,
-) -> Result<()> {
-    use mlx_sys as sys;
-
-    let m = committed_ids.len();
-    if m == 0 || m > 6 {
-        return Err(Error::from_reason(format!(
-            "commit_mtp_compiled_from_verify_prefix: committed_ids length {m} outside [1, 6]"
-        )));
-    }
-    let hidden_dim = verify_hiddens.shape_at(2)?;
-    let hidden_seq = verify_hiddens.slice(&[0, 0, 0], &[1, m as i64, hidden_dim])?;
-
-    let ids_i32: Vec<i32> = committed_ids.iter().map(|&v| v as i32).collect();
-    let ids_arr = MxArray::from_int32(&ids_i32, &[m as i64])?;
-    let gathered = embedding_weight.take(&ids_arr, 0)?;
-    let gathered_embs = gathered.reshape(&[1, m as i64, hidden_dim])?;
-
-    let before_committed = unsafe { sys::mlx_qwen35_mtp_get_committed_len() };
-    let status = unsafe {
-        sys::mlx_qwen35_mtp_compiled_commit(
-            hidden_seq.as_raw_ptr(),
-            gathered_embs.as_raw_ptr(),
-            m as i32,
-        )
-    };
-    if status != 0 {
-        return Err(Error::from_reason(format!(
-            "MTP chained committed-history commit failed (status {status}) — cache desync"
-        )));
-    }
-    let after_committed = unsafe { sys::mlx_qwen35_mtp_get_committed_len() };
-    let expected_committed = before_committed + m as i32;
-    if after_committed != expected_committed {
-        return Err(Error::from_reason(format!(
-            "MTP chained committed-history commit advanced committed_len to {after_committed}, \
-             expected {expected_committed}"
-        )));
-    }
-    tracing::trace!(
-        target: "mlx_core::mtp",
-        before_committed,
-        after_committed,
-        committed = m,
-        "MTP chained committed-history commit advanced committed_len"
-    );
-    Ok(())
-}
-
-/// Prompt-prefix MTP prefill.
-///
-/// Commits the prompt prefix or selected prompt tail (plus the first sampled
-/// token `y`) into the
-/// MTP committed-history cache so the MTP heads attend over the prompt
-/// from the very first decode cycle, instead of building history only
-/// from decode-produced tokens. After this runs,
-/// `g_mtp_committed_len == prompt_ids.len()` and slot 0 maps to
-/// `position_base`.
-///
-/// MTP head contract: the MTP slot for committed token `x` holds K/V
-/// from `fc([e_norm(emb(x)), h_norm(h(prev(x)))])` — the embedding of
-/// `x` paired with the post-final-norm hidden of the token BEFORE `x`.
-/// Token 0 of the prompt has no `h(-1)` and is skipped.
-///
-/// SEAM with the first decode cycle: `decode_loop_mtp!`'s Step A samples
-/// `y` from the prefill's last logits, forwards `y`, and samples the
-/// cycle's `last_committed_id`. Cycle 1's commit then writes a slot for
-/// `last_committed_id` (= the SECOND generated token) paired with
-/// `h(y)`. For the persistent MTP cache to remain a CONTIGUOUS
-/// real-sequence run (so RoPE positions equal `position_base + slot` with
-/// a uniform -1 shift), the prompt-prefill must commit a contiguous run ENDING at
-/// `y` — i.e. it must include `y` itself. So:
-///   - committed token ids = `[prompt_ids[1..prompt_len], y]`  (length P)
-///     real positions `1 .. P` inclusive.
-///   - paired hiddens = `prompt_hidden[:, 0..prompt_len, :]` (length P)
-///     slot for `prompt_ids[p]` (1≤p<P) ↔ `prompt_hidden[:, p-1, :]`;
-///     slot for `y` ↔ `prompt_hidden[:, P-1, :]` = `h(prompt_ids[P-1])`.
-///
-/// Cycle 1's first decode commit then lands at local MTP slot `prompt_len` paired with
-/// `h(y)` (= `run_mtp_cycle_inner`'s `commit_seed_hidden`) — contiguous,
-/// no gap, no double-count.
-///
-/// Mechanism: the existing compiled commit graph
-/// (`mlx_qwen35_mtp_compiled_commit`) is templated over `M in [1, 7]` and
-/// reads the local slot base from `g_mtp_committed_len` plus the absolute
-/// RoPE base from `g_mtp_position_base_int + g_mtp_committed_len`.
-/// We CHUNK the `P` committed tokens into pieces all sized in `[1, 7]`
-/// and call the commit FFI per chunk — repeated calls over consecutive
-/// chunks Just Work (each advances `g_mtp_committed_len`). Chunk size 6
-/// is used; the final remainder is handled so no chunk is out of range.
-///
-/// This does NOT route through `commit_mtp_compiled` — that helper
-/// asserts `m == k_accepted + 2`, false for prompt chunks. This helper
-/// just calls the FFI with `m = chunk_size`.
-///
-/// `prompt_hidden` is `[1, prompt_ids.len(), hidden]` bf16. `prompt_ids` is
-/// the full prompt token sequence or selected prompt tail. `y` is the first
-/// sampled token. `embedding_weight` is the model's embedding table.
-/// Errors propagate via `Result`.
-pub(super) fn prefill_mtp_commit(
-    prompt_hidden: &MxArray,
-    prompt_ids: &[u32],
-    y: u32,
-    embedding_weight: &MxArray,
-    position_base: usize,
-) -> Result<()> {
-    use mlx_sys as sys;
-
-    let prompt_len = prompt_ids.len();
-    // Committed run = [prompt_ids[1..prompt_len], y] → length `prompt_len`
-    // (token 0 skipped, `y` appended). With a one-token prompt tail this
-    // commits just `y`, which is valid now that the native commit graph
-    // supports M=1.
-    if prompt_len == 0 {
-        return Ok(());
-    }
-    let committed_total = prompt_len;
-    let hidden_dim = prompt_hidden.shape_at(2)?;
-    let hidden_len = prompt_hidden.shape_at(1)? as usize;
-    if hidden_len != prompt_len {
-        return Err(Error::from_reason(format!(
-            "prefill_mtp_commit: prompt_hidden length {hidden_len} does not match prompt_ids length {prompt_len}"
-        )));
-    }
-    if position_base > i32::MAX as usize {
-        return Err(Error::from_reason(format!(
-            "prefill_mtp_commit: position_base {position_base} exceeds i32::MAX"
-        )));
-    }
-
-    unsafe {
-        sys::mlx_qwen35_mtp_set_position_base(position_base as i32);
-    }
-
-    // Committed token ids: prompt_ids[1..prompt_len] then `y`.
-    let mut committed_ids: Vec<i32> = Vec::with_capacity(committed_total);
-    committed_ids.extend(prompt_ids[1..prompt_len].iter().map(|&v| v as i32));
-    committed_ids.push(y as i32);
-    debug_assert_eq!(committed_ids.len(), committed_total);
-
-    // Partition `committed_total` into chunk sizes all in [2, 7].
-    // Default chunk size 6; fix up the final remainder so no chunk < 2.
-    let chunk_sizes = partition_prefill_chunks(committed_total);
-
-    // `cursor` walks the committed-token index space [0, committed_total).
-    // Committed token index `i` ↔ `committed_ids[i]` and the paired
-    // hidden `prompt_hidden[:, i, :]` (= h of the token before
-    // committed token `i`).
-    let mut cursor: usize = 0;
-    for &chunk in &chunk_sizes {
-        let chunk_i64 = chunk as i64;
-        let start = cursor as i64;
-
-        // hidden_seq: prompt_hidden[:, cursor .. cursor+chunk, :].
-        let hidden_seq =
-            prompt_hidden.slice(&[0, start, 0], &[1, start + chunk_i64, hidden_dim])?;
-
-        // gathered_embs: embedding rows for committed_ids[cursor .. cursor+chunk].
-        let ids_arr = MxArray::from_int32(&committed_ids[cursor..cursor + chunk], &[chunk_i64])?;
-        let gathered = embedding_weight.take(&ids_arr, 0)?;
-        let gathered_embs = gathered.reshape(&[1, chunk_i64, hidden_dim])?;
-
-        // The FFI writes at local `g_mtp_committed_len` and applies the
-        // configured absolute position base for RoPE. A non-zero status leaves
-        // the committed counter unchanged — propagate as `Err`.
-        let before_committed = unsafe { sys::mlx_qwen35_mtp_get_committed_len() };
-        let status = unsafe {
-            sys::mlx_qwen35_mtp_compiled_commit(
-                hidden_seq.as_raw_ptr(),
-                gathered_embs.as_raw_ptr(),
-                chunk as i32,
-            )
-        };
-        if status != 0 {
-            return Err(Error::from_reason(format!(
-                "prefill_mtp_commit: commit FFI failed (status {status}) at \
-                 chunk cursor {cursor} size {chunk}"
-            )));
-        }
-        let after_committed = unsafe { sys::mlx_qwen35_mtp_get_committed_len() };
-        let expected_committed = before_committed + chunk as i32;
-        if after_committed != expected_committed {
-            return Err(Error::from_reason(format!(
-                "prefill_mtp_commit: committed_len advanced to {after_committed}, \
-                 expected {expected_committed} at chunk cursor {cursor} size {chunk}"
-            )));
-        }
-        cursor += chunk;
-    }
-    let committed_len = unsafe { sys::mlx_qwen35_mtp_get_committed_len() };
-    tracing::debug!(
-        target: "mlx_core::mtp",
-        prompt_len,
-        committed_len,
-        "MTP prompt-prefill committed-history prefix seeded"
-    );
-    Ok(())
-}
-
 /// Partition `total` committed tokens into chunk sizes all within the
-/// compiled commit graph's `M in [1, 7]` window.
+/// commit graph's `M in [1, 7]` window.
 ///
 /// Strategy: greedily take size-6 chunks. The final remainder `r` is
 /// `total % 6`:
@@ -10105,677 +8807,6 @@ fn partition_prefill_chunks(total: usize) -> Vec<usize> {
     );
     chunks.push(remaining);
     chunks
-}
-
-/// One MTP verify step on the compiled path.
-///
-/// `input_ids` is `[1, depth+1]` int32 — typically
-/// `[last_committed_id, drafted_tok_0, ..., drafted_tok_{depth-1}]`.
-/// `embedding_weight` is the model's embedding table (or LM head if
-/// `tie_word_embeddings=false`). `depth` must be in `[1, 5]`.
-///
-/// Returns logits of shape `[1, depth+1, vocab]`.
-///
-/// SIDE EFFECTS: advances the MAIN compiled path's offset by
-/// `depth + 1` and writes K/V into the main `g_compiled_caches[]` at
-/// the corresponding positions. Production callers (chat-session
-/// loop) MUST already hold `DENSE_COMPILED_MUTEX` and the
-/// `COMPILED_WEIGHTS_RWLOCK` read guard so no other turn can race the
-/// offset / cache state during the verify. Tests serialise via
-/// `FFI_LOCK` in the absence of concurrent main-path forward calls —
-/// see `compiled_ffi_tests` in `mtp.rs`.
-///
-/// All production callers now use
-/// [`forward_mtp_verify_compiled_with_hidden`] (chained-cycle path).
-/// This thin logits-only wrapper is kept as the backward-compatible
-/// surface for the underlying C++ FFI and as the natural fallback
-/// when a future opt-out (env-flag) is needed; flagged with
-/// `#[allow(dead_code)]` so the dead-code lint doesn't fire while
-/// the chained path is the only active caller.
-// The chat-session integration is the only intended caller.
-#[allow(dead_code)]
-pub(super) fn forward_mtp_verify_compiled(
-    input_ids: &MxArray,
-    embedding_weight: &MxArray,
-    depth: i32,
-) -> Result<MxArray> {
-    use mlx_sys as sys;
-
-    if !(1..=5).contains(&depth) {
-        return Err(Error::from_reason(format!(
-            "forward_mtp_verify_compiled: depth {depth} outside [1, 5]"
-        )));
-    }
-
-    let mut out_ptr: *mut sys::mlx_array = std::ptr::null_mut();
-    unsafe {
-        sys::mlx_qwen35_mtp_verify_compiled(
-            input_ids.as_raw_ptr(),
-            embedding_weight.as_raw_ptr(),
-            depth,
-            &mut out_ptr,
-        );
-    }
-
-    if out_ptr.is_null() {
-        return Err(Error::from_reason(
-            "forward_mtp_verify_compiled: C++ returned null — check stderr",
-        ));
-    }
-    MxArray::from_handle(out_ptr, "mtp_verify_logits")
-}
-
-/// Verify pass that ALSO exports the post-final-norm hidden
-/// state at EVERY verify position. The caller uses this to chain MTP
-/// cycles without running a fresh main-model forward at "Step A" —
-/// after the accept loop computes K (= number of accepted drafts), it
-/// slices `verify_hiddens[:, K, :]` and feeds the result as
-/// `prev_hidden` to the next cycle's first draft step. K's value
-/// corresponds to the prediction context for the committed token at
-/// position K+1 (bonus on full-accept, residual on rejection), matching
-/// the MTP head's training contract.
-///
-/// Same locking contract as [`forward_mtp_verify_compiled`]: callers
-/// MUST hold `DENSE_COMPILED_MUTEX` and a `COMPILED_WEIGHTS_RWLOCK`
-/// read guard for the entire cycle. Returns `(logits, hiddens)` on
-/// success — `logits` shape `[1, depth+1, vocab]`, `hiddens` shape
-/// `[1, depth+1, hidden_size]`. On C++ failure the function returns
-/// `Err` and the caller MUST fall back to Step A on the next cycle.
-///
-/// The exported hiddens are a lazy MLX array; it stays valid as long
-/// as `g_compiled_caches` (which the verify's per-position `final_norm`
-/// graph references) is alive — i.e. until the surrounding
-/// `CompiledResetGuard` drops at end of decode. In practice the caller
-/// slices position K and evals only the resulting `[1, 1, hidden]` so
-/// only one per-position final_norm output is realised on-device.
-pub(super) fn forward_mtp_verify_compiled_with_hidden(
-    input_ids: &MxArray,
-    embedding_weight: &MxArray,
-    depth: i32,
-) -> Result<chat_common::MtpVerifyOutput> {
-    use mlx_sys as sys;
-
-    if !(1..=5).contains(&depth) {
-        return Err(Error::from_reason(format!(
-            "forward_mtp_verify_compiled_with_hidden: depth {depth} outside [1, 5]"
-        )));
-    }
-
-    let mut out_logits: *mut sys::mlx_array = std::ptr::null_mut();
-    let mut out_hiddens: *mut sys::mlx_array = std::ptr::null_mut();
-    let mut out_argmax: *mut sys::mlx_array = std::ptr::null_mut();
-    unsafe {
-        sys::mlx_qwen35_mtp_verify_compiled_with_hidden_and_argmax(
-            input_ids.as_raw_ptr(),
-            embedding_weight.as_raw_ptr(),
-            depth,
-            &mut out_logits,
-            &mut out_hiddens,
-            &mut out_argmax,
-        );
-    }
-
-    if out_logits.is_null() {
-        return Err(Error::from_reason(
-            "forward_mtp_verify_compiled_with_hidden: C++ returned null logits — check stderr",
-        ));
-    }
-    if out_hiddens.is_null() {
-        // Logits succeeded but hidden export failed — drop the logits
-        // handle via the standard wrapper, then surface the error so
-        // the caller falls back to Step A.
-        let _ = MxArray::from_handle(out_logits, "mtp_verify_logits_drop_on_hidden_fail")?;
-        return Err(Error::from_reason(
-            "forward_mtp_verify_compiled_with_hidden: C++ returned null hiddens — check stderr",
-        ));
-    }
-    if out_argmax.is_null() {
-        let _ = MxArray::from_handle(out_logits, "mtp_verify_logits_drop_on_argmax_fail")?;
-        let _ = MxArray::from_handle(out_hiddens, "mtp_verify_hiddens_drop_on_argmax_fail")?;
-        return Err(Error::from_reason(
-            "forward_mtp_verify_compiled_with_hidden: C++ returned null argmax ids — check stderr",
-        ));
-    }
-    let logits = MxArray::from_handle(out_logits, "mtp_verify_logits")?;
-    let hiddens = MxArray::from_handle(out_hiddens, "mtp_verify_hiddens")?;
-    let target_argmax = MxArray::from_handle(out_argmax, "mtp_verify_argmax")?;
-    Ok(chat_common::MtpVerifyOutput::logits_with_argmax(
-        logits,
-        hiddens,
-        target_argmax,
-    ))
-}
-
-pub(super) fn forward_mtp_verify_compiled_with_hidden_and_argmax_only(
-    input_ids: &MxArray,
-    embedding_weight: &MxArray,
-    depth: i32,
-) -> Result<chat_common::MtpVerifyOutput> {
-    use mlx_sys as sys;
-
-    if !(1..=5).contains(&depth) {
-        return Err(Error::from_reason(format!(
-            "forward_mtp_verify_compiled_with_hidden_and_argmax_only: depth {depth} outside [1, 5]"
-        )));
-    }
-
-    let mut out_hiddens: *mut sys::mlx_array = std::ptr::null_mut();
-    let mut out_argmax: *mut sys::mlx_array = std::ptr::null_mut();
-    unsafe {
-        sys::mlx_qwen35_mtp_verify_compiled_with_hidden_and_argmax_only(
-            input_ids.as_raw_ptr(),
-            embedding_weight.as_raw_ptr(),
-            depth,
-            &mut out_hiddens,
-            &mut out_argmax,
-        );
-    }
-
-    if out_hiddens.is_null() {
-        if !out_argmax.is_null() {
-            let _ = MxArray::from_handle(
-                out_argmax,
-                "mtp_verify_argmax_only_argmax_drop_on_hidden_fail",
-            )?;
-        }
-        return Err(Error::from_reason(
-            "forward_mtp_verify_compiled_with_hidden_and_argmax_only: C++ returned null hiddens — check stderr",
-        ));
-    }
-    if out_argmax.is_null() {
-        let _ = MxArray::from_handle(
-            out_hiddens,
-            "mtp_verify_argmax_only_hiddens_drop_on_argmax_fail",
-        )?;
-        return Err(Error::from_reason(
-            "forward_mtp_verify_compiled_with_hidden_and_argmax_only: C++ returned null argmax ids — check stderr",
-        ));
-    }
-
-    let hiddens = MxArray::from_handle(out_hiddens, "mtp_verify_argmax_only_hiddens")?;
-    let target_argmax = MxArray::from_handle(out_argmax, "mtp_verify_argmax_only_argmax")?;
-    Ok(chat_common::MtpVerifyOutput::argmax_only(
-        hiddens,
-        target_argmax,
-    ))
-}
-
-pub(super) fn forward_mtp_verify_compiled_with_hidden_and_sparse_target(
-    input_ids: &MxArray,
-    embedding_weight: &MxArray,
-    depth: i32,
-    sampling_cfg: &SamplingConfig,
-) -> Result<chat_common::MtpVerifyOutput> {
-    use mlx_sys as sys;
-
-    if !(1..=5).contains(&depth) {
-        return Err(Error::from_reason(format!(
-            "forward_mtp_verify_compiled_with_hidden_and_sparse_target: depth {depth} outside [1, 5]"
-        )));
-    }
-    if !crate::sampling::sparse_distribution_supported(sampling_cfg)
-        || !crate::sampling::sampler_parity_is_mtplx()
-    {
-        return Err(Error::from_reason(
-            "forward_mtp_verify_compiled_with_hidden_and_sparse_target: unsupported sampling config",
-        ));
-    }
-
-    let temperature = sampling_cfg.temperature.unwrap_or(1.0) as f32;
-    let top_k = sampling_cfg.top_k.unwrap_or(0);
-    let top_p = sampling_cfg.top_p.unwrap_or(1.0) as f32;
-    let vocab_size = embedding_weight.shape_at(0)? as usize;
-    let width = usize::min(top_k as usize, vocab_size);
-    let expected_rows = (depth as usize) + 1;
-
-    let mut out_hiddens: *mut sys::mlx_array = std::ptr::null_mut();
-    let mut out_target_ids: *mut sys::mlx_array = std::ptr::null_mut();
-    let mut out_target_probs: *mut sys::mlx_array = std::ptr::null_mut();
-    unsafe {
-        sys::mlx_qwen35_mtp_verify_compiled_with_hidden_and_sparse_target(
-            input_ids.as_raw_ptr(),
-            embedding_weight.as_raw_ptr(),
-            depth,
-            temperature,
-            top_k,
-            top_p,
-            crate::sampling::sampler_parity_ffi_code(),
-            &mut out_hiddens,
-            &mut out_target_ids,
-            &mut out_target_probs,
-        );
-    }
-
-    if out_hiddens.is_null() {
-        if !out_target_ids.is_null() {
-            let _ = MxArray::from_handle(
-                out_target_ids,
-                "mtp_verify_sparse_target_ids_drop_on_hidden_fail",
-            )?;
-        }
-        if !out_target_probs.is_null() {
-            let _ = MxArray::from_handle(
-                out_target_probs,
-                "mtp_verify_sparse_target_probs_drop_on_hidden_fail",
-            )?;
-        }
-        return Err(Error::from_reason(
-            "forward_mtp_verify_compiled_with_hidden_and_sparse_target: C++ returned null hiddens — check stderr",
-        ));
-    }
-    if out_target_ids.is_null() || out_target_probs.is_null() {
-        let _ = MxArray::from_handle(out_hiddens, "mtp_verify_sparse_hiddens_drop_on_sparse_fail")?;
-        if !out_target_ids.is_null() {
-            let _ = MxArray::from_handle(
-                out_target_ids,
-                "mtp_verify_sparse_target_ids_drop_on_sparse_fail",
-            )?;
-        }
-        if !out_target_probs.is_null() {
-            let _ = MxArray::from_handle(
-                out_target_probs,
-                "mtp_verify_sparse_target_probs_drop_on_sparse_fail",
-            )?;
-        }
-        return Err(Error::from_reason(
-            "forward_mtp_verify_compiled_with_hidden_and_sparse_target: C++ returned null sparse target rows — check stderr",
-        ));
-    }
-
-    let hiddens = MxArray::from_handle(out_hiddens, "mtp_verify_sparse_hiddens")?;
-    let target_ids = MxArray::from_handle(out_target_ids, "mtp_verify_sparse_target_ids")?;
-    let target_probs = MxArray::from_handle(out_target_probs, "mtp_verify_sparse_target_probs")?;
-    let target_sparse = crate::sampling::SparseDistributionRows::from_precomputed_arrays(
-        &target_ids,
-        &target_probs,
-        vocab_size,
-        expected_rows,
-        width,
-        "forward_mtp_verify_compiled_with_hidden_and_sparse_target",
-    )?;
-
-    Ok(chat_common::MtpVerifyOutput::sparse(hiddens, target_sparse))
-}
-
-/// Paged-pool sibling of
-/// [`forward_mtp_verify_compiled_with_hidden`]. Drives the
-/// `mlx_qwen35_forward_batched_verify_paged` FFI which reads K/V from
-/// the paged adapter's pool tensors (via the C++ `g_dense_k_pools[]` /
-/// `g_dense_v_pools[]` globals seeded by `mlx_qwen35_init_paged`) and
-/// emits per-position logits, hiddens, and top-1 target ids for the D+1
-/// verify window in a single compiled forward.
-///
-/// `inputs` MUST come from
-/// [`PagedKVCacheAdapter::build_paged_attention_inputs`] called for the
-/// D+1 verify window (the caller `record_tokens` before building).
-/// `cu_seqlens_q` is `[0, depth+1]` int32 — the verify window has a
-/// single sequence with `depth+1` query rows.
-///
-/// LOCKING: the underlying FFI mutates process-global compile-cache,
-/// paged-pool, and paged-linear-cache state. This wrapper acquires both
-/// `DENSE_COMPILED_MUTEX` and a `COMPILED_WEIGHTS_RWLOCK` read guard
-/// for the entire call so concurrent main-path forwards on a different
-/// turn cannot race the mutation. Mirrors the locking contract of
-/// [`forward_mtp_verify_compiled_with_hidden`].
-///
-/// `slot_mapping` is sliced to exact `[depth + 1]` length before being
-/// handed to the FFI to satisfy `paged_kv_write`'s
-/// `slot_mapping.shape(0) == new_k.shape(0)` contract — the adapter
-/// returns a `chunk_size_max`-padded array. The dtype/rank of the
-/// sliced array stays stable (int64, rank-1), so MLX's compile cache
-/// allocates one trace per depth value (5 traces max) — same scaling
-/// factor as the BHTD bucket dispatch.
-///
-/// Defined and unit-tested (via the
-/// `compiled_ffi_tests::paged_verify_shape_smoke` regression in
-/// `mtp.rs`) but not wired into production decode; the `dead_code` allow
-/// keeps the lint quiet.
-#[allow(dead_code)]
-pub(super) fn forward_mtp_verify_paged(
-    input_ids: &MxArray,
-    embedding_weight: &MxArray,
-    depth: i32,
-    inputs: &crate::transformer::paged_attention_inputs::PagedAttentionInputs,
-    cu_seqlens_q: &MxArray,
-) -> Result<chat_common::MtpVerifyOutput> {
-    use mlx_sys as sys;
-
-    if !(1..=5).contains(&depth) {
-        return Err(Error::from_reason(format!(
-            "forward_mtp_verify_paged: depth {depth} outside [1, 5]"
-        )));
-    }
-
-    let slot_mapping_len = i64::from(depth) + 1;
-    let slot_mapping = inputs
-        .slot_mapping
-        .slice(&[0], &[slot_mapping_len])
-        .map_err(|e| {
-            Error::from_reason(format!(
-                "forward_mtp_verify_paged: failed to slice slot_mapping to [{slot_mapping_len}]: {}",
-                e.reason
-            ))
-        })?;
-
-    // Locking contract: production callers run inside
-    // `chat_sync_core_paged{,_inner}` which holds `DENSE_COMPILED_MUTEX`
-    // + `COMPILED_WEIGHTS_RWLOCK` across the entire turn. Taking the
-    // locks again here would deadlock the non-reentrant mutex on the
-    // paged-MTP gate's `verify_step` invocation. The smoke tests in
-    // `compiled_ffi_tests` serialise via `FFI_LOCK` and don't run
-    // concurrent main-path forwards, so the absence of the lock here is
-    // safe for both production and test usage.
-    let mut out_logits: *mut sys::mlx_array = std::ptr::null_mut();
-    let mut out_hiddens: *mut sys::mlx_array = std::ptr::null_mut();
-    let mut out_argmax: *mut sys::mlx_array = std::ptr::null_mut();
-    unsafe {
-        sys::mlx_qwen35_forward_batched_verify_paged(
-            input_ids.as_raw_ptr(),
-            embedding_weight.as_raw_ptr(),
-            depth,
-            inputs.offset_arr.as_raw_ptr(),
-            inputs.block_table.as_raw_ptr(),
-            slot_mapping.as_raw_ptr(),
-            inputs.seq_lens.as_raw_ptr(),
-            cu_seqlens_q.as_raw_ptr(),
-            &mut out_logits,
-            &mut out_hiddens,
-            &mut out_argmax,
-        );
-    }
-
-    if out_logits.is_null() {
-        if !out_hiddens.is_null() {
-            let _ =
-                MxArray::from_handle(out_hiddens, "mtp_verify_paged_hiddens_drop_on_logits_fail")?;
-        }
-        if !out_argmax.is_null() {
-            let _ =
-                MxArray::from_handle(out_argmax, "mtp_verify_paged_argmax_drop_on_logits_fail")?;
-        }
-        return Err(Error::from_reason(
-            "forward_mtp_verify_paged: C++ returned null logits — check stderr",
-        ));
-    }
-    if out_hiddens.is_null() {
-        let _ = MxArray::from_handle(out_logits, "mtp_verify_paged_logits_drop_on_hidden_fail")?;
-        if !out_argmax.is_null() {
-            let _ =
-                MxArray::from_handle(out_argmax, "mtp_verify_paged_argmax_drop_on_hidden_fail")?;
-        }
-        return Err(Error::from_reason(
-            "forward_mtp_verify_paged: C++ returned null hiddens — check stderr",
-        ));
-    }
-    if out_argmax.is_null() {
-        let _ = MxArray::from_handle(out_logits, "mtp_verify_paged_logits_drop_on_argmax_fail")?;
-        let _ = MxArray::from_handle(out_hiddens, "mtp_verify_paged_hiddens_drop_on_argmax_fail")?;
-        return Err(Error::from_reason(
-            "forward_mtp_verify_paged: C++ returned null argmax ids — check stderr",
-        ));
-    }
-    let logits = MxArray::from_handle(out_logits, "mtp_verify_paged_logits")?;
-    let hiddens = MxArray::from_handle(out_hiddens, "mtp_verify_paged_hiddens")?;
-    let target_argmax = MxArray::from_handle(out_argmax, "mtp_verify_paged_argmax")?;
-    Ok(chat_common::MtpVerifyOutput::logits_with_argmax(
-        logits,
-        hiddens,
-        target_argmax,
-    ))
-}
-
-// ============================================================================
-// C++ compiled paged-decode dispatcher (Dense).
-//
-// Mirrors `init_paged_moe_compiled_session` / `forward_moe_cpp_paged`
-// from `crates/mlx-core/src/models/qwen3_5_moe/model.rs` but without
-// MoE expert routing — the dense compiled paged graph in
-// `mlx_qwen35.cpp` is structurally simpler.
-// ============================================================================
-
-/// Block size hard-coded into the compiled C++ paged graph
-/// (`mlx_qwen35.cpp` — see `attn_for_compile_paged` and the
-/// `mlx_qwen35_init_paged` docstring). The Rust adapter supports
-/// configurable block sizes via `Qwen3_5Config::paged_block_size`,
-/// but the compiled graph traces against block_size=16 baked into the
-/// `paged_kv_write` / `paged_attention` kernel calls. Mismatched values
-/// would have Rust encode slot/block tables at the adapter's block size
-/// while C++ writes/reads at 16, corrupting KV state. The compile-branch
-/// selectors gate `cpp_session_ready` on this equality and fall back to
-/// the pure-Rust paged path when the adapter is configured otherwise.
-pub(crate) const CPP_PAGED_REQUIRED_BLOCK_SIZE: u32 = 16;
-
-/// Initialize the C++ paged forward graph from the live `paged_adapter`
-/// pool/scale arrays AND the per-layer linear-attention recurrent caches
-/// already populated by the pure-Rust paged prefill.
-///
-/// # Layer-index contract
-///
-/// The C++ FFI accepts pool/scale handle arrays of size `num_layers`
-/// (absolute decoder count). For each absolute layer index `i`:
-/// * Linear-attention layers: pool/scale slots are null pointers; the
-///   `linear_cache_arrays` pair `[i*2, i*2+1]` holds
-///   `(conv_state, recurrent_state)` from the layer's
-///   `Qwen3_5LayerCache::Linear(ArraysCache)`.
-/// * Full-attention layers: pool/scale slots come from the adapter's
-///   `LayerKVPool` at the COMPACT (full-attention) ordinal; the linear
-///   cache pair is null.
-///
-/// The compact-ordinal mapping is computed via
-/// [`crate::models::qwen3_5::decoder_layer::compute_layer_kinds`], the
-/// same helper the production Rust paged-forward dispatch uses.
-///
-/// # Caller contract
-///
-/// 1. `caches` is fully populated by a prior pure-Rust paged prefill.
-/// 2. The C++ weights for this model are still registered (caller must
-///    have verified `mlx_qwen35_get_model_id() == self.model_id` and
-///    holds the appropriate read locks).
-///
-/// `prefill_offset` is the global token cursor the compiled paged
-/// graph's `g_dense_paged_offset_int` will start incrementing from.
-///
-/// On any failure (missing linear cache, missing pool/scale handle, or
-/// the C++ FFI returning a non-zero status), the helper returns `Err`
-/// so the caller can fall back to the pure-Rust paged decode path.
-fn init_paged_dense_compiled_session(
-    config: &Qwen3_5Config,
-    caches: &[Qwen3_5LayerCache],
-    paged_adapter: &PagedKVCacheAdapter,
-    prefill_offset: i32,
-) -> Result<()> {
-    use super::decoder_layer::{Qwen3_5LayerKind, compute_layer_kinds};
-
-    let num_layers_us = config.num_layers as usize;
-    if caches.len() != num_layers_us {
-        return Err(Error::from_reason(format!(
-            "init_paged_dense_compiled_session: caches.len()={} but config.num_layers={}",
-            caches.len(),
-            num_layers_us
-        )));
-    }
-
-    let layer_kinds = compute_layer_kinds(num_layers_us, |i| config.is_linear_layer(i));
-
-    let mut k_pool_handles: Vec<*mut mlx_sys::mlx_array> =
-        vec![std::ptr::null_mut(); num_layers_us];
-    let mut v_pool_handles: Vec<*mut mlx_sys::mlx_array> =
-        vec![std::ptr::null_mut(); num_layers_us];
-    let mut k_scale_handles: Vec<*mut mlx_sys::mlx_array> =
-        vec![std::ptr::null_mut(); num_layers_us];
-    let mut v_scale_handles: Vec<*mut mlx_sys::mlx_array> =
-        vec![std::ptr::null_mut(); num_layers_us];
-    let mut linear_cache_handles: Vec<*mut mlx_sys::mlx_array> =
-        vec![std::ptr::null_mut(); num_layers_us * 2];
-
-    // Hold the wrapping `MxArray`s alive across the FFI call so the C++
-    // side has time to copy them into its own globals.
-    let mut held_arrays: Vec<MxArray> = Vec::with_capacity(num_layers_us * 4);
-
-    for (i, kind) in layer_kinds.iter().enumerate() {
-        match kind {
-            Qwen3_5LayerKind::Linear => {
-                let arrays_cache = match &caches[i] {
-                    Qwen3_5LayerCache::Linear(c) => c,
-                    Qwen3_5LayerCache::FullAttention(_) => {
-                        return Err(Error::from_reason(format!(
-                            "init_paged_dense_compiled_session: layer {i} is Linear by config \
-                             but cache slot is FullAttention",
-                        )));
-                    }
-                };
-                let conv = arrays_cache.get(0).ok_or_else(|| {
-                    Error::from_reason(format!(
-                        "init_paged_dense_compiled_session: layer {i} conv_state not populated; \
-                         pure-Rust paged prefill must run before C++ paged init",
-                    ))
-                })?;
-                let rec = arrays_cache.get(1).ok_or_else(|| {
-                    Error::from_reason(format!(
-                        "init_paged_dense_compiled_session: layer {i} recurrent_state not \
-                         populated; pure-Rust paged prefill must run before C++ paged init",
-                    ))
-                })?;
-                linear_cache_handles[i * 2] = conv.as_raw_ptr();
-                linear_cache_handles[i * 2 + 1] = rec.as_raw_ptr();
-                let _ = (conv, rec);
-            }
-            Qwen3_5LayerKind::FullAttentionPaged { paged_idx } => {
-                let k_arr = paged_adapter.key_pool_array(*paged_idx).map_err(|e| {
-                    Error::from_reason(format!(
-                        "init_paged_dense_compiled_session: key_pool_array(layer={i}, \
-                         paged_idx={paged_idx}): {e}",
-                    ))
-                })?;
-                let v_arr = paged_adapter.value_pool_array(*paged_idx).map_err(|e| {
-                    Error::from_reason(format!(
-                        "init_paged_dense_compiled_session: value_pool_array(layer={i}, \
-                         paged_idx={paged_idx}): {e}",
-                    ))
-                })?;
-                let ks_arr = paged_adapter.k_scale_array(*paged_idx).map_err(|e| {
-                    Error::from_reason(format!(
-                        "init_paged_dense_compiled_session: k_scale_array(layer={i}, \
-                         paged_idx={paged_idx}): {e}",
-                    ))
-                })?;
-                let vs_arr = paged_adapter.v_scale_array(*paged_idx).map_err(|e| {
-                    Error::from_reason(format!(
-                        "init_paged_dense_compiled_session: v_scale_array(layer={i}, \
-                         paged_idx={paged_idx}): {e}",
-                    ))
-                })?;
-                k_pool_handles[i] = k_arr.as_raw_ptr();
-                v_pool_handles[i] = v_arr.as_raw_ptr();
-                k_scale_handles[i] = ks_arr.as_raw_ptr();
-                v_scale_handles[i] = vs_arr.as_raw_ptr();
-                held_arrays.push(k_arr);
-                held_arrays.push(v_arr);
-                held_arrays.push(ks_arr);
-                held_arrays.push(vs_arr);
-            }
-        }
-    }
-
-    let status = unsafe {
-        mlx_sys::mlx_qwen35_init_paged(
-            config.num_layers,
-            config.hidden_size,
-            config.num_heads,
-            config.num_kv_heads,
-            config.head_dim,
-            config.rope_theta as f32,
-            config.rope_dims(),
-            config.rms_norm_eps as f32,
-            config.full_attention_interval,
-            config.linear_num_key_heads,
-            config.linear_num_value_heads,
-            config.linear_key_head_dim,
-            config.linear_value_head_dim,
-            config.linear_conv_kernel_dim,
-            if config.tie_word_embeddings { 1 } else { 0 },
-            config.max_position_embeddings,
-            1, // batch_size
-            k_pool_handles.as_mut_ptr(),
-            v_pool_handles.as_mut_ptr(),
-            k_scale_handles.as_mut_ptr(),
-            v_scale_handles.as_mut_ptr(),
-            linear_cache_handles.as_mut_ptr(),
-            prefill_offset,
-        )
-    };
-
-    drop(held_arrays);
-
-    // The C++ side returns 0 on success, -1 on failure. Failure paths
-    // include missing pool/scale handles for full-attention layers and
-    // any exception caught during graph build. On failure
-    // `g_dense_paged_inited` is left cleared so subsequent
-    // `mlx_qwen35_forward_paged` calls would null-out their logits;
-    // surfacing the failure here lets the dispatcher fall back to the
-    // pure-Rust paged path before any decode-step FFI is dispatched.
-    if status != 0 {
-        return Err(Error::from_reason(format!(
-            "init_paged_dense_compiled_session: mlx_qwen35_init_paged returned status={status} \
-             (expected 0); see stderr for the C++ diagnostic. Caller must fall back to the \
-             pure-Rust paged path."
-        )));
-    }
-
-    Ok(())
-}
-
-/// Single-token decode step using the C++ compiled paged forward pass.
-///
-/// Mirrors `forward_compiled` but threads through the paged-attention
-/// inputs (offset_arr, block_table, slot_mapping, num_valid_tokens,
-/// num_valid_blocks, seq_lens) so K/V is written into the adapter's
-/// paged Metal pool via `paged_kv_write` and gathered via
-/// `paged_attention`.
-///
-/// Caller contract:
-/// * `init_paged_dense_compiled_session` has been called this turn
-///   (sets `g_dense_paged_inited = true`).
-/// * `paged_adapter.record_tokens(&[token_id])` has been called to
-///   advance the cursor (and lazily allocate any new block).
-/// * `inputs` was just built via
-///   `paged_adapter.build_paged_attention_inputs(1, 1, max_blocks_per_seq)`.
-///
-/// On any FFI failure (`output_logits == null`) the helper returns an
-/// `Err` so the dispatcher falls back to pure-Rust paged decode.
-fn forward_dense_cpp_paged(
-    input_ids: &MxArray,
-    embedding_weight: &MxArray,
-    inputs: &crate::transformer::paged_attention_inputs::PagedAttentionInputs,
-) -> Result<MxArray> {
-    use mlx_sys as sys;
-
-    let mut output_ptr: *mut sys::mlx_array = std::ptr::null_mut();
-    let mut cache_offset_out: i32 = 0;
-    unsafe {
-        sys::mlx_qwen35_forward_paged(
-            input_ids.as_raw_ptr(),
-            embedding_weight.as_raw_ptr(),
-            inputs.offset_arr.as_raw_ptr(),
-            inputs.block_table.as_raw_ptr(),
-            inputs.slot_mapping.as_raw_ptr(),
-            inputs.num_valid_tokens.as_raw_ptr(),
-            inputs.num_valid_blocks.as_raw_ptr(),
-            inputs.seq_lens.as_raw_ptr(),
-            &mut output_ptr,
-            &mut cache_offset_out,
-        );
-    }
-
-    if output_ptr.is_null() {
-        return Err(Error::from_reason(
-            "C++ Dense paged forward step returned null — check stderr for diagnostic. \
-             (Common causes: g_dense_paged_inited = false, slot_mapping shape != [1], \
-             input_ids size != 1, or weights cleared by another model load.)",
-        ));
-    }
-
-    MxArray::from_handle(output_ptr, "dense_paged_forward_logits")
 }
 
 // ============================================================================
@@ -11207,211 +9238,6 @@ pub(crate) fn merge_input_ids_with_image_features(
     MxArray::stack(refs, Some(0))
 }
 
-/// VLM prefill: processes images through vision encoder, merges with text embeddings,
-/// and runs the prefill forward pass with M-RoPE position IDs.
-///
-/// Returns (first_logits [1, vocab], rope_deltas).
-///
-/// This is a free function (not a method) since it needs mutable lock guards passed in,
-/// matching the pattern of `forward_inner()`.
-#[allow(clippy::too_many_arguments)]
-fn vlm_prefill(
-    input_ids: &MxArray,
-    image_cache_key: u64,
-    pre_processed: &ProcessedImages,
-    vision_encoder: &Qwen3_5VisionEncoder,
-    spatial_merge_size: i32,
-    text_model_embedding: &MxArray,
-    layers_guard: &mut [DecoderLayer],
-    caches_guard: &mut Option<Vec<Qwen3_5LayerCache>>,
-    final_norm_guard: &RMSNorm,
-    lm_head_guard: &Option<Linear>,
-    model_config: &Qwen3_5Config,
-    max_new_tokens: i32,
-    generation_stream: Stream,
-    vision_cache: &VisionCache,
-    model_id: u64,
-) -> Result<(MxArray, i64, bool)> {
-    use crate::array::clear_cache;
-
-    let (inputs_embeds, position_ids, rope_deltas) = vlm_prepare_vision_features(
-        input_ids,
-        image_cache_key,
-        pre_processed,
-        vision_encoder,
-        spatial_merge_size,
-        text_model_embedding,
-        generation_stream,
-        vision_cache,
-    )?;
-
-    // === STEP 4: Prefill with M-RoPE ===
-    let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
-
-    let (last_logits, _seq_len, compiled_init_done) = if use_compiled {
-        // C++ VLM prefill: runs all layers in one FFI call with M-RoPE
-        use mlx_sys as sys;
-
-        let seq_len_i32 = inputs_embeds.shape_at(1)? as i32;
-        let max_kv_len = chat_common::kv_capacity_round_up(seq_len_i32, max_new_tokens)?;
-        let mrope_section: [i32; 3] = [11, 11, 10]; // Qwen3.5-VL
-
-        let mut output_ptr: *mut sys::mlx_array = std::ptr::null_mut();
-        unsafe {
-            sys::mlx_qwen35_vlm_prefill(
-                inputs_embeds.as_raw_ptr(),
-                position_ids.as_raw_ptr(),
-                model_config.num_layers,
-                model_config.hidden_size,
-                model_config.num_heads,
-                model_config.num_kv_heads,
-                model_config.head_dim,
-                model_config.rope_theta as f32,
-                model_config.rope_dims(),
-                model_config.rms_norm_eps as f32,
-                model_config.full_attention_interval,
-                model_config.linear_num_key_heads,
-                model_config.linear_num_value_heads,
-                model_config.linear_key_head_dim,
-                model_config.linear_value_head_dim,
-                model_config.linear_conv_kernel_dim,
-                if model_config.tie_word_embeddings {
-                    1
-                } else {
-                    0
-                },
-                max_kv_len,
-                1, // batch_size
-                mrope_section.as_ptr(),
-                rope_deltas as i32,
-                &mut output_ptr,
-            );
-        }
-
-        if output_ptr.is_null() {
-            return Err(Error::from_reason(
-                "C++ VLM prefill returned null — check stderr for details",
-            ));
-        }
-
-        // Transfer VLM caches to compiled decode path
-        // vlm_get_cache returns heap-allocated copies — we must delete them after use
-        let num_caches = unsafe { sys::mlx_qwen35_vlm_cache_count() };
-        let mut cache_ptrs: Vec<*mut sys::mlx_array> = Vec::with_capacity(num_caches as usize);
-        for idx in 0..num_caches {
-            cache_ptrs.push(unsafe { sys::mlx_qwen35_vlm_get_cache(idx) });
-        }
-
-        unsafe {
-            sys::mlx_qwen35_compiled_init_from_prefill(
-                model_config.num_layers,
-                model_config.hidden_size,
-                model_config.num_heads,
-                model_config.num_kv_heads,
-                model_config.head_dim,
-                model_config.rope_theta as f32,
-                model_config.rope_dims(),
-                model_config.rms_norm_eps as f32,
-                model_config.full_attention_interval,
-                model_config.linear_num_key_heads,
-                model_config.linear_num_value_heads,
-                model_config.linear_key_head_dim,
-                model_config.linear_value_head_dim,
-                model_config.linear_conv_kernel_dim,
-                if model_config.tie_word_embeddings {
-                    1
-                } else {
-                    0
-                },
-                max_kv_len,
-                1,
-                cache_ptrs.as_mut_ptr(),
-                seq_len_i32,
-            );
-
-            // Adjust offset for rope_deltas (VLM positions differ from sequential)
-            if rope_deltas != 0 {
-                sys::mlx_qwen35_compiled_adjust_offset(rope_deltas as i32);
-            }
-
-            // Clean up heap-allocated cache copies from vlm_get_cache
-            for ptr in &cache_ptrs {
-                if !ptr.is_null() {
-                    sys::mlx_array_delete(*ptr);
-                }
-            }
-
-            // Clean up VLM prefill state (caches now owned by compiled decode)
-            sys::mlx_qwen35_vlm_reset();
-        }
-
-        let logits = MxArray::from_handle(output_ptr, "vlm_cpp_prefill")?;
-        // logits is already [1, vocab] from C++ prefill
-        (logits, seq_len_i32 as i64, true) // compiled init done
-    } else {
-        // Rust fallback prefill (when C++ weights not loaded, e.g. test models)
-        // Init fresh caches
-        *caches_guard = Some(
-            (0..model_config.num_layers as usize)
-                .map(|i| {
-                    if model_config.is_linear_layer(i) {
-                        super::layer_cache::Qwen3_5LayerCache::new_linear()
-                    } else {
-                        super::layer_cache::Qwen3_5LayerCache::new_full_attention()
-                    }
-                })
-                .collect(),
-        );
-
-        let logits = {
-            let _stream_ctx = StreamContext::new(generation_stream);
-
-            let mut h = inputs_embeds.clone();
-
-            // No explicit mask — Qwen3_5Attention uses "causal" SDPA mode
-            let num_layers = layers_guard.len();
-            for i in 0..num_layers {
-                let cache = caches_guard.as_mut().map(|c| &mut c[i]);
-                let layer_pos = if layers_guard[i].is_linear() {
-                    None
-                } else {
-                    Some(&position_ids)
-                };
-                h = layers_guard[i].forward(&h, None, cache, layer_pos, true)?;
-            }
-
-            let h = final_norm_guard.forward(&h)?;
-            let logits = match lm_head_guard {
-                Some(head) => head.forward(&h)?,
-                None => {
-                    let weight_t = text_model_embedding.transpose(Some(&[1, 0]))?;
-                    h.matmul(&weight_t)?
-                }
-            };
-
-            if let Some(ref caches) = *caches_guard {
-                let mut cache_arrays: Vec<&MxArray> = Vec::new();
-                for cache in caches.iter() {
-                    cache.collect_arrays(&mut cache_arrays);
-                }
-                if !cache_arrays.is_empty() {
-                    MxArray::async_eval_arrays(&cache_arrays);
-                }
-            }
-            clear_cache();
-
-            logits
-        };
-
-        let seq_len = logits.shape_at(1)?;
-        let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
-        let last_logits = last_logits.squeeze(Some(&[1]))?;
-        (last_logits, seq_len, false) // compiled init NOT done
-    };
-
-    Ok((last_logits, rope_deltas, compiled_init_done))
-}
-
 /// Shared VLM prefill steps 1-3: vision cache lookup, vision encoder,
 /// embedding merge, and M-RoPE position computation.
 ///
@@ -11427,7 +9253,7 @@ pub(crate) fn vlm_prepare_vision_features(
     text_model_embedding: &MxArray,
     generation_stream: Stream,
     vision_cache: &VisionCache,
-) -> Result<(MxArray, MxArray, i64)> {
+) -> Result<VisionMerge> {
     // === STEP 1: Compute vision features (with hash cache) ===
     let combined_hash = image_cache_key;
 
@@ -11508,7 +9334,10 @@ pub(crate) fn vlm_prepare_vision_features(
         rope_deltas
     );
 
-    Ok((inputs_embeds, position_ids, rope_deltas))
+    Ok(VisionMerge {
+        inputs_embeds,
+        position_ids,
+    })
 }
 
 #[cfg(test)]
@@ -11673,8 +9502,9 @@ mod rope_index_tests {
 
     #[test]
     fn two_image_runs_separated_by_text_emits_every_position() {
-        // THE regression test for the P2 bug — pre-fix this crashed the
-        // downstream reshape with a length mismatch.
+        // Two image runs separated by interior text must emit a position for
+        // EVERY token; a dropped interior-text position makes the downstream
+        // reshape in get_rope_index fail with a length mismatch.
         let _g = mlx_lock().lock().unwrap();
         let mut tokens: Vec<i32> = Vec::new();
         tokens.push(TEXT_A); // position 0
@@ -11688,9 +9518,9 @@ mod rope_index_tests {
         let (pos, _) = get_rope_index(&ids, grid.as_ref(), 2, IMG).unwrap();
         let (t, _h, _w) = extract_positions(&pos);
 
-        // seq_len == tokens.len() — every token must have a position
-        // (the old single-span path dropped the interior text entries,
-        // which then failed the reshape at the end of get_rope_index).
+        // seq_len == tokens.len() — every token must have a position;
+        // dropping the interior text entries fails the reshape at the end
+        // of get_rope_index.
         assert_eq!(
             t.len(),
             tokens.len(),
@@ -11780,12 +9610,10 @@ mod rope_index_tests {
         // markers and `inject_image_placeholders` crams every image's
         // tokens into a single splice after BOS. For N images with
         // distinct grids, the prompt carries ONE big contiguous run of
-        // `sum(per_image_counts)` image tokens. The old strict guard
-        // rejected this as "run layout mismatch" even though it was
-        // the legitimate fallback layout that previously worked via
-        // the old single-span position walk. The new path synthesises
-        // per-image sub-run offsets from the shared span and emits
-        // correct M-RoPE positions for each image.
+        // `sum(per_image_counts)` image tokens. This is a legitimate
+        // fallback layout: the path synthesises per-image sub-run offsets
+        // from the shared span and emits correct M-RoPE positions for each
+        // image (rather than rejecting it as a "run layout mismatch").
         let _g = mlx_lock().lock().unwrap();
         // Two 1×2×2 grids → 4 image tokens each, 8 total.
         let mut tokens = vec![TEXT_A];
@@ -11847,9 +9675,8 @@ mod prefix_cache_reuse_integration_tests {
     //!
     //! The test bodies are intentionally skeletal — they document what
     //! needs to hold rather than wiring up the full model-loading
-    //! boilerplate. Flesh them out alongside the upcoming end-to-end
-    //! harness in `serve.ts` / the pi-mono vitest-migration smoke test
-    //! (plan doc §Verification).
+    //! boilerplate. Flesh them out alongside the end-to-end harness in
+    //! `serve.ts`.
 
     /// Append hit: two back-to-back session-start calls where the second's
     /// token sequence is `first_tokens + extra_tokens`. The result of the
@@ -11901,8 +9728,8 @@ mod prefix_cache_reuse_integration_tests {
 #[cfg(test)]
 mod paged_construction_tests {
     //! Smoke tests for the block-paged adapter construction on Qwen3.5
-    //! dense. The forward dispatch lives in `chat_sync_core_paged`
-    //! / `chat_stream_sync_core_paged`; these tests cover the
+    //! dense. The forward dispatch lives in `paged_turn_sync_core`
+    //! / `paged_turn_stream_core`; these tests cover the
     //! Inner-construction surface in isolation.
     //!
     //! Tests that allocate a `LayerKVPool` require Metal. Construction-only
@@ -12508,17 +10335,6 @@ mod paged_construction_tests {
     }
 
     #[test]
-    fn test_paged_dense_linear_cache_export_uninitialized_returns_none() {
-        unsafe {
-            mlx_sys::mlx_qwen35_compiled_reset();
-        }
-        let cfg = tiny_cfg(true);
-        let exported = export_paged_dense_linear_caches(&cfg)
-            .expect("uninitialized paged dense export should not fail");
-        assert!(exported.is_none());
-    }
-
-    #[test]
     fn test_dense_paged_prefix_block_hash_matches_allocator_chain() {
         let tokens: Vec<u32> = (1..=12).collect();
         let per_block = vec![vec![11], vec![], vec![33, 44]];
@@ -12619,127 +10435,6 @@ mod paged_construction_tests {
         assert!(
             inner.vision_encoder.is_some(),
             "vision_encoder field must be populated after a successful set"
-        );
-    }
-
-    /// Hard-fails fast when caller passes a `caches`
-    /// slice whose length disagrees with `config.num_layers`. The
-    /// check runs BEFORE any FFI dispatch so we don't perturb the C++
-    /// paged globals — making this the only branch of
-    /// `init_paged_dense_compiled_session` we can exercise from a
-    /// non-Metal sandbox.
-    ///
-    /// (The other failure branches all require populated `MxArray`
-    /// handles, which need a real Metal allocation. They're covered
-    /// indirectly by parity testing on real-weights checkpoints.)
-    #[test]
-    fn test_init_paged_dense_compiled_session_rejects_cache_length_mismatch() {
-        let cfg = tiny_cfg(true);
-        // `cfg` has num_layers=8; pass an empty cache slice to trigger
-        // the length check before any FFI / Metal call.
-        let empty_caches: Vec<Qwen3_5LayerCache> = Vec::new();
-        let alloc = std::sync::Arc::new(std::sync::Mutex::new(
-            mlx_paged_attn::BlockAllocator::new(2, 16),
-        ));
-        let pa_cfg = mlx_paged_attn::PagedAttentionConfig {
-            block_size: 16,
-            gpu_memory_mb: 8,
-            head_size: cfg.head_dim as u32,
-            num_kv_heads: cfg.num_kv_heads as u32,
-            num_layers: cfg.full_attention_layer_count() as u32,
-            use_fp8_cache: Some(false),
-            max_seq_len: Some(64),
-            max_batch_size: Some(1),
-        };
-        let pool = match mlx_paged_attn::LayerKVPool::new(
-            pa_cfg,
-            2,
-            mlx_paged_attn::metal::MetalDtype::BFloat16,
-        ) {
-            Ok(p) => std::sync::Arc::new(p),
-            Err(e) => {
-                eprintln!(
-                    "skipping test_init_paged_dense_compiled_session_rejects_cache_length_mismatch: {e}"
-                );
-                return;
-            }
-        };
-        let adapter = PagedKVCacheAdapter::new(alloc, pool, 16)
-            .expect("paged adapter construction must succeed once pool is built");
-        let res = init_paged_dense_compiled_session(&cfg, &empty_caches, &adapter, 0);
-        let msg = res
-            .expect_err("expected Err on cache length mismatch")
-            .to_string();
-        assert!(
-            msg.contains("caches.len()"),
-            "error must reference caches length contract; got: {msg}"
-        );
-    }
-
-    /// The C++ compiled paged graph hard-codes
-    /// block_size=16. The dispatcher MUST gate `cpp_session_ready` on
-    /// `adapter.block_size() == 16` so a config with
-    /// `paged_block_size: Some(8)` falls back to the pure-Rust paged
-    /// path instead of corrupting KV state. Validates the constant.
-    #[test]
-    fn test_cpp_paged_required_block_size_is_sixteen() {
-        assert_eq!(
-            CPP_PAGED_REQUIRED_BLOCK_SIZE, 16,
-            "C++ compiled paged graph in mlx_qwen35.cpp hard-codes block_size=16; \
-             changing this constant requires re-tracing the compiled graph"
-        );
-    }
-
-    /// Build an adapter with `block_size != 16` and
-    /// verify that the dispatcher gate
-    /// (`adapter.block_size() != CPP_PAGED_REQUIRED_BLOCK_SIZE`) would
-    /// correctly reject it. The gate runs BEFORE
-    /// `init_paged_dense_compiled_session` is called, so the FFI is
-    /// never touched on the fallback path.
-    #[test]
-    fn test_block_size_eight_adapter_falls_back_to_pure_rust() {
-        let cfg = tiny_cfg(true);
-        let alloc = std::sync::Arc::new(std::sync::Mutex::new(
-            mlx_paged_attn::BlockAllocator::new(2, 8),
-        ));
-        let pa_cfg = mlx_paged_attn::PagedAttentionConfig {
-            block_size: 8,
-            gpu_memory_mb: 8,
-            head_size: cfg.head_dim as u32,
-            num_kv_heads: cfg.num_kv_heads as u32,
-            num_layers: cfg.full_attention_layer_count() as u32,
-            use_fp8_cache: Some(false),
-            max_seq_len: Some(64),
-            max_batch_size: Some(1),
-        };
-        let pool = match mlx_paged_attn::LayerKVPool::new_for_test(
-            pa_cfg,
-            2,
-            cfg.full_attention_layer_count() as u32,
-            mlx_paged_attn::metal::MetalDtype::BFloat16,
-        ) {
-            Ok(p) => std::sync::Arc::new(p),
-            Err(e) => {
-                eprintln!("skipping test_block_size_eight_adapter_falls_back_to_pure_rust: {e}");
-                return;
-            }
-        };
-        let adapter = PagedKVCacheAdapter::new(alloc, pool, 8)
-            .expect("PagedKVCacheAdapter::new must accept block_size=8 (validated by adapter)");
-        assert_eq!(
-            adapter.block_size(),
-            8,
-            "adapter must report the block_size it was constructed with"
-        );
-        // Simulate the dispatcher's gate. We do NOT call
-        // `init_paged_dense_compiled_session` here — that's exactly
-        // what the gate prevents.
-        assert_ne!(
-            adapter.block_size(),
-            CPP_PAGED_REQUIRED_BLOCK_SIZE,
-            "block_size=8 adapter must not match the compiled graph's hard-coded 16; \
-             the dispatcher gate at chat_sync_core_paged_inner / chat_stream_sync_core_paged_inner \
-             relies on this inequality to fall back to the pure-Rust paged path"
         );
     }
 
@@ -12901,70 +10596,5 @@ mod paged_construction_tests {
         let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
         let _ = adapter.register_full_blocks_for_reuse(&[], 0);
         adapter.release_request().expect("release_request");
-    }
-
-    /// The C++ FFI returns `int32_t` (0 success / -1
-    /// failure). The Rust `init_paged_dense_compiled_session`
-    /// propagates non-zero status as `Err` so the dispatcher's
-    /// `cpp_session_ready` becomes false on init failure and falls
-    /// back to the pure-Rust paged decode. This test forces the C++
-    /// side's null-handle rejection branch by passing null pool
-    /// handles for the full-attention layers, and asserts the FFI
-    /// returns -1.
-    #[test]
-    fn test_mlx_qwen35_init_paged_returns_negative_on_null_handles() {
-        let cfg = tiny_cfg(true);
-        let num_layers = cfg.num_layers as usize;
-        // All-null pool/scale handles. The C++ side iterates layers
-        // [0..num_layers); for each non-linear (full-attention) layer
-        // the null-handle check fires and the function returns -1.
-        // Layer 0 with full_attention_interval=4 is linear, so the
-        // first full-attn layer is at index 3, where the rejection
-        // fires.
-        let mut k_pool: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); num_layers];
-        let mut v_pool: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); num_layers];
-        let mut k_scale: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); num_layers];
-        let mut v_scale: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); num_layers];
-        let mut linear_caches: Vec<*mut mlx_sys::mlx_array> =
-            vec![std::ptr::null_mut(); num_layers * 2];
-
-        let status = unsafe {
-            mlx_sys::mlx_qwen35_init_paged(
-                cfg.num_layers,
-                cfg.hidden_size,
-                cfg.num_heads,
-                cfg.num_kv_heads,
-                cfg.head_dim,
-                cfg.rope_theta as f32,
-                cfg.rope_dims(),
-                cfg.rms_norm_eps as f32,
-                cfg.full_attention_interval,
-                cfg.linear_num_key_heads,
-                cfg.linear_num_value_heads,
-                cfg.linear_key_head_dim,
-                cfg.linear_value_head_dim,
-                cfg.linear_conv_kernel_dim,
-                if cfg.tie_word_embeddings { 1 } else { 0 },
-                cfg.max_position_embeddings,
-                1,
-                k_pool.as_mut_ptr(),
-                v_pool.as_mut_ptr(),
-                k_scale.as_mut_ptr(),
-                v_scale.as_mut_ptr(),
-                linear_caches.as_mut_ptr(),
-                0,
-            )
-        };
-        assert_eq!(
-            status, -1,
-            "mlx_qwen35_init_paged MUST return -1 when full-attention pool/scale handles \
-             are null. Returning 0 would let the dispatcher enter the compiled paged decode \
-             against uninitialized globals."
-        );
-        // Reset C++ globals to a clean state so the test doesn't
-        // contaminate any later tests in the same process.
-        unsafe {
-            mlx_sys::mlx_qwen35_compiled_reset();
-        }
     }
 }

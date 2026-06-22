@@ -140,7 +140,35 @@ bool mlx_array_get_batch_seq_hidden(mlx_array* handle, int64_t* batch, int64_t* 
 // Read a scalar element from an evaluated array at the given index, casting to
 // the requested output type entirely on CPU.  Never creates a GPU astype+eval
 // -- that was the root cause of a 4.4 ms per-step stall in decode loops.
+//
+// PRECONDITION (enforced by ensure_readable below): the array must be
+// materialized before its buffer is dereferenced. Callers used to rely on
+// the Rust side having eval'd the array, but several decode loops read a
+// token that was only ASYNC-eval'd one step earlier. `data<T>()` does NOT
+// wait on the array's completion event, so when the GPU hadn't finished
+// the forward yet the read returned stale recycled-buffer bytes — observed
+// as nondeterministic garbage token ids (e.g. lfm2 sampling reserved
+// vocab ids 45/125 at the thinking-budget force boundary, where the forced
+// </think> path skips the next sample/eval that normally hides the race).
 namespace {
+// Make `arr` safe to read host-side: full eval when unscheduled, event
+// wait when scheduled (mirrors mlx::core::array::item<T>()). Cheap no-op
+// for already-available arrays. Returns false if evaluation threw.
+bool ensure_readable(array& arr, const char* context) {
+  try {
+    if (!arr.is_available()) {
+      arr.eval();
+    }
+    return true;
+  } catch (const std::exception& e) {
+    mlx_trace_native_error(context, e.what());
+    return false;
+  } catch (...) {
+    mlx_trace_native_error(context, "unknown exception");
+    return false;
+  }
+}
+
 template <typename Out>
 Out read_scalar(const array& arr, size_t index) {
   // Host-side reads require materialized data. On the CUDA backend data() on an
@@ -179,6 +207,7 @@ bool mlx_array_item_at_float32(mlx_array* handle, size_t index, float* out) {
   if (!handle || !out) return false;
   auto arr = reinterpret_cast<array*>(handle);
   if (index >= arr->size()) return false;
+  if (!ensure_readable(*arr, "array_item_at_float32")) return false;
   *out = read_scalar<float>(*arr, index);
   return true;
 }
@@ -187,6 +216,7 @@ bool mlx_array_item_at_int32(mlx_array* handle, size_t index, int32_t* out) {
   if (!handle || !out) return false;
   auto arr = reinterpret_cast<array*>(handle);
   if (index >= arr->size()) return false;
+  if (!ensure_readable(*arr, "array_item_at_int32")) return false;
   *out = read_scalar<int32_t>(*arr, index);
   return true;
 }
@@ -195,6 +225,7 @@ bool mlx_array_item_at_uint32(mlx_array* handle, size_t index, uint32_t* out) {
   if (!handle || !out) return false;
   auto arr = reinterpret_cast<array*>(handle);
   if (index >= arr->size()) return false;
+  if (!ensure_readable(*arr, "array_item_at_uint32")) return false;
   *out = read_scalar<uint32_t>(*arr, index);
   return true;
 }
@@ -264,8 +295,12 @@ bool mlx_array_to_uint16(mlx_array* handle, uint16_t* out, size_t len) {
       return false;
     }
 
-    // Use contiguous copy to flatten multi-dim arrays into row-major buffer
-    auto flat = flatten(*arr);
+    // Flatten on the CPU device. flatten() otherwise inherits the ambient
+    // default device; if that is the GPU, a single tensor larger than the GPU
+    // per-buffer cap — e.g. gemma4's embed_tokens_per_layer.weight (~4.7 GB) —
+    // is migrated into one Metal buffer and trips metal::malloc on memory-
+    // constrained GPUs. Host RAM has no per-buffer cap, so pin the read to CPU.
+    auto flat = flatten(*arr, mlx::core::Device::cpu);
     flat.eval();
 
     if (dtype == mlx::core::bfloat16) {
@@ -278,6 +313,75 @@ bool mlx_array_to_uint16(mlx_array* handle, uint16_t* out, size_t len) {
     return true;
   } catch (const std::exception& e) {
     std::cerr << "[MLX] mlx_array_to_uint16: " << e.what() << std::endl;
+    return false;
+  }
+}
+
+// Read a raw byte range straight from a safetensors file into a host buffer,
+// bypassing MLX entirely. Used by the convert serializer for tensors whose
+// on-disk bytes are a verified unmodified passthrough of a source tensor (e.g.
+// gemma4's ~4.7 GB `embed_tokens_per_layer.weight`). Routing such a tensor
+// through any whole-tensor `array::eval()` allocates one Metal buffer that
+// trips the GPU per-buffer cap (3.5 GB on memory-constrained runners),
+// regardless of stream/device. A plain host file read has no per-buffer cap.
+//
+// `file_offset` is the ABSOLUTE byte offset of the tensor's data within the
+// file (i.e. `8 + header_len + data_offsets[begin]`); the caller computes it
+// from the parsed safetensors header. `out_len` must equal the tensor's byte
+// length; the read is performed in bounded chunks so no single read call sizes
+// to the full tensor. Returns false on any I/O error, short read, or if the
+// file is smaller than `file_offset + out_len`.
+bool mlx_safetensor_read_raw(const char* file_path,
+                             uint64_t file_offset,
+                             uint8_t* out,
+                             size_t out_len) {
+  if (!file_path || !out) {
+    return false;
+  }
+  try {
+    std::ifstream file(file_path, std::ios::binary);
+    if (!file) {
+      std::cerr << "[MLX] mlx_safetensor_read_raw: cannot open " << file_path << std::endl;
+      return false;
+    }
+
+    // Bound the read against the real file size so a bad offset/length can
+    // never over-read or silently return uninitialized bytes.
+    file.seekg(0, std::ios::end);
+    const std::streamoff file_size = file.tellg();
+    if (file_size < 0) {
+      std::cerr << "[MLX] mlx_safetensor_read_raw: tellg failed for " << file_path << std::endl;
+      return false;
+    }
+    const uint64_t end = file_offset + static_cast<uint64_t>(out_len);
+    if (end < file_offset /* overflow */ || end > static_cast<uint64_t>(file_size)) {
+      std::cerr << "[MLX] mlx_safetensor_read_raw: range [" << file_offset << ", " << end
+                << ") exceeds file size " << file_size << " for " << file_path << std::endl;
+      return false;
+    }
+
+    file.seekg(static_cast<std::streamoff>(file_offset), std::ios::beg);
+    if (!file) {
+      std::cerr << "[MLX] mlx_safetensor_read_raw: seek failed for " << file_path << std::endl;
+      return false;
+    }
+
+    constexpr size_t kChunk = static_cast<size_t>(256) << 20;  // 256 MiB
+    size_t remaining = out_len;
+    uint8_t* cursor = out;
+    while (remaining > 0) {
+      const size_t this_read = remaining < kChunk ? remaining : kChunk;
+      file.read(reinterpret_cast<char*>(cursor), static_cast<std::streamsize>(this_read));
+      if (static_cast<size_t>(file.gcount()) != this_read) {
+        std::cerr << "[MLX] mlx_safetensor_read_raw: short read on " << file_path << std::endl;
+        return false;
+      }
+      cursor += this_read;
+      remaining -= this_read;
+    }
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "[MLX] mlx_safetensor_read_raw: " << e.what() << std::endl;
     return false;
   }
 }

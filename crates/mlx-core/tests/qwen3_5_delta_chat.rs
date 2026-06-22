@@ -17,11 +17,76 @@
 //! Without `MLX_TEST_MODEL_PATH` the test early-returns and passes
 //! trivially so it still compiles as part of `cargo test`.
 
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use mlx_core::models::qwen3_5::model::{ChatConfig, Qwen3_5Model};
+use mlx_core::engine::types::ChatConfig;
+use mlx_core::models::qwen3_5::model::Qwen3_5Model;
 use mlx_core::tokenizer::ChatMessage;
+
+/// Clone `src` into a fresh `target/`-rooted dir with the weight files
+/// symlinked and `config.json` patched to `use_block_paged_cache=false`,
+/// returning the new path. The path is leaked — these run a couple of times
+/// per session and `target/` is already a build artifact, so cleanup is
+/// best-effort and not needed for correctness.
+///
+/// The vision-capable MTP checkpoint the MTP-vs-AR oracles run against defaults
+/// to the block-paged KV backend at load (its config carries a `vision_config`).
+/// The "MTP byte-matches AR" property only holds on the FLAT backend: paged
+/// full-attention decode differs from flat by ~1 bf16 ULP, and streaming MTP on
+/// a paged model routes through the flat-dense path while AR stays paged — a
+/// cross-backend mix that is not byte-comparable. Pin flat so both paths run the
+/// same backend.
+fn flat_clone_model_dir(src: &Path, suffix: &str) -> Result<PathBuf, String> {
+    let pid = std::process::id();
+    let workspace_target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let manifest = std::env::var("CARGO_MANIFEST_DIR")
+                .expect("CARGO_MANIFEST_DIR must be set when running cargo test");
+            let mut p = PathBuf::from(manifest);
+            p.pop();
+            p.pop();
+            p.join("target")
+        });
+
+    let dst = workspace_target.join(format!("delta-chat-flat-{pid}-{suffix}"));
+    if dst.exists() {
+        let _ = fs::remove_dir_all(&dst);
+    }
+    fs::create_dir_all(&dst).map_err(|e| format!("create_dir_all({}): {e}", dst.display()))?;
+
+    // Symlink the (multi-GB) weight files; only config.json is copied + patched.
+    for entry in fs::read_dir(src).map_err(|e| format!("read_dir({}): {e}", src.display()))? {
+        let entry = entry.map_err(|e| format!("dir entry: {e}"))?;
+        let from = entry.path();
+        if !from.is_file() {
+            continue;
+        }
+        let to = dst.join(entry.file_name());
+        if entry.file_name() == "config.json" {
+            fs::copy(&from, &to)
+                .map_err(|e| format!("copy({} -> {}): {e}", from.display(), to.display()))?;
+        } else {
+            std::os::unix::fs::symlink(&from, &to)
+                .map_err(|e| format!("symlink({} -> {}): {e}", from.display(), to.display()))?;
+        }
+    }
+
+    let cfg_path = dst.join("config.json");
+    let raw = fs::read_to_string(&cfg_path)
+        .map_err(|e| format!("read config.json: {e} (path={})", cfg_path.display()))?;
+    let mut cfg: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("parse config.json: {e} (path={})", cfg_path.display()))?;
+    cfg["use_block_paged_cache"] = serde_json::Value::Bool(false);
+    let pretty =
+        serde_json::to_string_pretty(&cfg).map_err(|e| format!("serialize config.json: {e}"))?;
+    fs::write(&cfg_path, pretty)
+        .map_err(|e| format!("write config.json: {e} (path={})", cfg_path.display()))?;
+
+    Ok(dst)
+}
 
 fn chat_config_default(max_new_tokens: i32) -> ChatConfig {
     ChatConfig {
@@ -93,6 +158,7 @@ async fn session_path_keeps_ttft_flat_across_turns() {
     struct TurnSnapshot {
         ttft_ms: f64,
         prompt_tokens: u32,
+        cached_tokens: u32,
     }
 
     // --- Turn 1: chat_session_start establishes a clean session ---
@@ -113,6 +179,7 @@ async fn session_path_keeps_ttft_flat_across_turns() {
             .expect("turn 1 performance missing")
             .ttft_ms,
         prompt_tokens: r1.prompt_tokens,
+        cached_tokens: r1.cached_tokens,
     };
     println!(
         "turn 1 ttft={:.1}ms prompt_tokens={} num_tokens={}",
@@ -152,6 +219,7 @@ async fn session_path_keeps_ttft_flat_across_turns() {
         snapshots.push(TurnSnapshot {
             ttft_ms: ttft,
             prompt_tokens: result.prompt_tokens,
+            cached_tokens: result.cached_tokens,
         });
 
         assert!(
@@ -197,35 +265,65 @@ async fn session_path_keeps_ttft_flat_across_turns() {
         turn4.prompt_tokens
     );
 
-    // 2. TTFT stays flat (<=1.5x of turn 1) across all turns. The broken
-    //    pre-Phase-1 path would balloon linearly as the history grows —
-    //    1.5x is a generous bound that still catches a full re-prefill
-    //    regression.
-    let bound_vs_turn1 = turn1.ttft_ms * 1.5;
+    // 2. The delta path reuses the entire prior context (the live KV cache)
+    //    and freshly prefills ONLY the new turn's ChatML delta. We assert on
+    //    that token accounting rather than wall-clock TTFT: TTFT flakes on
+    //    shared CI runners (tiny warm-GPU times dominated by fixed per-turn
+    //    setup, not prefill work) and is a WEAK signal — a path that silently
+    //    rebuilt the cache each turn could still post a fast TTFT on a fast
+    //    machine. `cached_tokens` is the deterministic proof.
+
+    // 2a. cached_tokens GROWS across delta turns: each delta reuses the full,
+    //     ever-longer prior context. A regressed delta that desynced and
+    //     re-prefilled from scratch reports cached_tokens == 0 (the engine's
+    //     `is_delta && !desynced` gate), so non-zero, strictly-growing
+    //     cached_tokens is direct evidence the cache is reused, not rebuilt.
+    assert_eq!(
+        turn1.cached_tokens, 0,
+        "turn 1 cold-starts but reported cached_tokens={}",
+        turn1.cached_tokens
+    );
     assert!(
-        turn4.ttft_ms < bound_vs_turn1,
-        "delta-path TTFT regression vs turn 1: turn1={:.1}ms turn4={:.1}ms bound={:.1}ms. \
-         snapshots: {:?}",
-        turn1.ttft_ms,
-        turn4.ttft_ms,
-        bound_vs_turn1,
+        turn2.cached_tokens > 0,
+        "delta turn 2 reused nothing (cached_tokens=0) — cache was rebuilt. snapshots: {:?}",
+        snapshots
+    );
+    assert!(
+        turn3.cached_tokens > turn2.cached_tokens,
+        "delta turn 3 didn't grow its reused prefix ({} -> {}). snapshots: {:?}",
+        turn2.cached_tokens,
+        turn3.cached_tokens,
+        snapshots
+    );
+    assert!(
+        turn4.cached_tokens > turn3.cached_tokens,
+        "delta turn 4 didn't grow its reused prefix ({} -> {}). snapshots: {:?}",
+        turn3.cached_tokens,
+        turn4.cached_tokens,
         snapshots
     );
 
-    // 3. Turn 4 should be in the same flat-TTFT regime as turn 2 (the
-    //    first delta turn). Turn 1 includes any one-time warmups the
-    //    session-start path happens to do — comparing turn 4 to turn 2
-    //    filters that out and catches a gradual slowdown across deltas
-    //    that an only-vs-turn-1 check would miss. Allow 2x noise to
-    //    avoid flakes on shared runners.
-    let bound_vs_turn2 = turn2.ttft_ms * 2.0;
+    // 2b. The freshly-prefilled span (prompt_tokens - cached_tokens) stays
+    //     small and FLAT even as the context grows — it is just one new user
+    //     turn's ChatML each time, never the whole transcript. A full
+    //     re-prefill regression would make turn 4's fresh span scale with the
+    //     accumulated history instead.
+    let uncached = |t: &TurnSnapshot| t.prompt_tokens.saturating_sub(t.cached_tokens);
     assert!(
-        turn4.ttft_ms < bound_vs_turn2,
-        "turn 4 TTFT much slower than turn 2: turn2={:.1}ms turn4={:.1}ms bound={:.1}ms. \
-         snapshots: {:?}",
-        turn2.ttft_ms,
-        turn4.ttft_ms,
-        bound_vs_turn2,
+        uncached(turn4) < turn4.cached_tokens,
+        "delta turn 4 prefilled more than it reused — work is not flat: \
+         prompt={} cached={} uncached={}. snapshots: {:?}",
+        turn4.prompt_tokens,
+        turn4.cached_tokens,
+        uncached(turn4),
+        snapshots
+    );
+    assert!(
+        uncached(turn4) <= uncached(turn2) * 2,
+        "delta turn 4's fresh prefill ({}) ballooned vs turn 2's ({}) — TTFT \
+         would regress. snapshots: {:?}",
+        uncached(turn4),
+        uncached(turn2),
         snapshots
     );
 }
@@ -257,13 +355,9 @@ async fn session_path_keeps_ttft_flat_across_turns() {
 /// invariants expected by subsequent turns.
 async fn drain_stream_turn(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<
-        napi::Result<mlx_core::models::qwen3_5::model::ChatStreamChunk>,
+        napi::Result<mlx_core::engine::types::ChatStreamChunk>,
     >,
-) -> (
-    Vec<mlx_core::models::qwen3_5::model::ChatStreamChunk>,
-    f64,
-    bool,
-) {
+) -> (Vec<mlx_core::engine::types::ChatStreamChunk>, f64, bool) {
     let start = Instant::now();
     let mut chunks = Vec::new();
     let mut ttft_ms: Option<f64> = None;
@@ -695,7 +789,7 @@ async fn session_start_accepts_images_for_vlm() {
 // on the MTP decode path, matching the AR `decode_loop!` semantics.
 // ---------------------------------------------------------------------
 //
-// The MTP decode macro (`decode_loop_mtp!` in `chat_common.rs`) used to
+// The MTP decode macro (`decode_loop_mtp!` in `mtp_decode.rs`) used to
 // UNCONDITIONALLY push the prefill-seed token before its loop's length
 // check, so `maxNewTokens == 0` emitted ONE token where AR's
 // `for step in 0..max` emits ZERO. A NEGATIVE budget additionally wrapped
@@ -747,7 +841,8 @@ async fn nonpositive_budget_emits_zero_tokens_mtp_matches_ar() {
         model_path
     );
 
-    let model = Qwen3_5Model::load(model_path.clone())
+    let flat_dir = flat_clone_model_dir(model_dir, "nonpos").expect("flat clone failed");
+    let model = Qwen3_5Model::load(flat_dir.to_string_lossy().into_owned())
         .await
         .expect("failed to load Qwen3.5 model");
 
@@ -911,5 +1006,189 @@ async fn nonpositive_budget_emits_zero_tokens_mtp_matches_ar() {
         "MTP finish_reason at a negative budget (clamped to 0) must match the \
          AR baseline ({:?}), got {:?}",
         ar_zero.finish_reason, mtp_neg.finish_reason
+    );
+}
+
+// ---------------------------------------------------------------------
+// Regression: cancel MID-MTP-CYCLE must not corrupt the next delta turn
+// ---------------------------------------------------------------------
+//
+// The eager-MTP decode commits a whole speculative cycle into the flat
+// trunk caches (`self.caches`) BEFORE the per-token emit loop streams the
+// accepted tokens out. A cancel BETWEEN those emits strands the committed-
+// but-unemitted tail in the cache: `self.caches` ends advanced past the
+// saved `cached_token_history`. The flat `rollback_unemitted` closure was a
+// no-op (model.rs), so the FOLLOWING delta turn prefilled on top of the
+// over-advanced caches → RoPE skew / orphaned K-V → corrupt reply. The fix
+// marks the flat caches desynced on a mid-cycle stop so the next turn
+// discards them and re-prefills the full history into fresh caches.
+//
+// ORACLE: the AR (`decode_loop!`) path emits exactly one token per forward,
+// so a cancel always lands on a clean cache boundary — AR can never desync
+// and is the ground truth. We run the SAME cancel->continue scenario with
+// MTP on and off and require the post-cancel follow-up reply to be byte-
+// identical. Under the bug the MTP follow-up diverges whenever the cancel
+// stranded >= 1 committed-but-unemitted token.
+//
+// Determinism note: whether a given cancel point strands u>0 depends on the
+// checkpoint's per-cycle acceptance, which the public API can't force. So
+// this is a GUARD: it never false-fails (u==0 -> both paths agree trivially)
+// and it catches the desync whenever the cancel lands mid-cycle. A counting
+// prompt (high, contiguous MTP acceptance) maximises that chance.
+//
+// Gated on an MTP-head checkpoint — the desync only exists on the eager-MTP
+// path; on a non-MTP checkpoint or if MTP did not actually run it skips.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real Qwen3.5 Dense checkpoint WITH an MTP head"]
+async fn cancel_midcycle_then_continue_mtp_matches_ar() {
+    let Ok(model_path) = std::env::var("MLX_TEST_MODEL_PATH") else {
+        eprintln!(
+            "skipping: MLX_TEST_MODEL_PATH unset (needs an MTP-head Qwen3.5 Dense checkpoint)"
+        );
+        return;
+    };
+    let model_dir = Path::new(&model_path);
+    assert!(
+        model_dir.exists(),
+        "MLX_TEST_MODEL_PATH does not exist: {}",
+        model_path
+    );
+
+    let flat_dir = flat_clone_model_dir(model_dir, "cancel").expect("flat clone failed");
+    let model = Qwen3_5Model::load(flat_dir.to_string_lossy().into_owned())
+        .await
+        .expect("failed to load Qwen3.5 model");
+
+    // MTP-active gate: the desync only exists on the eager-MTP path. If the
+    // checkpoint has no MTP head (or MTP does not actually run) the MTP run
+    // below would silently re-test the AR path and the comparison would be
+    // vacuous — skip instead of passing as a false positive. Mirrors the
+    // probe in `nonpositive_budget_emits_zero_tokens_mtp_matches_ar`.
+    if !model.has_mtp_weights() {
+        eprintln!("skipping: checkpoint has no MTP head (has_mtp_weights() == false)");
+        return;
+    }
+    let probe = model
+        .chat_session_start(
+            vec![user_message("Count from 1 to 12, space separated.")],
+            Some(ChatConfig {
+                enable_mtp: Some(true),
+                ..chat_config_default(16)
+            }),
+        )
+        .await
+        .expect("MTP probe chat_session_start failed");
+    let mtp_ran = probe
+        .performance
+        .as_ref()
+        .and_then(|p| p.mtp_mean_accepted_tokens)
+        .is_some();
+    if !mtp_ran {
+        eprintln!(
+            "skipping: MTP head present but decode_loop_mtp! did not run \
+             (mtp_mean_accepted_tokens absent)"
+        );
+        return;
+    }
+
+    // Turn-1 stop policy. The MTP path cancels mid-cycle (the desync trigger);
+    // the AR ground truth instead stops cleanly at a fixed new-token budget so
+    // it never races the cancel and commits a deterministic history.
+    #[derive(Clone, Copy)]
+    enum Turn1Stop {
+        CancelAfter(usize),
+        Budget(usize),
+    }
+
+    // Runs turn 1 under `stop`, then a fixed turn-2 follow-up on the resulting
+    // caches. Returns (turn-1 streamed-token count, full turn-2 reply text).
+    async fn scenario(model: &Qwen3_5Model, enable_mtp: bool, stop: Turn1Stop) -> (usize, String) {
+        let max_new = match stop {
+            Turn1Stop::Budget(n) => n as i32,
+            Turn1Stop::CancelAfter(_) => 64,
+        };
+        let turn1_cfg = ChatConfig {
+            enable_mtp: Some(enable_mtp),
+            include_reasoning: Some(true),
+            ..chat_config_default(max_new)
+        };
+        let (handle, mut rx) = model
+            .chat_stream_session_start_for_test(
+                vec![user_message(
+                    "Count slowly upward, one number per step: 1 2 3 4 5 and keep going.",
+                )],
+                Some(turn1_cfg),
+            )
+            .expect("turn 1 stream dispatch failed");
+        // The streaming emit loop fires the callback once per accepted token on
+        // BOTH paths, so `emitted` is the saved-history token count (pre
+        // drop-last) for either a cancel or a length stop.
+        let mut emitted = 0usize;
+        while let Some(result) = rx.recv().await {
+            let chunk = result.expect("turn 1 stream error");
+            if chunk.done {
+                break;
+            }
+            emitted += 1;
+            if let Turn1Stop::CancelAfter(k) = stop
+                && emitted == k
+            {
+                handle.cancel();
+            }
+        }
+
+        // Turn 2: follow-up delta on top of the (possibly desynced) caches.
+        let turn2_cfg = ChatConfig {
+            enable_mtp: Some(enable_mtp),
+            include_reasoning: Some(true),
+            ..chat_config_default(24)
+        };
+        let (_h2, rx2) = model
+            .chat_stream_session_continue_for_test(
+                "Repeat back, in order, every number you listed so far.".to_string(),
+                None,
+                Some(turn2_cfg),
+            )
+            .expect("turn 2 continue dispatch failed");
+        let (chunks2, _ttft, done2) = drain_stream_turn(rx2).await;
+        assert!(done2, "turn 2 (enable_mtp={enable_mtp}) didn't reach done");
+        let full2: String = chunks2.iter().map(|c| c.text.as_str()).collect();
+        (emitted, full2)
+    }
+
+    // MTP path: cancel mid-cycle to strand drafted-but-unemitted tokens, the
+    // condition the desync heal must repair. Capture its exact emitted count.
+    let (n_mtp, mtp_turn2) = scenario(&model, true, Turn1Stop::CancelAfter(3)).await;
+    assert!(
+        n_mtp >= 3,
+        "MTP turn-1 emitted fewer tokens ({n_mtp}) than the cancel point; cannot \
+         exercise a mid-cycle cancel"
+    );
+
+    // AR ground truth: stop turn 1 cleanly at the SAME emitted count (no cancel,
+    // no host-timing race). A length stop and a cancel both drop the last,
+    // unforwarded token, so a HEALED MTP cancel and this AR run commit the
+    // identical turn-1 history (n_mtp-1 tokens). T=0 greedy makes the token
+    // sequences identical, so turn 2 is directly comparable on every host with
+    // no vacuous skip.
+    let (n_ar, ar_turn2) = scenario(&model, false, Turn1Stop::Budget(n_mtp)).await;
+    assert_eq!(
+        n_ar, n_mtp,
+        "AR length stop should emit exactly the MTP emitted-token budget \
+         (n_mtp={n_mtp}, n_ar={n_ar}); a short AR stop would skew the histories"
+    );
+
+    println!("turn1 emitted (MTP = AR budget) = {n_mtp}");
+    println!("MTP turn2 = {mtp_turn2:?}");
+    println!("AR  turn2 = {ar_turn2:?}");
+
+    // KEY: with the desync healed, the follow-up reply is identical to the AR
+    // ground truth. Under the bug the MTP flat caches were advanced past the
+    // emitted history (stranded drafted tokens never rolled back) and this
+    // follow-up diverges. Asserted unconditionally — no host-dependent skip.
+    assert_eq!(
+        mtp_turn2, ar_turn2,
+        "MTP follow-up after a mid-cycle cancel diverged from the AR ground \
+         truth — flat-cache desync not healed.\nMTP={mtp_turn2:?}\nAR={ar_turn2:?}"
     );
 }

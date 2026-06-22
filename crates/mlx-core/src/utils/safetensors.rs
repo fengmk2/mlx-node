@@ -329,6 +329,295 @@ fn bytes_to_u16(bytes: &[u8]) -> Vec<u16> {
 /// Maximum shard size in bytes (5 GB), matching mlx-lm and mlx-vlm.
 const MAX_SHARD_SIZE: usize = 5 << 30;
 
+/// Default minimum byte size at which a passthrough tensor is written by
+/// reading the source file directly instead of materializing it through MLX.
+///
+/// Chosen safely below the smallest real Metal per-buffer cap (3.5 GiB on the
+/// memory-constrained CI runner that triggered the original OOM). A whole-tensor
+/// MLX `eval()` over a tensor at or above this size risks allocating one Metal
+/// buffer that trips `metal::malloc`. Below it, the normal `array_to_bytes`
+/// path is unchanged.
+const DEFAULT_RAW_PASSTHROUGH_THRESHOLD_BYTES: u64 = 2 << 30; // 2 GiB
+
+/// Resolve the raw-passthrough byte threshold, honoring the
+/// `MLX_CONVERT_RAW_THRESHOLD_BYTES` override (used by tests / large-tensor
+/// debugging). Falls back to [`DEFAULT_RAW_PASSTHROUGH_THRESHOLD_BYTES`] when
+/// the var is unset or unparseable.
+fn raw_passthrough_threshold_bytes() -> u64 {
+    std::env::var("MLX_CONVERT_RAW_THRESHOLD_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_RAW_PASSTHROUGH_THRESHOLD_BYTES)
+}
+
+/// Where to find a dest tensor's raw bytes in a SOURCE safetensors file.
+///
+/// A dest tensor is eligible for this path only when convert proved it is an
+/// unmodified passthrough of a source tensor (same MLX array handle after
+/// sanitize ⇒ no astype / quant / slice / stack happened) AND it is a 2-byte
+/// float (bf16/f16), whose safetensors on-disk encoding is a pure
+/// little-endian bit layout identical to what the MLX writer would emit.
+/// The bytes are therefore byte-identical to `array_to_bytes` by construction.
+#[derive(Debug, Clone)]
+pub struct PassthroughSource {
+    /// Absolute path to the source safetensors shard file.
+    pub file_path: std::path::PathBuf,
+    /// Absolute byte offset of this tensor's data within the file
+    /// (`8 + header_len + data_offsets[begin]`).
+    pub file_offset: u64,
+    /// Tensor byte length (`data_offsets[end] - data_offsets[begin]`).
+    pub byte_len: usize,
+    /// Source dtype, used as a cheap pre-read guard against the dest header.
+    pub dtype: DType,
+}
+
+/// A recorded source tensor's provenance, keyed during convert by the loaded
+/// MLX array's raw handle pointer.
+///
+/// `_keep_alive` pins the source `MxArray` (a clone shares the `Arc<MxHandle>`)
+/// for the whole convert so its handle pointer can never be freed and reused by
+/// a later allocation — without this, a dropped source's address could be
+/// recycled by an `astype`/quantize result and falsely match as a passthrough.
+/// The clone is a lazy handle (no materialized data), so the memory cost is just
+/// the handle structs.
+pub struct SourceProvenance {
+    _keep_alive: MxArray,
+    pub source: PassthroughSource,
+}
+
+/// For one SOURCE safetensors file, record the on-disk location of every tensor
+/// that is still present (by name) in `loaded`, keyed by the loaded MLX array's
+/// raw handle pointer (as `usize`).
+///
+/// This is the basis of convert's passthrough provenance: the handle pointer is
+/// stable for the lifetime of the lazily-loaded array, and a pure HashMap rename
+/// preserves it (move, no clone of the underlying array), whereas any transform
+/// (`astype` / quantize / slice / stack) constructs a NEW array with a new
+/// handle. So a dest tensor whose handle is still in this map is provably an
+/// unmodified passthrough of this file's tensor.
+///
+/// Only 2-byte float source tensors (bf16/f16) are recorded — their safetensors
+/// on-disk bytes are a pure little-endian bit layout byte-identical to what the
+/// MLX writer emits. Other dtypes are excluded conservatively.
+pub fn record_passthrough_sources<P: AsRef<Path>>(
+    source_file: P,
+    loaded: &HashMap<String, MxArray>,
+    out: &mut HashMap<usize, SourceProvenance>,
+) -> Result<()> {
+    let path = source_file.as_ref();
+    let st = SafeTensorsFile::load(path)?;
+    for (name, info) in st.tensors.iter() {
+        let Some(array) = loaded.get(name) else {
+            continue;
+        };
+        // Only bf16/f16 — see fn doc.
+        let dtype = match info.dtype {
+            SafeTensorDType::BF16 => DType::BFloat16,
+            SafeTensorDType::F16 => DType::Float16,
+            _ => continue,
+        };
+        let byte_len = info.data_offsets[1] - info.data_offsets[0];
+        let file_offset = (st.data_offset + info.data_offsets[0]) as u64;
+        // Keep the source array alive (clone shares the `Arc<MxHandle>`) so its
+        // raw handle pointer is PINNED for the whole convert. This closes an ABA
+        // hazard: if a source array were dropped and its MLX buffer freed, a
+        // later `astype`/quantize allocation could reuse the same address and
+        // collide with a stale entry — a false passthrough = corrupt output.
+        // Pinning the handle guarantees no other array can ever hold this
+        // pointer, so a dest handle match is genuinely the same array.
+        out.insert(
+            array.as_raw_ptr() as usize,
+            SourceProvenance {
+                _keep_alive: array.clone(),
+                source: PassthroughSource {
+                    file_path: path.to_path_buf(),
+                    file_offset,
+                    byte_len,
+                    dtype,
+                },
+            },
+        );
+    }
+    Ok(())
+}
+
+/// Read a passthrough tensor's raw bytes straight from the source file via FFI,
+/// constructing no MLX array (so no Metal per-buffer cap applies). The host
+/// `Vec` is sized to the tensor; host RAM has no per-buffer cap.
+fn read_passthrough_bytes(src: &PassthroughSource) -> Result<Vec<u8>> {
+    use mlx_sys as sys;
+
+    let path_str = src
+        .file_path
+        .to_str()
+        .ok_or_else(|| Error::from_reason("Passthrough source path is not valid UTF-8"))?;
+    let c_path = std::ffi::CString::new(path_str)
+        .map_err(|_| Error::from_reason("Passthrough source path contains null byte"))?;
+
+    let mut buf = vec![0u8; src.byte_len];
+    let ok = unsafe {
+        sys::mlx_safetensor_read_raw(
+            c_path.as_ptr(),
+            src.file_offset,
+            buf.as_mut_ptr(),
+            buf.len(),
+        )
+    };
+    if !ok {
+        return Err(Error::from_reason(format!(
+            "Failed to read passthrough tensor bytes from {} (offset={}, len={})",
+            path_str, src.file_offset, src.byte_len
+        )));
+    }
+    Ok(buf)
+}
+
+/// Load a dense bf16 2-D tensor as axis-0 row shards, each `<= shard_byte_budget`
+/// bytes, streaming the rows straight from the source file (no whole-tensor MLX
+/// array is ever built, so the Metal per-buffer cap never applies).
+///
+/// Returns `(shards, rows_per_shard)`: `shards` concatenated along axis 0 equal
+/// the full `[vocab, cols]` table; `rows_per_shard` is the uniform axis-0 stride
+/// (every shard but the last has exactly this many rows). Used for tables like
+/// gemma-4-E2B's ~4GB `embed_tokens_per_layer.weight` that exceed the cap.
+/// The canonical checkpoint `.safetensors` under `dir`, matching exactly what
+/// the main loader (`crate::engine::persistence::load_all_safetensors`) reads:
+/// a single `weights.safetensors`/`model.safetensors` when present, otherwise
+/// the sorted `model-*-of-*.safetensors` shards. Stray or auxiliary
+/// `.safetensors` files in the directory are deliberately ignored so a sharded
+/// lookup resolves against the same files that produced the sanitized params.
+fn checkpoint_safetensors_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    for single in ["weights.safetensors", "model.safetensors"] {
+        let p = dir.join(single);
+        if p.exists() {
+            return vec![p];
+        }
+    }
+    let mut shards: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let is_shard = (name.starts_with("model-") || name.starts_with("model.safetensors-"))
+                && name.ends_with(".safetensors")
+                && name.contains("-of-");
+            if is_shard {
+                shards.push(entry.path());
+            }
+        }
+    }
+    shards.sort();
+    shards
+}
+
+pub(crate) fn load_bf16_tensor_sharded(
+    model_dir: &std::path::Path,
+    key: &str,
+    shard_byte_budget: usize,
+) -> Result<(Vec<MxArray>, i64)> {
+    use mlx_sys as sys;
+
+    // Locate the file holding `key`, reading only each file's header for the
+    // data offset + shape + dtype, and only over the canonical checkpoint files
+    // (`checkpoint_safetensors_files`) so a stray `.safetensors` can neither win
+    // the lookup nor abort it. `key` is the sanitized (prefix-stripped) name,
+    // but checkpoints store tensors under their raw names (gemma-4 wraps
+    // everything in `model.language_model.`). Resolution is decided GLOBALLY
+    // across the shard files rather than file-by-file — file order is
+    // unspecified and a tensor lives in exactly one shard:
+    //   * an exact `key` match anywhere wins over any `*.{key}` suffix match;
+    //   * a `*.{key}` suffix match is taken only when no exact match exists;
+    //   * 2+ exact matches, or 2+ suffix matches with no exact, is a loud error
+    //     rather than silently gathering the wrong tensor.
+    let suffix = format!(".{key}");
+    let mut exact: Vec<(std::path::PathBuf, TensorInfo, usize)> = Vec::new();
+    let mut suffixed: Vec<(std::path::PathBuf, String, TensorInfo, usize)> = Vec::new();
+    for p in checkpoint_safetensors_files(model_dir) {
+        let st = SafeTensorsFile::load(&p)?;
+        if let Some(info) = st.tensors.get(key) {
+            exact.push((p.clone(), info.clone(), st.data_offset));
+        }
+        for (name, info) in &st.tensors {
+            if name != key && name.ends_with(&suffix) {
+                suffixed.push((p.clone(), name.clone(), info.clone(), st.data_offset));
+            }
+        }
+    }
+    let (file_path, info, data_offset) = if exact.len() > 1 {
+        return Err(Error::from_reason(format!(
+            "tensor {key} appears as an exact key in {} safetensors under {model_dir:?}; refusing to guess",
+            exact.len()
+        )));
+    } else if let Some(hit) = exact.pop() {
+        hit
+    } else if suffixed.len() > 1 {
+        let names: Vec<&str> = suffixed
+            .iter()
+            .map(|(_, name, _, _)| name.as_str())
+            .collect();
+        return Err(Error::from_reason(format!(
+            "ambiguous `*.{key}` suffix matched {} tensors under {model_dir:?}: {names:?}; refusing to guess",
+            names.len()
+        )));
+    } else if let Some((p, _name, info, off)) = suffixed.pop() {
+        (p, info, off)
+    } else {
+        return Err(Error::from_reason(format!(
+            "tensor {key} (or a `*.{key}` suffix) not found in any safetensors under {model_dir:?}"
+        )));
+    };
+
+    if !matches!(info.dtype, SafeTensorDType::BF16) {
+        return Err(Error::from_reason(format!(
+            "load_bf16_tensor_sharded: {key} is {:?}, expected BF16",
+            info.dtype
+        )));
+    }
+    if info.shape.len() != 2 {
+        return Err(Error::from_reason(format!(
+            "load_bf16_tensor_sharded: {key} is {}-D, expected 2-D",
+            info.shape.len()
+        )));
+    }
+    let vocab = info.shape[0] as i64;
+    let cols = info.shape[1] as i64;
+    let row_bytes = cols as usize * 2; // bf16 = 2 bytes/element
+    if row_bytes == 0 {
+        return Err(Error::from_reason(format!(
+            "load_bf16_tensor_sharded: {key} has zero columns"
+        )));
+    }
+    let rows_per_shard = ((shard_byte_budget / row_bytes).max(1)) as i64;
+    // Absolute file offset where this tensor's data begins.
+    let tensor_base = (data_offset + info.data_offsets[0]) as u64;
+
+    let path_str = file_path
+        .to_str()
+        .ok_or_else(|| Error::from_reason("safetensors path is not valid UTF-8"))?;
+    let c_path = std::ffi::CString::new(path_str)
+        .map_err(|_| Error::from_reason("safetensors path contains a null byte"))?;
+
+    let mut shards: Vec<MxArray> = Vec::new();
+    let mut base: i64 = 0;
+    while base < vocab {
+        let rows_s = (vocab - base).min(rows_per_shard);
+        let shard_offset = tensor_base + (base as u64) * (row_bytes as u64);
+        let shard_len = rows_s as usize * row_bytes;
+        let mut buf = vec![0u8; shard_len];
+        let ok = unsafe {
+            sys::mlx_safetensor_read_raw(c_path.as_ptr(), shard_offset, buf.as_mut_ptr(), buf.len())
+        };
+        if !ok {
+            return Err(Error::from_reason(format!(
+                "Failed to read shard of {key} from {path_str} (offset={shard_offset}, len={shard_len})"
+            )));
+        }
+        let u16_data = bytes_to_u16(&buf);
+        shards.push(MxArray::from_bfloat16(&u16_data, &[rows_s, cols])?);
+        base += rows_s;
+    }
+    Ok((shards, rows_per_shard))
+}
+
 /// Snapshot MLX's allocator counters in MB. Returns `(active, peak, cache)`.
 /// Each accessor is fallible (returns -1 if the Metal allocator is
 /// uninitialised, e.g. CPU-only host or convert path that never touched the
@@ -367,8 +656,11 @@ fn save_safetensors_single<P: AsRef<Path>>(
     tensors: &mut HashMap<String, MxArray>,
     names: &[String],
     metadata: Option<serde_json::Value>,
+    passthrough: Option<&HashMap<String, PassthroughSource>>,
 ) -> Result<()> {
     use std::io::{BufWriter, Write};
+
+    let raw_threshold = raw_passthrough_threshold_bytes();
 
     // --- Pass 1: Build header from metadata only (no tensor evaluation) ---
     let mut header = serde_json::Map::new();
@@ -437,17 +729,70 @@ fn save_safetensors_single<P: AsRef<Path>>(
                 "materializing tensor"
             );
         }
-        let bytes = array_to_bytes(array).map_err(|e| {
-            let dtype = array.dtype().ok();
-            let shape = array.shape().ok();
-            Error::from_reason(format!(
-                "Failed to serialize tensor '{}' (dtype={:?}, shape={:?}): {}",
-                name,
-                dtype,
-                shape.as_ref().map(|s| s.as_ref()),
-                e
-            ))
-        })?;
+        // Compute this tensor's dest byte size + dtype from metadata (no eval).
+        // Used both to gate the raw-passthrough path by size and to validate a
+        // passthrough source against the dest header before trusting the file.
+        let dest_dtype = array.dtype().ok();
+        let dest_byte_size = match (array.size().ok(), dest_dtype) {
+            (Some(size), Some(dt)) => Some(size as usize * dt.byte_size()),
+            _ => None,
+        };
+
+        // Oversized passthrough fast path: for a verified unmodified passthrough
+        // of a source tensor whose byte size exceeds the threshold, read its
+        // bytes straight from the source file (no MLX array → no Metal
+        // per-buffer cap). Only taken when the source's dtype + byte length
+        // match the dest header exactly; any mismatch falls back to the
+        // standard `array_to_bytes` path.
+        let raw_bytes = match (
+            passthrough.and_then(|m| m.get(name)),
+            dest_byte_size,
+            dest_dtype,
+        ) {
+            (Some(src), Some(dest_len), Some(dest_dt))
+                if dest_len as u64 >= raw_threshold
+                    && src.byte_len == dest_len
+                    && src.dtype == dest_dt =>
+            {
+                let bytes = read_passthrough_bytes(src).map_err(|e| {
+                    Error::from_reason(format!(
+                        "Failed to read passthrough tensor '{}' from source: {}",
+                        name, e
+                    ))
+                })?;
+                tracing::info!(
+                    tensor = %name,
+                    bytes = bytes.len(),
+                    source = %src.file_path.display(),
+                    "wrote oversized tensor via direct source file read (bypassed MLX)"
+                );
+                if std::env::var("MLX_CONVERT_RAW_DEBUG").is_ok() {
+                    eprintln!(
+                        "[raw-passthrough] tensor={} bytes={} source={}",
+                        name,
+                        bytes.len(),
+                        src.file_path.display()
+                    );
+                }
+                Some(bytes)
+            }
+            _ => None,
+        };
+
+        let bytes = match raw_bytes {
+            Some(b) => b,
+            None => array_to_bytes(array).map_err(|e| {
+                let dtype = array.dtype().ok();
+                let shape = array.shape().ok();
+                Error::from_reason(format!(
+                    "Failed to serialize tensor '{}' (dtype={:?}, shape={:?}): {}",
+                    name,
+                    dtype,
+                    shape.as_ref().map(|s| s.as_ref()),
+                    e
+                ))
+            })?,
+        };
         let elapsed = t0.elapsed();
         if trace_enabled {
             tracing::debug!(
@@ -492,7 +837,7 @@ pub fn save_safetensors<P: AsRef<Path>>(
 ) -> Result<()> {
     let mut names: Vec<String> = tensors.keys().cloned().collect();
     names.sort();
-    save_safetensors_single(path, tensors, &names, metadata)
+    save_safetensors_single(path, tensors, &names, metadata, None)
 }
 
 /// Save tensors as sharded SafeTensors files with an index, matching mlx-lm/mlx-vlm output.
@@ -508,6 +853,7 @@ pub fn save_safetensors<P: AsRef<Path>>(
 pub fn save_safetensors_sharded(
     output_dir: &Path,
     tensors: &mut HashMap<String, MxArray>,
+    passthrough: Option<&HashMap<String, PassthroughSource>>,
 ) -> Result<()> {
     use tracing::info;
 
@@ -585,7 +931,13 @@ pub fn save_safetensors_sharded(
         );
 
         let shard_start = std::time::Instant::now();
-        save_safetensors_single(&shard_path, tensors, shard_names, Some(metadata.clone()))?;
+        save_safetensors_single(
+            &shard_path,
+            tensors,
+            shard_names,
+            Some(metadata.clone()),
+            passthrough,
+        )?;
         let shard_elapsed = shard_start.elapsed();
         bytes_written_total += shard_bytes;
         let convert_elapsed_s = convert_start.elapsed().as_secs_f64().max(1e-6);
@@ -807,6 +1159,345 @@ mod tests {
         assert_eq!(w.dtype().unwrap(), DType::Int8);
         assert_eq!(w.shape().unwrap().to_vec(), vec![2i64, 3]);
         assert_eq!(w.to_int8().unwrap(), vals);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Byte-identity lock: a bf16 tensor's on-disk bytes read by the raw
+    // source-file path (`mlx_safetensor_read_raw` via `read_passthrough_bytes`)
+    // must be byte-identical to the bytes the MLX writer produces
+    // (`array_to_bytes`). This is the invariant the convert OOM fix relies on —
+    // routing an oversized passthrough tensor through the file read instead of
+    // an MLX `eval()` must not change a single byte. Uses raw u16 bit patterns
+    // (incl. NaN/Inf/denormal/sign-bit) to prove a pure bit-reinterpret, not a
+    // numeric round-trip.
+    #[test]
+    fn test_passthrough_raw_read_matches_array_to_bytes_bf16() {
+        let dir = std::env::temp_dir().join(format!("st_raw_rt_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bf16.safetensors");
+
+        // bf16 bit patterns: 0, +1.0, -1.0, +Inf, NaN, denormal, sign-only, max.
+        let bits: Vec<u16> = vec![
+            0x0000, 0x3F80, 0xBF80, 0x7F80, 0x7FC0, 0x0001, 0x8000, 0x7F7F, 0x4049, 0xC2F7, 0x1234,
+            0xABCD,
+        ];
+        let arr = MxArray::from_bfloat16(&bits, &[3, 4]).unwrap();
+        assert_eq!(arr.dtype().unwrap(), DType::BFloat16);
+        let mut tensors = HashMap::new();
+        tensors.insert("emb".to_string(), arr);
+        save_safetensors(&path, &mut tensors, None).unwrap();
+
+        // Parse the saved file header to locate the tensor's on-disk bytes.
+        let st = SafeTensorsFile::load(&path).unwrap();
+        let info = st.tensors.get("emb").unwrap();
+        let byte_len = info.data_offsets[1] - info.data_offsets[0];
+        let file_offset = (st.data_offset + info.data_offsets[0]) as u64;
+        assert_eq!(byte_len, bits.len() * 2);
+
+        // Path 1: MLX writer bytes via array_to_bytes on the reloaded array.
+        let loaded = st.load_tensors(&path).unwrap();
+        let mlx_bytes = array_to_bytes(loaded.get("emb").unwrap()).unwrap();
+
+        // Path 2: raw source-file read via the new FFI.
+        let raw_bytes = read_passthrough_bytes(&PassthroughSource {
+            file_path: path.clone(),
+            file_offset,
+            byte_len,
+            dtype: DType::BFloat16,
+        })
+        .unwrap();
+
+        assert_eq!(
+            raw_bytes, mlx_bytes,
+            "raw source-file bytes must be byte-identical to the MLX writer bytes"
+        );
+        // And both must equal the original little-endian u16 input.
+        let expected: Vec<u8> = bits.iter().flat_map(|&x| x.to_le_bytes()).collect();
+        assert_eq!(raw_bytes, expected);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Streaming a bf16 table into axis-0 row shards must reconstruct the source
+    // rows exactly — exercises the file discovery + per-shard offset math
+    // (tensor_base + base*row_bytes) and the short final shard.
+    #[test]
+    fn load_bf16_tensor_sharded_matches_source_rows() {
+        let dir = std::env::temp_dir().join(format!("st_shard_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.safetensors");
+
+        // [7, 4] bf16 with every element distinct, so a wrong offset is obvious.
+        const V: usize = 7;
+        const C: usize = 4;
+        let bits: Vec<u16> = (0..(V * C) as u16).map(|i| 0x4000 + i).collect();
+        let arr = MxArray::from_bfloat16(&bits, &[V as i64, C as i64]).unwrap();
+        let mut tensors = HashMap::new();
+        tensors.insert("embed_tokens_per_layer.weight".to_string(), arr);
+        save_safetensors(&path, &mut tensors, None).unwrap();
+
+        // Budget = 2 rows (2*C*2 bytes) → rows_per_shard 2 → shards [2,2,2,1].
+        let budget = 2 * C * 2;
+        let (shards, rows_per_shard) =
+            load_bf16_tensor_sharded(&dir, "embed_tokens_per_layer.weight", budget).unwrap();
+        assert_eq!(rows_per_shard, 2);
+        assert_eq!(shards.len(), 4);
+
+        // Concatenated shard rows (in order) must equal the source, byte-exact.
+        let mut got: Vec<u16> = Vec::new();
+        for (s, shard) in shards.iter().enumerate() {
+            let rows_s = if s < 3 { 2 } else { 1 };
+            assert_eq!(shard.shape_at(0).unwrap(), rows_s as i64);
+            assert_eq!(shard.shape_at(1).unwrap(), C as i64);
+            got.extend(shard.to_uint16_native().unwrap());
+        }
+        assert_eq!(
+            got, bits,
+            "sharded load must reconstruct the source tensor rows exactly"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Checkpoints store tensors under their raw, prefixed names (gemma-4 wraps
+    /// everything in `model.language_model.`), but callers pass the sanitized
+    /// bare key. The loader must resolve the bare key against the unique
+    /// `*.{key}` suffix in the file — without this, the gemma-4-E2B PLE shard
+    /// load fails with "tensor not found".
+    #[test]
+    fn load_bf16_tensor_sharded_resolves_prefixed_key() {
+        let dir = std::env::temp_dir().join(format!("st_shard_prefixed_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.safetensors");
+
+        const V: usize = 5;
+        const C: usize = 3;
+        let bits: Vec<u16> = (0..(V * C) as u16).map(|i| 0x4000 + i).collect();
+        let arr = MxArray::from_bfloat16(&bits, &[V as i64, C as i64]).unwrap();
+        let mut tensors = HashMap::new();
+        // Stored under the raw prefixed name, exactly as gemma-4 ships it.
+        tensors.insert(
+            "model.language_model.embed_tokens_per_layer.weight".to_string(),
+            arr,
+        );
+        save_safetensors(&path, &mut tensors, None).unwrap();
+
+        // Requested by the sanitized bare key — must resolve via the suffix.
+        let budget = 2 * C * 2;
+        let (shards, rows_per_shard) =
+            load_bf16_tensor_sharded(&dir, "embed_tokens_per_layer.weight", budget).unwrap();
+        assert_eq!(rows_per_shard, 2);
+        assert_eq!(shards.len(), 3); // [2, 2, 1]
+
+        let mut got: Vec<u16> = Vec::new();
+        for shard in &shards {
+            got.extend(shard.to_uint16_native().unwrap());
+        }
+        assert_eq!(
+            got, bits,
+            "prefixed-key resolution must reconstruct the source tensor exactly"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Resolution is global, not per-file: when one shard file holds the exact
+    /// bare key and another holds a `*.{key}` suffix, the exact key must win
+    /// regardless of `read_dir` order — a per-file break could otherwise pick
+    /// the suffix from whichever file the OS happened to list first.
+    #[test]
+    fn load_bf16_tensor_sharded_exact_key_wins_across_files() {
+        let dir = std::env::temp_dir().join(format!("st_shard_exact_wins_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        const V: usize = 4;
+        const C: usize = 2;
+        // Two distinct tensors in two separate files: a prefixed suffix-match
+        // and the exact bare key. The loader must return the exact one.
+        let suffix_bits: Vec<u16> = (0..(V * C) as u16).map(|i| 0x5000 + i).collect();
+        let exact_bits: Vec<u16> = (0..(V * C) as u16).map(|i| 0x4000 + i).collect();
+
+        // Canonical shard names so both files are in the checkpoint's file set.
+        let mut a = HashMap::new();
+        a.insert(
+            "model.language_model.embed_tokens_per_layer.weight".to_string(),
+            MxArray::from_bfloat16(&suffix_bits, &[V as i64, C as i64]).unwrap(),
+        );
+        save_safetensors(dir.join("model-00001-of-00002.safetensors"), &mut a, None).unwrap();
+
+        let mut b = HashMap::new();
+        b.insert(
+            "embed_tokens_per_layer.weight".to_string(),
+            MxArray::from_bfloat16(&exact_bits, &[V as i64, C as i64]).unwrap(),
+        );
+        save_safetensors(dir.join("model-00002-of-00002.safetensors"), &mut b, None).unwrap();
+
+        let budget = V * C * 2; // single shard
+        let (shards, _) =
+            load_bf16_tensor_sharded(&dir, "embed_tokens_per_layer.weight", budget).unwrap();
+        let mut got: Vec<u16> = Vec::new();
+        for shard in &shards {
+            got.extend(shard.to_uint16_native().unwrap());
+        }
+        assert_eq!(
+            got, exact_bits,
+            "an exact key in any shard must win over a `*.{{key}}` suffix in another"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `*.{key}` suffix that matches different tensors in different shard
+    /// files (with no exact key anywhere) is ambiguous and must be a loud Err,
+    /// never a silent pick of whichever file was listed first.
+    #[test]
+    fn load_bf16_tensor_sharded_ambiguous_suffix_across_files_errors() {
+        let dir = std::env::temp_dir().join(format!("st_shard_ambig_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        const V: usize = 4;
+        const C: usize = 2;
+        let bits: Vec<u16> = (0..(V * C) as u16).map(|i| 0x4000 + i).collect();
+
+        // Canonical shard names so both files are in the checkpoint's file set.
+        let mut a = HashMap::new();
+        a.insert(
+            "model.language_model.embed_tokens_per_layer.weight".to_string(),
+            MxArray::from_bfloat16(&bits, &[V as i64, C as i64]).unwrap(),
+        );
+        save_safetensors(dir.join("model-00001-of-00002.safetensors"), &mut a, None).unwrap();
+
+        let mut b = HashMap::new();
+        b.insert(
+            "vision_model.embed_tokens_per_layer.weight".to_string(),
+            MxArray::from_bfloat16(&bits, &[V as i64, C as i64]).unwrap(),
+        );
+        save_safetensors(dir.join("model-00002-of-00002.safetensors"), &mut b, None).unwrap();
+
+        let budget = V * C * 2;
+        match load_bf16_tensor_sharded(&dir, "embed_tokens_per_layer.weight", budget) {
+            Ok(_) => panic!("cross-file suffix ambiguity must fail loudly, not pick one"),
+            Err(e) => assert!(
+                e.reason.contains("ambiguous"),
+                "error must name the ambiguity, got: {}",
+                e.reason
+            ),
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Resolution is scoped to the canonical checkpoint files only. A stray,
+    /// non-canonically-named `.safetensors` that happens to hold the exact bare
+    /// key must NOT win over (or abort) the real prefixed tensor in
+    /// `model.safetensors` — it is invisible to the main loader, so it must be
+    /// invisible here too.
+    #[test]
+    fn load_bf16_tensor_sharded_ignores_stray_non_checkpoint_file() {
+        let dir = std::env::temp_dir().join(format!("st_shard_stray_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        const V: usize = 4;
+        const C: usize = 2;
+        let real_bits: Vec<u16> = (0..(V * C) as u16).map(|i| 0x4000 + i).collect();
+        let stray_bits: Vec<u16> = (0..(V * C) as u16).map(|i| 0x5000 + i).collect();
+
+        // The real tensor lives prefixed in the canonical model.safetensors.
+        let mut real = HashMap::new();
+        real.insert(
+            "model.language_model.embed_tokens_per_layer.weight".to_string(),
+            MxArray::from_bfloat16(&real_bits, &[V as i64, C as i64]).unwrap(),
+        );
+        save_safetensors(dir.join("model.safetensors"), &mut real, None).unwrap();
+
+        // A stray file holds the exact bare key with different values; it is not
+        // a canonical checkpoint file and must be ignored entirely.
+        let mut stray = HashMap::new();
+        stray.insert(
+            "embed_tokens_per_layer.weight".to_string(),
+            MxArray::from_bfloat16(&stray_bits, &[V as i64, C as i64]).unwrap(),
+        );
+        save_safetensors(dir.join("extra.safetensors"), &mut stray, None).unwrap();
+
+        let budget = V * C * 2;
+        let (shards, _) =
+            load_bf16_tensor_sharded(&dir, "embed_tokens_per_layer.weight", budget).unwrap();
+        let mut got: Vec<u16> = Vec::new();
+        for shard in &shards {
+            got.extend(shard.to_uint16_native().unwrap());
+        }
+        assert_eq!(
+            got, real_bits,
+            "must resolve the real prefixed tensor, not the stray exact-key file"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same exact bare key in two canonical shard files is a malformed
+    /// checkpoint (a single tensor lives in exactly one shard), so it must fail
+    /// loudly rather than silently picking one.
+    #[test]
+    fn load_bf16_tensor_sharded_duplicate_exact_key_across_files_errors() {
+        let dir = std::env::temp_dir().join(format!("st_shard_dupexact_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        const V: usize = 4;
+        const C: usize = 2;
+        let bits: Vec<u16> = (0..(V * C) as u16).map(|i| 0x4000 + i).collect();
+
+        for shard in [
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+        ] {
+            let mut t = HashMap::new();
+            t.insert(
+                "embed_tokens_per_layer.weight".to_string(),
+                MxArray::from_bfloat16(&bits, &[V as i64, C as i64]).unwrap(),
+            );
+            save_safetensors(dir.join(shard), &mut t, None).unwrap();
+        }
+
+        let budget = V * C * 2;
+        match load_bf16_tensor_sharded(&dir, "embed_tokens_per_layer.weight", budget) {
+            Ok(_) => panic!("duplicate exact key across shards must fail loudly, not pick one"),
+            Err(e) => assert!(
+                e.reason.contains("exact key"),
+                "error must name the duplicate exact key, got: {}",
+                e.reason
+            ),
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Out-of-range / mismatch requests must fail (return Err) rather than read
+    // garbage — the writer guard relies on this to fall back to array_to_bytes.
+    #[test]
+    fn test_passthrough_raw_read_rejects_out_of_range() {
+        let dir = std::env::temp_dir().join(format!("st_raw_oob_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bf16.safetensors");
+
+        let bits: Vec<u16> = vec![0x3F80, 0xBF80];
+        let arr = MxArray::from_bfloat16(&bits, &[2]).unwrap();
+        let mut tensors = HashMap::new();
+        tensors.insert("emb".to_string(), arr);
+        save_safetensors(&path, &mut tensors, None).unwrap();
+
+        let st = SafeTensorsFile::load(&path).unwrap();
+        let info = st.tensors.get("emb").unwrap();
+        let file_offset = (st.data_offset + info.data_offsets[0]) as u64;
+
+        // Ask for far more bytes than the file holds → must fail, not over-read.
+        let res = read_passthrough_bytes(&PassthroughSource {
+            file_path: path.clone(),
+            file_offset,
+            byte_len: 1 << 30,
+            dtype: DType::BFloat16,
+        });
+        assert!(res.is_err(), "out-of-range read must return Err");
 
         std::fs::remove_dir_all(&dir).ok();
     }
