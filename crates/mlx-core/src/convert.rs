@@ -1344,7 +1344,7 @@ pub(crate) mod recipe {
 
     impl ConversionRecipe for Gemma4Recipe {
         fn model_types(&self) -> &'static [&'static str] {
-            &["gemma4"]
+            &["gemma4", "gemma4_unified"]
         }
 
         fn sanitize(
@@ -1407,6 +1407,7 @@ pub(crate) mod recipe {
                     || stripped.starts_with("audio_encoder.")
                     || stripped.starts_with("embed_audio.")
                     || stripped.starts_with("embed_vision.")
+                    || stripped.starts_with("vision_embedder.")
                     || stripped.starts_with("multi_modal_projector.")
                 {
                     // Apply PyTorch→MLX layout conversions for conv weights
@@ -1500,6 +1501,7 @@ pub(crate) mod recipe {
         "qianfan-ocr",
         "privacy-filter",
         "gemma4",
+        "gemma4_unified",
     ];
 
     /// Resolve a [`ConversionRecipe`] for an exact HuggingFace `model_type`
@@ -1513,7 +1515,7 @@ pub(crate) mod recipe {
             "paddleocr-vl" => Some(Box::new(PaddleOcrVlRecipe)),
             "qianfan-ocr" => Some(Box::new(QianfanOcrRecipe)),
             "privacy-filter" => Some(Box::new(PrivacyFilterRecipe)),
-            "gemma4" => Some(Box::new(Gemma4Recipe)),
+            "gemma4" | "gemma4_unified" => Some(Box::new(Gemma4Recipe)),
             _ => None,
         }
     }
@@ -2299,7 +2301,14 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     if let Some(ref imatrix_path) = imatrix_path {
         let imatrix = crate::utils::imatrix::parse_imatrix(imatrix_path)?;
         let num_layers = infer_num_layers_from_weights(&converted_tensors);
-        apply_awq_prescaling(&mut converted_tensors, &imatrix, 0.5, num_layers)?;
+        let modified = apply_awq_prescaling(&mut converted_tensors, &imatrix, 0.5, num_layers)?;
+        if modified == 0 {
+            warn!(
+                "AWQ pre-scaling modified 0 weight tensors despite an imatrix being provided — \
+                 the imatrix keys did not match any target weights (importance applied to nothing). \
+                 Check that the imatrix corresponds to this model."
+            );
+        }
     }
 
     // Apply quantization if requested
@@ -2859,6 +2868,13 @@ fn should_quantize(key: &str, embed_quantizable: bool) -> bool {
 
     // Exclude vision encoder weights (keep bf16 for quality)
     if key.contains("vision_tower") || key.contains("visual.") {
+        return false;
+    }
+
+    // Encoder-free unified vision patch projection (`vision_embedder.patch_dense`).
+    // The loader installs `vision_embedder.*` as dense bf16 only (no quantized
+    // branch), so quantizing it would corrupt the unified vision path. Keep bf16.
+    if key.contains("vision_embedder") {
         return false;
     }
 
@@ -3648,9 +3664,13 @@ pub(crate) fn build_qwen35_recipe(
 /// ## AWQ Pre-Scaling
 ///
 /// imatrix is **required** — attention/SSM weights fed by input_layernorm can
-/// be AWQ-corrected (layernorm absorbs inverse scales). `o_proj`, `out_proj`,
-/// and the split `in_proj_a`/`in_proj_b` have no preceding norm so cannot be
-/// AWQ-corrected; they are quantized at 8-bit affine (group_size 64) rather
+/// be AWQ-corrected (layernorm absorbs inverse scales). `o_proj` and `out_proj`
+/// have no preceding norm so cannot be AWQ-corrected. The split
+/// `in_proj_a`/`in_proj_b` DO share input_layernorm with `in_proj_qkv`/`in_proj_z`
+/// (Group D), so they are not part of the importance-derived scale but their
+/// columns are still multiplied by that scale to keep the reparametrization
+/// output-preserving. All of these are quantized at 8-bit affine (group_size 64)
+/// rather
 /// than left bf16 so they route through MLX's row-independent `qmv` kernel —
 /// required for MTP/AR T=0 bit-exactness (a bf16 `matmul` dispatches `gemv` at
 /// M=1 but split-K `steel_matmul` at M>=2, and the differing reduction order
@@ -5121,7 +5141,7 @@ pub(crate) fn apply_awq_prescaling(
     imatrix: &crate::utils::imatrix::ImatrixData,
     ratio: f32,
     num_layers: usize,
-) -> Result<()> {
+) -> Result<usize> {
     info!(
         "Applying AWQ pre-scaling: {} layers, ratio={}, {} imatrix entries",
         num_layers,
@@ -5225,16 +5245,29 @@ pub(crate) fn apply_awq_prescaling(
             }
         }
 
-        // ── Group D: input_layernorm → linear_attn.in_proj_qkv + in_proj_z ──
-        // (Only present in GatedDeltaNet layers)
+        // ── Group D: input_layernorm → linear_attn.in_proj_qkv + in_proj_z
+        //                              + in_proj_a + in_proj_b ──
+        // (Only present in GatedDeltaNet layers.) All four in_proj_* projections
+        // read the SAME input_layernorm output (see gated_delta_net.rs forward:
+        // both in_proj_qkvz and in_proj_ba matmul the normed input). The AWQ
+        // scale `s` is derived from qkv+z importance, but because the shared
+        // input_layernorm is divided by `s` below, EVERY consumer of that norm
+        // must have its input columns multiplied by `s` for the reparametrization
+        // to stay output-preserving. Omitting in_proj_a/in_proj_b would leave
+        // their inputs divided by `s` with un-compensated weights, distorting the
+        // GDN decay (`a`) and beta (`b`) gates. Their bit-width (8-bit affine) is
+        // orthogonal and unchanged — this is a correctness compensation, not a
+        // quantization-quality tweak.
         let qkv_key = format!("{prefix}.linear_attn.in_proj_qkv.weight");
         let z_key = format!("{prefix}.linear_attn.in_proj_z.weight");
+        let a_key = format!("{prefix}.linear_attn.in_proj_a.weight");
+        let b_key = format!("{prefix}.linear_attn.in_proj_b.weight");
 
         // Only apply if this layer has linear_attn weights (GDN layer)
         if weights.contains_key(&qkv_key)
             && let Some(scales) = compute_multi_key_scales(imatrix, &[&qkv_key, &z_key], ratio)?
         {
-            for proj_key in [&qkv_key, &z_key] {
+            for proj_key in [&qkv_key, &z_key, &a_key, &b_key] {
                 if let Some(proj) = weights.remove(proj_key) {
                     let scaled = scale_columns(&proj, &scales)?;
                     weights.insert(proj_key.to_string(), scaled);
@@ -5268,7 +5301,19 @@ pub(crate) fn apply_awq_prescaling(
         "AWQ pre-scaling complete: modified {} weight tensors",
         modified
     );
-    Ok(())
+    Ok(modified)
+}
+
+/// Map a (possibly VLM-wrapped) weight key to its canonical imatrix key.
+///
+/// Imatrix importance is always keyed with the canonical `model.layers.N.*`
+/// names produced by `gguf_name_to_hf` from a `blk.N.*` GGUF. Sanitized VLM
+/// checkpoints (e.g. qwen3_5_moe `*ForConditionalGeneration`) instead carry the
+/// `language_model.model.layers.N.*` prefix on their weights. Stripping the
+/// `language_model.` wrapper aligns the lookup with the imatrix; plain
+/// `model.layers.*` keys pass through unchanged.
+fn imatrix_lookup_key(key: &str) -> &str {
+    key.strip_prefix("language_model.").unwrap_or(key)
 }
 
 /// Compute AWQ scales for Group A (norm → gate_proj + up_proj).
@@ -5279,8 +5324,8 @@ fn compute_group_a_scales(
     up_key: &str,
     ratio: f32,
 ) -> Result<Option<MxArray>> {
-    let gate_imp = imatrix.importance.get(gate_key);
-    let up_imp = imatrix.importance.get(up_key);
+    let gate_imp = imatrix.importance.get(imatrix_lookup_key(gate_key));
+    let up_imp = imatrix.importance.get(imatrix_lookup_key(up_key));
 
     match (gate_imp, up_imp) {
         (Some(g), Some(u)) => {
@@ -5305,7 +5350,7 @@ fn compute_multi_key_scales(
 ) -> Result<Option<MxArray>> {
     let importances: Vec<&Vec<f32>> = keys
         .iter()
-        .filter_map(|k| imatrix.importance.get(*k))
+        .filter_map(|k| imatrix.importance.get(imatrix_lookup_key(k)))
         .collect();
 
     if importances.is_empty() {
@@ -5316,7 +5361,7 @@ fn compute_multi_key_scales(
     if importances.len() < keys.len() {
         let missing: Vec<&str> = keys
             .iter()
-            .filter(|k| !imatrix.importance.contains_key(**k))
+            .filter(|k| !imatrix.importance.contains_key(imatrix_lookup_key(k)))
             .copied()
             .collect();
         warn!(
@@ -5363,7 +5408,7 @@ fn compute_scales_for_key(
     key: &str,
     ratio: f32,
 ) -> Result<Option<MxArray>> {
-    match imatrix.importance.get(key) {
+    match imatrix.importance.get(imatrix_lookup_key(key)) {
         Some(imp) => {
             let scales = compute_normalized_scales(imp, ratio)?;
             Ok(Some(scales))
@@ -5435,6 +5480,114 @@ mod tests {
     use super::*;
     use crate::convert::recipe::{self, ConversionRecipe};
 
+    /// AWQ pre-scaling must fire on VLM-wrapped checkpoints whose sanitized
+    /// weights carry the `language_model.model.layers.*` prefix (e.g. the
+    /// qwen3_5_moe `qwen-agentworld` checkpoint), while the imatrix is always
+    /// keyed with the canonical `model.layers.*` names produced by
+    /// `gguf_name_to_hf`. Regression: that prefix mismatch silently turned AWQ
+    /// into a no-op (`modified == 0`), so the unsloth recipe's low-bit
+    /// attention/SSM projections shipped without importance correction.
+    #[test]
+    fn awq_prescaling_matches_vlm_prefixed_weights() {
+        use crate::utils::imatrix::ImatrixData;
+
+        const K: i64 = 4; // input features (columns)
+        const N: i64 = 2; // output features (rows)
+
+        let ones = |shape: &[i64]| {
+            let numel: usize = shape.iter().product::<i64>() as usize;
+            MxArray::from_float32(&vec![1.0f32; numel], shape).expect("from_float32")
+        };
+
+        // Sanitized VLM-wrapped weights: GDN layer 0 + full-attention layer 1.
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+        // Layer 0 — GatedDeltaNet (linear_attn) → exercises AWQ Group D.
+        // in_proj_a/in_proj_b also read the shared input_layernorm output (see
+        // gated_delta_net.rs forward), so Group D must compensate their columns
+        // too — otherwise the norm-division distorts the GDN decay/beta gates.
+        weights.insert(
+            "language_model.model.layers.0.linear_attn.in_proj_qkv.weight".into(),
+            ones(&[N, K]),
+        );
+        weights.insert(
+            "language_model.model.layers.0.linear_attn.in_proj_z.weight".into(),
+            ones(&[N, K]),
+        );
+        weights.insert(
+            "language_model.model.layers.0.linear_attn.in_proj_a.weight".into(),
+            ones(&[N, K]),
+        );
+        weights.insert(
+            "language_model.model.layers.0.linear_attn.in_proj_b.weight".into(),
+            ones(&[N, K]),
+        );
+        weights.insert(
+            "language_model.model.layers.0.input_layernorm.weight".into(),
+            ones(&[K]),
+        );
+        // Layer 1 — full attention → exercises AWQ Group C.
+        weights.insert(
+            "language_model.model.layers.1.self_attn.q_proj.weight".into(),
+            ones(&[N, K]),
+        );
+        weights.insert(
+            "language_model.model.layers.1.self_attn.k_proj.weight".into(),
+            ones(&[N, K]),
+        );
+        weights.insert(
+            "language_model.model.layers.1.self_attn.v_proj.weight".into(),
+            ones(&[N, K]),
+        );
+        weights.insert(
+            "language_model.model.layers.1.input_layernorm.weight".into(),
+            ones(&[K]),
+        );
+
+        // imatrix keyed with canonical `model.layers.*` names (no
+        // `language_model.`), exactly as gguf_name_to_hf emits them from a
+        // `blk.N.*` imatrix GGUF.
+        let importance: HashMap<String, Vec<f32>> = [
+            (
+                "model.layers.0.linear_attn.in_proj_qkv.weight",
+                vec![1.0, 2.0, 3.0, 4.0],
+            ),
+            (
+                "model.layers.0.linear_attn.in_proj_z.weight",
+                vec![4.0, 3.0, 2.0, 1.0],
+            ),
+            (
+                "model.layers.1.self_attn.q_proj.weight",
+                vec![1.0, 2.0, 3.0, 4.0],
+            ),
+            (
+                "model.layers.1.self_attn.k_proj.weight",
+                vec![2.0, 2.0, 2.0, 2.0],
+            ),
+            (
+                "model.layers.1.self_attn.v_proj.weight",
+                vec![4.0, 3.0, 2.0, 1.0],
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let imatrix = ImatrixData {
+            importance,
+            chunk_count: 1,
+            chunk_size: 1,
+        };
+
+        let modified = apply_awq_prescaling(&mut weights, &imatrix, 0.5, 2).expect("awq");
+
+        // Group D (qkv + z + a + b + norm = 5) on layer 0, Group C (q + k + v +
+        // norm = 4) on layer 1. Before the prefix-decoupling fix this was 0
+        // (silent no-op); before the a/b-compensation fix it was 7 (a/b skipped).
+        assert_eq!(
+            modified, 9,
+            "AWQ must fire on VLM-prefixed weights and compensate in_proj_a/in_proj_b"
+        );
+    }
+
     /// Registry-consistency gate: for the exhaustive set of supported
     /// `model_type` strings (plus a non-convertible control), the four
     /// recipe-sourced asymmetry flags must reproduce EXACTLY the
@@ -5473,9 +5626,13 @@ mod tests {
             );
 
             // sym8_supported == old sym8 allowlist (NOTE qwen3_5_moe excluded).
+            // gemma4_unified routes to Gemma4Recipe and supports sym8 like gemma4.
             assert_eq!(
                 r.sym8_supported(),
-                matches!(mt, "qwen3_5" | "lfm2" | "lfm2_moe" | "gemma4"),
+                matches!(
+                    mt,
+                    "qwen3_5" | "lfm2" | "lfm2_moe" | "gemma4" | "gemma4_unified"
+                ),
                 "{mt}: sym8_supported mismatch vs inline sym8 allowlist"
             );
 
@@ -5615,6 +5772,103 @@ mod tests {
                 "language_model.model.layers.0.mlp.experts.switch_glu.down_proj.weight"
             ),
             "down_proj must be renamed to switch_glu.down_proj.weight"
+        );
+    }
+
+    /// The encoder-free `gemma4_unified` loader installs `vision_embedder.*` as
+    /// dense bf16 only (`apply_unified_vision_embedder_weights`, no `.scales`
+    /// branch), so `should_quantize` must refuse it under any wrapper depth or
+    /// the quantized checkpoint corrupts the unified vision path. The sibling
+    /// `embed_vision.embedding_projection` DOES have an affine loader branch and
+    /// must keep quantizing — this pins the exclusion to `vision_embedder` only.
+    #[test]
+    fn should_quantize_excludes_unified_vision_embedder() {
+        // vision_embedder patch projection → never quantized (bf16-only loader).
+        assert!(!should_quantize(
+            "language_model.model.vision_embedder.patch_dense.weight",
+            false
+        ));
+        assert!(!should_quantize(
+            "vision_embedder.patch_dense.weight",
+            false
+        ));
+
+        // Positive controls: ordinary text MLP weight quantizes, and the
+        // affine-loadable embed_vision projection must NOT be caught by the
+        // exclusion (guards against an over-broad `vision` substring match).
+        assert!(should_quantize(
+            "language_model.model.layers.0.mlp.gate_proj.weight",
+            false
+        ));
+        assert!(should_quantize(
+            "embed_vision.embedding_projection.weight",
+            false
+        ));
+    }
+
+    /// `gemma4_unified` must be a first-class convertible model_type: it resolves
+    /// to a recipe (the shared `Gemma4Recipe`) and appears in the registry's
+    /// single source of truth. Explicit guard alongside the registry-consistency
+    /// test in `recipe_registry_reproduces_inline_flags`.
+    #[test]
+    fn gemma4_unified_is_convertible() {
+        assert!(recipe::recipe_for("gemma4_unified").is_some());
+        assert!(recipe::CONVERTIBLE_MODEL_TYPES.contains(&"gemma4_unified"));
+        // Routes to the same recipe family as gemma4, and self-declares coverage.
+        assert!(
+            recipe::recipe_for("gemma4_unified")
+                .unwrap()
+                .model_types()
+                .contains(&"gemma4_unified")
+        );
+    }
+
+    /// `vision_embedder.*` must be written at its BARE key (sibling of
+    /// `embed_vision.*`), not mis-prefixed under `language_model.model.`. The
+    /// loader installs it from the bare key; the multimodal-keep block in
+    /// `Gemma4Recipe::sanitize` must route it there instead of falling through to
+    /// the text re-prefix step.
+    #[test]
+    fn gemma4_recipe_sanitize_keeps_vision_embedder_bare() {
+        let f32 = |numel: usize, shape: &[i64]| {
+            MxArray::from_float32(&vec![1.0f32; numel], shape).expect("from_float32")
+        };
+
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+        weights.insert(
+            "model.vision_embedder.patch_dense.weight".into(),
+            f32(4 * 4, &[4, 4]),
+        );
+        weights.insert(
+            "model.vision_embedder.pos_embedding".into(),
+            f32(4 * 4, &[4, 4]),
+        );
+
+        let out = recipe::Gemma4Recipe
+            .sanitize(
+                weights,
+                &serde_json::json!({}),
+                "bfloat16",
+                /* tie_word_embeddings */ true,
+                /* verbose */ false,
+            )
+            .expect("gemma4 sanitize");
+
+        assert!(
+            out.contains_key("vision_embedder.patch_dense.weight"),
+            "vision_embedder.patch_dense.weight must be kept bare; got {:?}",
+            out.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            out.contains_key("vision_embedder.pos_embedding"),
+            "vision_embedder.pos_embedding must be kept bare; got {:?}",
+            out.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !out.keys()
+                .any(|k| k.contains("language_model.model.vision_embedder")),
+            "vision_embedder must NOT be re-prefixed under language_model.model.; got {:?}",
+            out.keys().collect::<Vec<_>>()
         );
     }
 

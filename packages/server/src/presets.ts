@@ -18,6 +18,14 @@ import type { ChatConfig } from '@mlx-node/core';
  *
  * All modes pin `top_k = 20` and `min_p = 0.0`; they differ in
  * `temperature`, `top_p`, and `presence_penalty`.
+ *
+ * The native anti-repetition cutoff is now disabled by default
+ * (vLLM-aligned — vLLM ships no repetition-stop heuristic), so these
+ * presets no longer pin `maxConsecutiveTokens` / `maxNgramRepeats` /
+ * `ngramSize`. Repetition is shaped by the sampling penalties above and
+ * bounded by the per-model `maxOutputTokens`. An operator or client can
+ * still opt in by setting those fields explicitly — a per-request config
+ * value wins via `ChatSession.mergeConfig`.
  */
 export const QWEN_SAMPLING_DEFAULTS = {
   /** Thinking mode for precise coding tasks: temp=0.6, top_p=0.95, pp=0.0 */
