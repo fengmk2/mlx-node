@@ -3,6 +3,74 @@
 Install the signed DMG from [GitHub Releases](https://github.com/mlx-node/mlx-node/releases)
 by dragging mlx-node to Applications. The app requires Apple Silicon and macOS 26 or newer.
 
+## Coding Agents
+
+Open **Coding Agents** in the control panel to let other agents delegate GitHub
+work to `mlx delegate github`. The app includes the CLI and runs it with Electron's
+bundled Node runtime; users do not need npm or a separate Node installation. At
+launch it creates `~/.mlx-node/bin/mlx`, verifies delegation support, and repairs
+its target after the app moves or updates. It never overwrites a foreign command
+at that location or changes shell startup files or an existing global `mlx`.
+
+Setup writes the launcher's quoted absolute path into the routing prompt, so
+coding agents can invoke it regardless of their terminal/editor `PATH`. The
+launcher executes in the caller's process tree and preserves its permissions.
+Authenticate the [GitHub CLI](https://cli.github.com/) before delegating GitHub work.
+
+Successful command checks persist in `~/.mlx-node/cli-verification.json` across
+app restarts. Unchanged runtime files use a cheap metadata check; changed metadata
+triggers a content hash, and only different content or permissions require another
+command probe. Failed probes remain retryable. The cache stores hashes in an
+owner-only file and never skips checking that the launcher and runtime still exist.
+
+`mlx delegate` uses the same prompt-and-exit runtime as `mlx agent --print`,
+including its model settings, inference cache, metrics, and saved sessions.
+It has a focused worker prompt, read/bash tools, and inherits Codex's process
+permissions when launched by Codex. Permission or authentication blockers return
+a handoff without recursive subagents. Delegated sessions appear on **Sessions**. The CLI owns its model
+process; the desktop inference service is used separately for installation checks.
+
+The page uses the installed default local model to read the listed global
+instruction file and recognize active delegation instructions, including manual
+wording. **Install…** appends a short plain-text instruction, preserves existing
+content, and verifies it with that model. No markers are added. Without an
+installed local model, checks and installation are disabled and the page links
+to **Models**. Start a new coding-agent session after setup.
+
+Opening the page never starts inference. **Check status** checks only new or
+changed nonempty files; missing and empty files are recognized without loading
+the model. Checks run sequentially, with **Waiting…** shown for queued rows.
+The Installed menu offers **Recheck with model** to bypass a cached result.
+
+Semantic results persist in the owner-only `~/.mlx-node/coding-agents.json` file,
+keyed by the instruction content, path, selected model, app command and detection prompt.
+Only hashes, verdicts and check times are stored there, not instruction text.
+Both installed and not-installed results survive restarts and identical file rewrites.
+Active checks poll in-memory status. Idle pages refresh metadata every 30 seconds
+and when focused; model discovery for this page skips recursive directory sizing.
+
+Supported native global files:
+
+| Agent       | File                                                                              |
+| ----------- | --------------------------------------------------------------------------------- |
+| Claude Code | `~/.claude/CLAUDE.md` (`CLAUDE_CONFIG_DIR` supported)                             |
+| Codex       | `~/.codex/AGENTS.md`, or a nonempty `AGENTS.override.md` (`CODEX_HOME` supported) |
+| Grok        | `~/.grok/AGENTS.md` (`GROK_HOME` supported)                                       |
+
+**Installed** requires both a working app command and a model-verified prompt
+that uses it. Older prompts using bare `mlx` show **Update…**; the exact previous
+template is upgraded in place without duplicate instructions. Custom wording is
+preserved, with the current routing instruction appended when needed. If command
+setup fails, the page shows the reason and **Retry setup**; it cannot install or
+report a working integration until the command is available. Project
+instructions, imported files and Grok's optional Claude compatibility sources
+are outside this check. Grok may already read a Claude installation through that
+compatibility layer; in that case a second native installation is unnecessary.
+See [Grok's instruction discovery rules](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/12-project-rules.md).
+
+Instruction contents stay on this Mac. The control panel requests inference
+credentials over a private process channel; credentials never reach the page.
+
 ## Updates
 
 Signed stable builds check for updates at launch and every six hours. Updates download

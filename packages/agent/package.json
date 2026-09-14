@@ -22,9 +22,21 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
+    "./delegate": {
+      "types": "./dist/delegate.d.ts",
+      "default": "./dist/delegate.js"
+    },
     "./catalog": {
       "types": "./dist/catalog.d.ts",
       "default": "./dist/catalog.js"
+    },
+    "./paths": {
+      "types": "./dist/paths.d.ts",
+      "default": "./dist/paths.js"
+    },
+    "./models": {
+      "types": "./dist/provider/models.d.ts",
+      "default": "./dist/provider/models.js"
     }
   },
   "scripts": {

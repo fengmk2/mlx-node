@@ -526,15 +526,35 @@ describe('makeMlxStreamSimple', () => {
     expect(session.configSeen?.tools).toBeUndefined();
   });
 
+  it('forwards an explicit CLI thinking cap on each model turn', async () => {
+    const session = new FakeChatSession([
+      async function* () {
+        yield finalEvent();
+      },
+    ]);
+    const streamSimple = makeMlxStreamSimple(
+      makeFakeHost(session),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      () => 2,
+    );
+    await collect(streamSimple(MODEL, CONTEXT, { reasoning: 'low' }));
+    expect(session.configSeen?.reasoningEffort).toBe('low');
+    expect(session.configSeen?.thinkingTokenBudget).toBe(2);
+  });
+
   it('persists the resolved native thinking mode for exact history replay', async () => {
     const cases = [
       [undefined, 'none', false],
-      ['minimal', 'low', false],
-      ['low', 'low', false],
+      ['minimal', 'low', true],
+      ['low', 'low', true],
       ['medium', 'medium', true],
       ['high', 'high', true],
-      ['xhigh', 'high', true],
-      ['max', 'high', true],
+      ['xhigh', 'xhigh', true],
+      ['max', 'max', true],
     ] as const;
 
     for (const [reasoning, expectedEffort, expectedEnabled] of cases) {
@@ -1292,7 +1312,9 @@ describe('makeMlxStreamSimple', () => {
       },
     ]);
     let currentRoot = 'root-0';
-    const streamSimple = makeMlxStreamSimple(makeFakeHost(session), undefined, () => currentRoot);
+    const host = makeFakeHost(session);
+    const acquire = vi.spyOn(host, 'runWithResident');
+    const streamSimple = makeMlxStreamSimple(host, undefined, () => currentRoot);
 
     const first = collect(streamSimple(MODEL, CONTEXT, { sessionId: 'root-0' }));
     await firstStartedPromise;
@@ -1303,6 +1325,7 @@ describe('makeMlxStreamSimple', () => {
     await Promise.all([first, second]);
 
     expect(seenRoots).toEqual(['root-0', 'root-1']);
+    expect(acquire.mock.calls.map((call) => call[2])).toEqual(['root-0', 'child-1']);
   });
 
   it('attributes a completed turn to the root it was SUBMITTED under, not a root that switched mid-flight (Finding 8)', async () => {

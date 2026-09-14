@@ -33,6 +33,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
 import type { ApiContext } from '../src/api/context.js';
 import { dispatch, isApiPath } from '../src/api/dispatch.js';
+import { CodingAgentsService } from '../src/coding-agents.js';
 import { openDashboardDb } from '../src/db/open.js';
 import { DownloadsClosedError } from '../src/download.js';
 import { TRACE_RETENTION_DAYS } from '../src/ingest/traces.js';
@@ -47,6 +48,22 @@ const FIXTURE_SESSIONS = fileURLToPath(new URL('./fixtures/sessions', import.met
 const FIXTURE_TRACES = fileURLToPath(new URL('./fixtures/traces', import.meta.url));
 
 const MODEL_CONFIG = JSON.stringify({ model_type: 'qwen3', max_position_embeddings: 40960 });
+
+function ggufHeader(architecture: string): Buffer {
+  const string = (text: string): Buffer => {
+    const bytes = Buffer.from(text);
+    const length = Buffer.alloc(8);
+    length.writeBigUInt64LE(BigInt(bytes.length));
+    return Buffer.concat([length, bytes]);
+  };
+  const header = Buffer.alloc(24);
+  header.write('GGUF');
+  header.writeUInt32LE(3, 4);
+  header.writeBigUInt64LE(1n, 16);
+  const stringType = Buffer.alloc(4);
+  stringType.writeUInt32LE(8);
+  return Buffer.concat([header, string('general.architecture'), stringType, string(architecture)]);
+}
 
 /** 64-char lowercase-hex cold-cache block filename. */
 function hexBlock(index: number): string {
@@ -100,6 +117,107 @@ afterEach(async () => {
 });
 
 describe('dashboard api — models & catalog', () => {
+  it.each(
+    ['qwen35', 'gemma4', 'muse-glimmer'].flatMap((family) =>
+      ['top-level', 'nested'].map((layout) => ({ family, layout })),
+    ),
+  )('keeps the persisted $layout $family GGUF default available for setup', async ({ family, layout }) => {
+    rmSync(join(modelsDir, 'model-a'), { recursive: true });
+    const repo = layout === 'top-level' ? modelsDir : join(modelsDir, 'downloaded-repo');
+    mkdirSync(repo, { recursive: true });
+    if (family !== 'qwen35' || layout === 'nested') {
+      writeFileSync(
+        join(repo, 'config.json'),
+        JSON.stringify({ model_type: family === 'qwen35' ? 'qwen3_5' : family.replace('-', '_') }),
+      );
+      writeFileSync(join(repo, 'tokenizer.json'), '{}');
+    }
+    const names = [`${family}-Q4_K_XL`, `${family}-Q6_K_XL`];
+    for (const name of [...names, `${family}-mmproj-Q4_K_XL`, `${family}-draft-Q4_K_XL`]) {
+      writeFileSync(join(repo, `${name}.gguf`), ggufHeader(family));
+    }
+    const listModels = async (): Promise<string[]> => {
+      const response = await api.fetch('/api/coding-agents/models');
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { models: { name: string }[] };
+      return body.models.map((model) => model.name);
+    };
+    expect(await listModels()).toEqual(names);
+    const home = join(base, 'home');
+    mkdirSync(join(home, '.mlx-node', 'agent'), { recursive: true });
+    writeFileSync(
+      join(home, '.mlx-node', 'agent', 'settings.json'),
+      JSON.stringify({ defaultProvider: 'mlx', defaultModel: names[1] }),
+    );
+    const service = new CodingAgentsService({
+      prepareCommand: async () => join(home, '.mlx-node', 'bin', 'mlx'),
+      home,
+      env: {},
+      listModels,
+      connect: async () => {
+        throw new Error('Discovery must not start inference');
+      },
+    });
+    try {
+      expect(await service.state()).toMatchObject({ model: names[1], available: true, unavailableReason: null });
+      expect(await service.start('detect')).toMatchObject({ available: true });
+    } finally {
+      await service.close();
+    }
+  });
+
+  it.each(['qwen3_5', 'muse_glimmer'])('keeps a %s weights.safetensors default available for setup', async (family) => {
+    const name = 'native-saved-model';
+    const dir = join(modelsDir, name);
+    mkdirSync(dir);
+    writeFileSync(join(dir, 'config.json'), JSON.stringify({ model_type: family }));
+    writeFileSync(join(dir, 'tokenizer.json'), '{}');
+    writeFileSync(join(dir, 'weights.safetensors'), Buffer.alloc(128));
+    const listModels = async (): Promise<string[]> => {
+      const response = await api.fetch('/api/coding-agents/models');
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { models: { name: string }[] };
+      return body.models.map((model) => model.name);
+    };
+    expect(await listModels()).toContain(name);
+    const home = join(base, 'native-home');
+    mkdirSync(join(home, '.mlx-node', 'agent'), { recursive: true });
+    writeFileSync(
+      join(home, '.mlx-node', 'agent', 'settings.json'),
+      JSON.stringify({ defaultProvider: 'mlx', defaultModel: name }),
+    );
+    const service = new CodingAgentsService({
+      home,
+      env: {},
+      listModels,
+      prepareCommand: async () => join(home, '.mlx-node', 'bin', 'mlx'),
+      connect: async () => {
+        throw new Error('Discovery must not start inference');
+      },
+    });
+    try {
+      expect(await service.state()).toMatchObject({ model: name, available: true, unavailableReason: null });
+      expect(await service.start('detect')).toMatchObject({ available: true });
+    } finally {
+      await service.close();
+    }
+  });
+
+  it('only offers complete generative models for local prompt detection', async () => {
+    for (const [name, type, weights] of [
+      ['partial', 'qwen3', false],
+      ['embedding', 'harrier', true],
+      ['unknown', 'unsupported-type', true],
+    ] as const) {
+      mkdirSync(join(modelsDir, name));
+      writeFileSync(join(modelsDir, name, 'config.json'), JSON.stringify({ model_type: type }));
+      if (weights) writeFileSync(join(modelsDir, name, 'model.safetensors'), Buffer.alloc(2048));
+    }
+    const response = await api.fetch('/api/coding-agents/models');
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ models: [{ name: 'model-a' }] });
+  });
+
   it('returns draft weights separately and allows their deletion without deleting the target', async () => {
     const name = 'qwen3.8-27b-dflash2';
     const config = JSON.stringify({ model_type: 'qwen3', architectures: ['DFlash2DraftModel'] });

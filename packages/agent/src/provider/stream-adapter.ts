@@ -67,7 +67,11 @@ export interface StreamSimpleHost {
    * `fn` receives a `resident` boolean: `true` when the model was already warm
    * (reused), `false` when this turn had to load/swap it.
    */
-  runWithResident<T>(modelId: string, fn: (session: ChatSession, resident: boolean) => Promise<T>): Promise<T>;
+  runWithResident<T>(
+    modelId: string,
+    fn: (session: ChatSession, resident: boolean) => Promise<T>,
+    ownerId?: string,
+  ): Promise<T>;
   /** Flag the resident as post-error so the next turn does a full reset (see `MlxModelHost`). */
   markResidentDirty(modelId: string): void;
   /** Read-and-clear the resident's post-error flag; `true` ⇒ full-reset this turn. */
@@ -218,9 +222,11 @@ export function makeMlxStreamSimple(
   onTurnRecord?: TurnRecorder,
   onTurnStart?: () => void,
   resolveRootSessionFile?: RootSessionFileResolver,
+  resolveThinkingBudget?: () => number | undefined,
 ): (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => AssistantMessageEventStream {
   return (model, context, options) => {
     const stream = createAssistantMessageEventStream();
+    let thinkingTokenBudget: number | undefined;
 
     /**
      * Exactly-one-terminal guard for the WHOLE turn. `TurnEmitter` has its
@@ -309,7 +315,8 @@ export function makeMlxStreamSimple(
       rootSessionFile = resolveRootSessionFile?.();
       // Snapshot once: the native config and the replay provenance must describe
       // the same resolved template mode. Presence alone is wrong for Pi's
-      // minimal/low levels, both of which resolve to disabled thinking.
+      // off is disabled; low remains enabled thinking.
+      thinkingTokenBudget = resolveThinkingBudget?.();
       resolvedReasoning = resolveReasoningMode(options?.reasoning);
       emitter = new TurnEmitter(stream, model, onPerformance, resolvedReasoning.thinkingEnabled);
     } catch (err) {
@@ -340,7 +347,7 @@ export function makeMlxStreamSimple(
       // prefill + decode) so a MetricsTrace record can report wall-clock
       // duration. Read at the terminal only on the success path below.
       const turnStartedAt = Date.now();
-      await host.runWithResident(model.id, async (session, resident) => {
+      const runTurn = async (session: ChatSession, resident: boolean): Promise<void> => {
         // Callback entry: the queue wait + any cold model load/swap have now
         // resolved, but no native work (prime/prefill/decode) has started. This
         // is the seam that separates queue+load latency from execution time —
@@ -400,6 +407,7 @@ export function makeMlxStreamSimple(
             rootCacheOwnerId,
             resolvedReasoning,
             configuredModelMaxTokens,
+            thinkingTokenBudget,
           );
           for await (const event of session.startFromHistoryStream(config, signal)) {
             if (event.done) {
@@ -487,7 +495,8 @@ export function makeMlxStreamSimple(
           }
           throw err;
         }
-      });
+      };
+      await host.runWithResident(model.id, runTurn, options?.sessionId);
       if (!terminated && !sawNativeFinal) {
         // An aborted native stream ends cleanly with NO final event; any
         // other final-less ending is a native-protocol violation.

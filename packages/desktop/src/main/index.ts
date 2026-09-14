@@ -23,6 +23,7 @@ import { engineEnvFor, LAUNCHER_ENGINE_POLICY } from '@mlx-node/server/host/env-
 import { app, autoUpdater, clipboard, Menu, screen, type MenuItemConstructorOptions, type WebContents } from 'electron';
 import electronUpdater from 'electron-updater';
 
+import { createCliLauncher, type DesktopCliConfig } from '../cli-launcher.js';
 import { DESKTOP_QUIT_DEADLINE_MS } from '../control-panel/shutdown-timings.js';
 import { createControlPanelBroker, type ControlPanelBroker } from './broker.js';
 import { controlPanelEnvOverrides, sidecarEnvOverrides } from './child-env.js';
@@ -282,10 +283,34 @@ async function bootstrap(): Promise<void> {
     }
   });
 
+  const cliConfig: DesktopCliConfig = {
+    executable: process.execPath,
+    entry: paths.cliEntry,
+    nativeAddon: paths.nativeAddon,
+    modelsDir: settings.modelsDir,
+  };
+  // Failure is surfaced on Coding Agents; command setup must not stop the app.
+  void createCliLauncher(cliConfig)
+    .prepare()
+    .catch((error: unknown) => console.error('[mlx] command setup:', error));
+
   broker = createControlPanelBroker<WebContents>({
     ...electronBrokerDeps({
+      getInferenceConnection: async () => {
+        if (!supervisor || quitting) throw new Error('The local model service is unavailable.');
+        await supervisor.start();
+        const info = await supervisor.request<{ boundModel: string }>({ op: 'info' });
+        const url = supervisor.snapshot().url;
+        const token = supervisor.connectionToken();
+        if (!url || !token) throw new Error('The local model service is unavailable.');
+        return { url, token, model: info.boundModel };
+      },
       entry: paths.controlPanelEntry,
-      env: { ...process.env, ...controlPanelEnvOverrides({ modelsDir: settings.modelsDir }) } as Record<string, string>,
+      env: {
+        ...process.env,
+        ...controlPanelEnvOverrides({ modelsDir: settings.modelsDir }),
+        MLX_DESKTOP_CLI: JSON.stringify(cliConfig),
+      } as Record<string, string>,
       onLog: (stream, line) => {
         if (stream === 'stderr') console.error(`[mlx] control panel: ${line}`);
       },

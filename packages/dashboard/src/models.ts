@@ -145,6 +145,7 @@ export function isModelPresent(modelDir: string): boolean {
   // the card AND short-circuits a re-download to `done` — self-locking, with the
   // "needs cleanup" notice suppressed because `present` short-circuits it.
   if (isRegularFile(join(modelDir, 'model.safetensors'))) return true;
+  if (isRegularFile(join(modelDir, 'weights.safetensors'))) return true;
   if (isRegularFile(join(modelDir, 'inference.pdiparams'))) return true;
   if (entries.some((file) => file.endsWith('.gguf') && isRegularFile(join(modelDir, file)))) return true;
   // Sharded safetensors: every shard the index references must exist on disk —
@@ -330,7 +331,7 @@ function readMarkerFile(dir: string): unknown {
  * byte size". A no-follow test here would call a symlinked weight missing and hide
  * a checkpoint that loads perfectly, which is the regression this shape avoids.
  */
-function isRegularFile(path: string): boolean {
+export function isRegularFile(path: string): boolean {
   try {
     return statSync(path).isFile();
   } catch {
@@ -606,7 +607,10 @@ export function walkDirStats(
  * results with no warning. Draft-only checkpoints have a separate inventory
  * for storage accounting and deletion, never contributing to model counts.
  */
-export function discoverLocalModels(modelsDir: string): {
+export function discoverLocalModels(
+  modelsDir: string,
+  options: { includeStats?: boolean } = {},
+): {
   models: LocalModel[];
   companions: LocalCompanion[];
   warnings: string[];
@@ -652,7 +656,8 @@ export function discoverLocalModels(modelsDir: string): {
       continue;
     }
 
-    const { sizeBytes, fileCount, truncated } = walkDirStats(full);
+    const { sizeBytes, fileCount, truncated } =
+      options.includeStats === false ? { sizeBytes: 0, fileCount: 0, truncated: false } : walkDirStats(full);
     if (truncated) {
       warnings.push(`${entry.name}: directory too large to size fully; reported size is a lower bound`);
     }

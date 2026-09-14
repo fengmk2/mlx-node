@@ -41,6 +41,7 @@ import {
   isNonRuntimeFile,
   pruneExcludedNested,
   runtimeClosure,
+  scopeCoreNativeOverride,
   stageApp,
   stageRuntimeBuildFiles,
 } from '../scripts/stage-app.js';
@@ -75,9 +76,15 @@ describe('runtime build assets', () => {
   });
 });
 
-// The same roots packaging uses: what the three entries import, not what
-// packages/desktop/package.json happens to declare.
+// Dashboard-only roots exercise metadata-only pruning. Production packaging
+// adds @mlx-node/cli; the first closure test below covers that superset.
 const ROOTS = ['@mlx-node/dashboard', '@mlx-node/server', '@mlx-node/lm', 'electron-updater'];
+
+it('rejects a changed generated core loader instead of silently shipping a broken override', () => {
+  expect(() => scopeCoreNativeOverride('module.exports = require("./native.node")')).toThrow(
+    'Unrecognized core native binding override',
+  );
+});
 
 describe('packaged update eligibility', () => {
   it.each([undefined, false, true])('enables updates only when the packager explicitly signs: %s', (autoUpdates) => {
@@ -105,6 +112,14 @@ describe('packaged update eligibility', () => {
 });
 
 describe('runtimeClosure', () => {
+  it('keeps the complete CLI runtime, including lazy providers used by agent options', () => {
+    const cli = runtimeClosure(repoRoot, [...ROOTS, '@mlx-node/cli']);
+    expect(cli.workspace).toContain('@mlx-node/cli');
+    expect(cli.workspace).toContain('@mlx-node/agent');
+    expect(cli.external).toContain('@earendil-works/pi-coding-agent');
+    expect(cli.external).toContain('openai');
+    expect(cli.excludedProviderSdk).toEqual([]);
+  });
   const closure = runtimeClosure(repoRoot, ROOTS);
 
   it('reaches the workspace packages the app actually runs', () => {
