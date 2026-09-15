@@ -1,9 +1,73 @@
-import { resolve, dirname } from 'node:path';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import type { Plugin } from 'vite';
 import { defineConfig } from 'vite-plus';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+/** Condition a workspace package declares for its own TypeScript source. */
+const SOURCE_CONDITION = '@mlx-node/source';
+
+/**
+ * Resolve `@mlx-node/*` specifiers to the TypeScript source each package declares,
+ * so a dev server and the test run exercise `src` while `tsc`, `oxnode` and
+ * published consumers keep reading `dist`.
+ *
+ * The mapping is not a list: it is read from each package's own `exports` map,
+ * where a subpath and its `@mlx-node/source` target sit together, so a new subpath
+ * needs no change here. That is what replaced the hand-maintained
+ * `resolve.alias` table, whose subpath list was a second copy of `exports` that
+ * nothing validated.
+ *
+ * Deliberately not `resolve.conditions` / `ssr.resolve.conditions`: Vitest mirrors
+ * those onto its Node processes as real `--conditions` flags, which makes Node
+ * itself resolve workspace packages to TypeScript. Node can only run the
+ * TypeScript it can strip, so every Node-side load dies on the first parameter
+ * property (`packages/server/src/host/index.ts` has one) — measured on a worker
+ * thread and on the forked desktop sidecar. Keeping the mapping inside Vite
+ * leaves Node, `oxnode` and the published map untouched.
+ */
+function workspaceSource(): Plugin {
+  const packages = new Map<string, { dir: string; exports: Record<string, string | Record<string, string>> }>();
+  const packagesRoot = resolve(__dirname, 'packages');
+
+  for (const entry of readdirSync(packagesRoot)) {
+    const manifestPath = join(packagesRoot, entry, 'package.json');
+    if (!existsSync(manifestPath)) continue;
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8')) as {
+      name?: string;
+      exports?: Record<string, string | Record<string, string>>;
+    };
+    if (manifest.name === undefined || manifest.exports === undefined) continue;
+    packages.set(manifest.name, { dir: dirname(manifestPath), exports: manifest.exports });
+  }
+
+  return {
+    name: 'mlx-node:workspace-source',
+    enforce: 'pre',
+    resolveId(source) {
+      const parts = source.split('/');
+      if (parts.length < 2 || parts[0] !== '@mlx-node') return null;
+      const pkg = packages.get(`${parts[0]}/${parts[1]}`);
+      if (pkg === undefined) return null;
+      const entry = pkg.exports[parts.length > 2 ? `./${parts.slice(2).join('/')}` : '.'];
+      const target = typeof entry === 'string' ? undefined : entry?.[SOURCE_CONDITION];
+      return target === undefined ? null : resolve(pkg.dir, target);
+    },
+    // The map is built once, at config load, and these manifests are not config
+    // files: Vite restarts on a `vite.config.ts` edit but not on a package.json
+    // edit, so a watch session would keep resolving a subpath that moved, lost its
+    // source entry, or fall back to `dist` for one that is new.
+    configureServer(server) {
+      const restart = (file: string): void => {
+        if (file.startsWith(`${packagesRoot}/`) && file.endsWith('package.json')) void server.restart();
+      };
+      for (const event of ['add', 'change', 'unlink'] as const) server.watcher.on(event, restart);
+    },
+  };
+}
 
 export default defineConfig({
   fmt: {
@@ -65,33 +129,10 @@ export default defineConfig({
       'packages/*/__test__/**/*.{test,spec}.ts',
     ],
   },
+  plugins: [workspaceSource()],
   resolve: {
     alias: {
-      '@mlx-node/core': resolve(__dirname, './packages/core/index.cjs'),
-      '@mlx-node/lm/draft-companion': resolve(__dirname, './packages/lm/src/draft-companion.ts'),
-      '@mlx-node/lm/family-data': resolve(__dirname, './packages/lm/src/family-data.ts'),
-      '@mlx-node/lm/model-detection': resolve(__dirname, './packages/lm/src/model-detection.ts'),
-      '@mlx-node/lm/model-discovery': resolve(__dirname, './packages/lm/src/model-discovery.ts'),
-      '@mlx-node/lm': resolve(__dirname, './packages/lm/src/index.ts'),
-      '@mlx-node/agent/catalog': resolve(__dirname, './packages/agent/src/catalog.ts'),
-      '@mlx-node/agent/delegate': resolve(__dirname, './packages/agent/src/delegate.ts'),
-      '@mlx-node/agent/models': resolve(__dirname, './packages/agent/src/provider/models.ts'),
-      '@mlx-node/agent/paths': resolve(__dirname, './packages/agent/src/paths.ts'),
-      '@mlx-node/agent': resolve(__dirname, './packages/agent/src/index.ts'),
-      '@mlx-node/privacy': resolve(__dirname, './packages/privacy/src/index.ts'),
-      '@mlx-node/trl': resolve(__dirname, './packages/trl/src/index.ts'),
-      // Subpaths MUST precede the bare '@mlx-node/server' entry, longest
-      // first: alias matching is prefix-based and first-match-wins, so the
-      // bare key would otherwise rewrite `@mlx-node/server/host` to
-      // `.../src/index.ts/host`.
-      '@mlx-node/server/host/env-policy': resolve(__dirname, './packages/server/src/host/env-policy.ts'),
-      '@mlx-node/server/host/paths': resolve(__dirname, './packages/server/src/host/paths.ts'),
-      '@mlx-node/server/host': resolve(__dirname, './packages/server/src/host/index.ts'),
-      '@mlx-node/server': resolve(__dirname, './packages/server/src/index.ts'),
-      '@mlx-node/dashboard': resolve(__dirname, './packages/dashboard/src/index.ts'),
-      // The dashboard SPA's own `@/…` alias (packages/dashboard/ui/vite.config.ts),
-      // repeated here so a test can import a page component. Keyed with the
-      // trailing slash so it can never swallow an `@mlx-node/…` specifier.
+      // Dashboard SPA's own `@/` alias (packages/dashboard/ui), repeated for tests; no package boundary to cross.
       '@/': `${resolve(__dirname, './packages/dashboard/ui/src')}/`,
     },
   },
