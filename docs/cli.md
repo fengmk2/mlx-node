@@ -671,6 +671,54 @@ Like `mlx launch claude`, it applies the launcher engine policy (`MLX_PAGED_PREF
 
 Launches the same inference host as `mlx serve` and spawns Claude Code against it — the entry point for using MLX-Node as a Claude Code backend. Use `mlx serve` when you want the server without a Claude Code child (for example to point another client at it, or to reproduce a wedged sidecar in a terminal).
 
+## `mlx delegate`
+
+A focused local worker for bounded investigations. It shares the `mlx agent`
+model, session, cache and thinking settings, defaults to print mode, and uses
+read/bash tools without project instructions, skills or nested agents.
+
+From a regular terminal, Claude Code, Grok or another caller, approve the bounded
+task and its tool execution before passing `--caller-approved`. This also applies
+when resuming a session. After approving these read-only investigations:
+
+```bash
+mlx delegate github --caller-approved --repo owner/repo 'Inspect PR #42. Return failed checks, exact head SHA and evidence URLs.'
+mlx delegate --caller-approved --session SESSION 'Which failure applies to the current head? Return its evidence only.'
+```
+
+Supply the PR, issue or run number, the requested fields, and any query budget
+or conditional steps. For a small status check, ask for only the exact values
+or compact JSON. The worker is instructed to return an already sufficient tool
+result directly, avoid repeated facts, and skip conditional comparisons when
+the SHAs match. These are model instructions, not enforced output limits;
+requested evidence, uncertainty and incomplete work still belong in the answer.
+
+Consume the final print-mode handoff once. While waiting, check process
+completion rather than loading the worker's transcript. `--mode json` exposes
+the full event stream for debugging; returning its reasoning and raw tool
+results to the caller can erase any token savings. Resolve a specific gap with
+a focused follow-up or the relevant evidence excerpt.
+
+Codex delegates can omit `--caller-approved`: tool execution inherits the caller's
+process sandbox. The flag does not copy another coding agent's tool approval rules.
+`--allow-write` supplies authorization context for GitHub changes already
+approved in the task; neither flag grants extra sandbox access. Failed or
+incomplete work returns a handoff for the caller to continue.
+
+The dashboard labels recorded delegate invocations with a **Delegate** badge.
+Session rows show estimated tokens saved, or extra tokens when the handoff is
+larger. The detail page shows the evidence and handoff counts and their ratio.
+These compare unique successful tool-result text with the final handoff using
+the fixed `o200k_base` vocabulary through Hugging Face's native Node `tokenizers`
+binding. The vocabulary is bundled locally; measurement needs no network access.
+Repeated evidence is counted once across resumed invocations, while every
+completed handoff is counted. They exclude tool errors,
+caller invocation costs, reasoning, and transcript rereads, so they measure
+evidence compression and do not establish total coding-agent savings. Incomplete or non-text runs
+show an unavailable estimate. Older sessions without delegate metadata remain
+unclassified; titles are not used to infer their origin. An old blocked handoff can
+identify an unforked delegate session, but a fork needs its own delegate metadata.
+
 ## `mlx agent`
 
 A fully-local coding agent — MLX-Node's first all-in-one local agent. It embeds the [pi coding agent](https://www.npmjs.com/org/earendil-works) (`@earendil-works/*`) and serves every model turn through in-process `@mlx-node/lm` inference. There is no HTTP server, no external process, and no API keys: prompts, tools, and weights all stay on the machine. Requires Node.js ≥ 22.19.

@@ -1613,6 +1613,7 @@ __metadata:
     sonner: "npm:^2.0.8"
     tailwind-merge: "npm:^3.6.0"
     tailwindcss: "npm:^4.3.3"
+    tokenizers: "npm:0.23.2"
     tw-animate-css: "npm:^1.4.0"
     typescript: "npm:^7.0.2"
     vite: "catalog:"
@@ -10765,6 +10766,13 @@ __metadata:
   version: 3.7.4
   resolution: "toad-cache@npm:3.7.4"
   checksum: 10c0/4a33f9c1e9eea84d0fc019805fe346c8f69e9820f44745f65b77a282d60928c61ad851c258d74e77ad3d2651a28d3d9c8129d1e8c1647902042220f54e7dd026
+  languageName: node
+  linkType: hard
+
+"tokenizers@npm:0.23.2":
+  version: 0.23.2
+  resolution: "tokenizers@npm:0.23.2"
+  checksum: 10c0/e1946c5b564981fbe0e367ecec8d0f68e441d0e69ac35b8ae9d080114f5dc9900f5081dbda374f3e620f81ccc6ad8ab6819aa3e4909d3b6eb291b0e133a2f576
   languageName: node
   linkType: hard
 

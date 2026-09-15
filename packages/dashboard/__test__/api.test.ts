@@ -28,6 +28,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { MessageChannel } from 'node:worker_threads';
 
+import { SessionManager } from '@earendil-works/pi-coding-agent';
 import { canonicalCacheRoot, coldTierRestoreFamilyList } from '@mlx-node/agent/catalog';
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
@@ -43,6 +44,7 @@ import { serveRuntimeOverPort } from '../src/rpc/host.js';
 import { bindEventTargetPort } from '../src/rpc/port.js';
 import { createDashboardRuntime, type DashboardRuntime } from '../src/runtime.js';
 import { createTestClient, type TestClient } from './helpers/api-client.js';
+import { delegationFixture } from './helpers/delegation-fixture.js';
 
 const FIXTURE_SESSIONS = fileURLToPath(new URL('./fixtures/sessions', import.meta.url));
 const FIXTURE_TRACES = fileURLToPath(new URL('./fixtures/traces', import.meta.url));
@@ -109,6 +111,106 @@ beforeEach(() => {
     cacheRoot,
   });
   api = createTestClient(runtime);
+});
+
+it('serves delegate identity and evidence compression consistently, and withholds a live partial handoff', async () => {
+  const file = join(sessionsRoot, 'delegate.jsonl');
+  const raw =
+    delegationFixture()
+      .map((entry) => JSON.stringify(entry))
+      .join('\n') + '\n';
+  writeFileSync(file, raw);
+  await ingest();
+  const listing = (await (await api.fetch('/api/sessions')).json()) as {
+    sessions: { id: string; inputTokens: number; outputTokens: number; delegation: unknown }[];
+  };
+  const indexed = listing.sessions.find((s) => s.id === 'delegate')!;
+  expect(indexed).toMatchObject({
+    inputTokens: 2000,
+    outputTokens: 2000,
+    delegation: {
+      status: 'complete',
+      evidenceTokens: 3,
+      handoffTokens: 1,
+      savedTokens: 2,
+      savingsRatio: 2 / 3,
+    },
+  });
+  const detail = (await (await api.fetch('/api/sessions/delegate')).json()) as { session: { delegation: unknown } };
+  expect(detail.session.delegation).toEqual(indexed.delegation);
+  expect(readFileSync(file, 'utf8')).toBe(raw);
+
+  const partial =
+    raw +
+    JSON.stringify({
+      type: 'custom',
+      id: 'next',
+      parentId: 'f',
+      timestamp: '',
+      customType: 'mlx-delegate-session',
+      data: { version: 1, sessionId: 'delegate' },
+    }) +
+    '\n{"type":"message"';
+  writeFileSync(file, partial);
+  // Detail reads the new snapshot even before the periodic index refresh.
+  const live = (await (await api.fetch('/api/sessions/delegate')).json()) as { session: { delegation: unknown } };
+  expect(live.session.delegation).toEqual({ status: 'incomplete', reason: 'partial-record' });
+  expect(readFileSync(file, 'utf8')).toBe(partial);
+  await ingest();
+  const refreshed = (await (await api.fetch('/api/sessions')).json()) as {
+    sessions: { id: string; delegation: unknown }[];
+  };
+  expect(refreshed.sessions.find((s) => s.id === 'delegate')!.delegation).toEqual(live.session.delegation);
+});
+
+it('serves session-wide unique evidence and does not label a real fork of a legacy delegate', async () => {
+  const original = delegationFixture();
+  const follow = delegationFixture()
+    .slice(1)
+    .map((entry) => ({
+      ...entry,
+      id: `next-${entry.id}`,
+      parentId: entry.parentId ? `next-${entry.parentId}` : 'f',
+    }));
+  writeFileSync(
+    join(sessionsRoot, 'delegate.jsonl'),
+    [...original, ...follow].map((entry) => JSON.stringify(entry)).join('\n') + '\n',
+  );
+
+  const legacy = delegationFixture('legacy');
+  legacy.splice(1, 1);
+  legacy[1]!.parentId = null;
+  const legacyFile = join(sessionsRoot, 'legacy.jsonl');
+  legacy.push({
+    type: 'custom',
+    id: 'blocked',
+    parentId: 'f',
+    timestamp: '',
+    customType: 'mlx-delegate-handoff',
+    data: { reason: 'permission denied', sessionFile: legacyFile },
+  });
+  writeFileSync(legacyFile, legacy.map((entry) => JSON.stringify(entry)).join('\n') + '\n');
+  const fork = SessionManager.forkFrom(legacyFile, '/w', sessionsRoot);
+  expect(fork.getHeader()?.parentSession).toBe(legacyFile);
+  await ingest();
+
+  const listing = (await (await api.fetch('/api/sessions')).json()) as {
+    sessions: { id: string; delegation: unknown }[];
+  };
+  const byId = new Map(listing.sessions.map((session) => [session.id, session.delegation]));
+  expect(byId.get('delegate')).toMatchObject({
+    status: 'complete',
+    evidenceTokens: 3,
+    handoffTokens: 2,
+    savedTokens: 1,
+    savingsRatio: 1 / 3,
+  });
+  expect(byId.get('legacy')).toEqual({ status: 'unavailable', reason: 'legacy' });
+  expect(byId.get(fork.getSessionId())).toBeNull();
+  for (const id of ['delegate', 'legacy', fork.getSessionId()]) {
+    const detail = (await (await api.fetch(`/api/sessions/${id}`)).json()) as { session: { delegation: unknown } };
+    expect(detail.session.delegation).toEqual(byId.get(id));
+  }
 });
 
 afterEach(async () => {

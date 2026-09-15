@@ -5,6 +5,7 @@
   "description": "Local web dashboard for mlx-node: models, sessions, metrics, paged cache",
   "license": "MIT",
   "files": [
+    "assets",
     "dist",
     "web"
   ],
@@ -27,7 +28,8 @@
     "@huggingface/hub": "^2.16.1",
     "@mlx-node/agent": "workspace:*",
     "@mlx-node/lm": "workspace:*",
-    "drizzle-orm": "1.0.0-rc.4"
+    "drizzle-orm": "1.0.0-rc.4",
+    "tokenizers": "0.23.2"
   },
   "devDependencies": {
     "@radix-ui/react-dialog": "^1.1.23",
