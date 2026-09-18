@@ -182,8 +182,7 @@ interface ModelFamilyDataBase {
   readonly acceptsDraftModel?: true;
   /**
    * GGUF `general.architecture` values whose native `load(path)` accepts a
-   * direct GGUF file. Qwen3.5-MoE currently consumes converted directories,
-   * not direct files, so it carries none.
+   * direct GGUF file.
    */
   readonly ggufArchitectures?: readonly string[];
   /** Config markers for optimistic discovery; the loaded model is authoritative. */
@@ -321,6 +320,8 @@ export const MODEL_FAMILY_DATA = [
     id: 'qwen3_5_moe',
     visionConfigKeys: ['vision_config'],
     kind: 'trainable',
+    ggufArchitectures: ['qwen35moe'],
+    ggufDiscovery: { variants: 'qwen35-xl' },
     match: { rawModelTypes: ['qwen3_5_moe'] },
     traits: { reasoning: true, fallbackContextWindow: 262144 },
     launchPreset: {

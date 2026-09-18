@@ -2,8 +2,8 @@
  * Curated model catalog for `mlx agent`.
  *
  * The first-run download wizard offers `visibleCatalog()` and feeds the chosen
- * entry's `catalogRepo()` to `mlx download model`. Slugs are verified against the Brooooooklyn
- * HF account — use them verbatim.
+ * entry's `catalogRepo()` to `mlx download model`. Slugs are verified against
+ * Hugging Face — use them verbatim.
  */
 
 import { QWEN38_DFLASH2 } from '@mlx-node/lm/draft-companion';
@@ -11,15 +11,47 @@ import { QWEN38_DFLASH2 } from '@mlx-node/lm/draft-companion';
 export interface CatalogEntry {
   /** Wizard display name. */
   label: string;
-  /** HF slug for `mlx download model` on Apple Silicon — the MXFP4 build. */
+  /** HF slug for `mlx download model` — the UD-Q4_K_XL GGUF, every platform. */
   hfRepo: string;
   /**
-   * HF slug on Linux + NVIDIA CUDA — the NVFP4 build.
+   * HF slug on Linux + NVIDIA CUDA, when a platform-specific build exists.
    *
-   * Absent means the entry has no CUDA-specific build and {@link hfRepo}
-   * serves both. Resolve with {@link catalogRepo}, never by reading the field.
+   * Absent means {@link hfRepo} serves both — the case for every current
+   * entry: all platforms install the Unsloth UD quant from one GGUF repo.
+   * Retained for future platform-specific builds; {@link globs} and
+   * {@link assetsRepo} describe {@link hfRepo} only and never apply to an
+   * override repo. Resolve with {@link catalogRepo}, never by reading the
+   * field.
    */
   hfRepoCuda?: string;
+  /**
+   * Download file filter for multi-variant repos (GGUF), as simple `*`-wildcard
+   * globs. A file is downloaded when its basename OR its full repo path matches
+   * any glob; core metadata files (config/tokenizer) present in the repo are
+   * always included. Mirrors the `mlx download model --glob` semantics so the
+   * wizard, the dashboard downloader, and a manual CLI run select the same
+   * file set out of a repo that ships dozens of quantization variants.
+   *
+   * Applies to {@link hfRepo} only — the pre-converted CUDA repo has no
+   * quantization variants to filter.
+   */
+  globs?: string[];
+  /**
+   * Base-model HF repo supplying the tokenizer/config/processor sidecar files
+   * a GGUF repo lacks (GGUF quantization repos ship weights, no tokenizer).
+   * Applies to {@link hfRepo} only.
+   *
+   * Mandatory for correct tool calling, not a nicety: when no sidecar
+   * `tokenizer.json` sits next to the `.gguf`, the native GGUF runtime
+   * extracts the embedded tokenizer, and that extraction marks
+   * `<tool_call>`/`</tool_call>` `special: true` (the HF files mark them
+   * false) — every decode path then skips special tokens, the tool-call
+   * wrapper is stripped, and tool calling silently breaks. With the official
+   * sidecar files beside the `.gguf`, the runtime copies them into its native
+   * cache (the `GGUF_RUNTIME_ASSET_FILES` copy in
+   * `crates/mlx-core/src/utils/gguf.rs`) and skips the embedded extraction.
+   */
+  assetsRepo?: string;
   /** Approximate download size in GB, for display. */
   sizeGb: number;
   /** Optional companion, downloaded separately and never offered as a chat model. */
@@ -48,26 +80,46 @@ export interface CatalogEntry {
 
 export const MODEL_CATALOG: readonly CatalogEntry[] = [
   {
+    // The UD-Q4_K_XL file carries its MTP layer INLINE (block 64 of 65,
+    // `blk.64.nextn.*`), which the native prepare converts to `mtp.*` in the
+    // cache — hasMtpWeights() is true from the primary file alone (validated:
+    // ~4.8 tokens accepted per cycle). The repo's separate
+    // `MTP/mtp-Qwen3.8-27B-Q4_0.gguf` is deliberately NOT globbed: nothing
+    // in the runtime pairs a GGUF MTP sidecar (`mtp_sidecar_candidates` is
+    // safetensors-only), so it would be 1.28 GB of dead weight per install.
+    // The optional z-lab DFlash2 draft stays offered beside the target for
+    // checkpoints that pair with it; it is never auto-installed.
     label: 'Qwen3.8-27B',
-    hfRepo: 'Brooooooklyn/Qwen3.8-27B-MXFP4-mlx',
-    hfRepoCuda: 'Brooooooklyn/Qwen3.8-27B-NVFP4-mlx',
-    sizeGb: 23.3,
+    hfRepo: 'unsloth/Qwen3.8-27B-GGUF',
+    globs: ['*UD-Q4_K_XL*', 'config.json'],
+    assetsRepo: 'Qwen/Qwen3.8-27B',
+    sizeGb: 17.6,
     description: 'Best tool use — recommended default',
     isDefault: true,
     draft: QWEN38_DFLASH2,
   },
   {
     label: 'Qwen-AgentWorld-35B-A3B',
-    hfRepo: 'Brooooooklyn/Qwen-AgentWorld-35B-A3B-mxfp4-mlx',
-    hfRepoCuda: 'Brooooooklyn/Qwen-AgentWorld-35B-A3B-nvfp4-mlx',
-    sizeGb: 23.3,
+    hfRepo: 'unsloth/Qwen-AgentWorld-35B-A3B-GGUF',
+    globs: ['*UD-Q4_K_XL*'],
+    assetsRepo: 'Qwen/Qwen-AgentWorld-35B-A3B',
+    sizeGb: 22.3,
     description: 'Agent-tuned MoE, fast decode',
   },
   {
+    // `mmproj-BF16.gguf` is the SigLIP vision tower — the gemma4v projector
+    // importer converts it to `vision.safetensors` during native prepare, so
+    // this entry supports images. The repo's `mtp-*.gguf` files are
+    // deliberately NOT globbed — mlx-node's Gemma speculative decode is the
+    // DSpark draft path, nothing pairs those llama.cpp MTP artifacts, and
+    // they would add ~2.5 GB of dead weight per install.
     label: 'Gemma-4-26B-A4B',
-    hfRepo: 'Brooooooklyn/Gemma-4-26B-A4B-Unsloth-MXFP4-mlx',
-    hfRepoCuda: 'Brooooooklyn/Gemma-4-26B-A4B-Unsloth-NVFP4-mlx',
-    sizeGb: 16.2,
+    hfRepo: 'unsloth/gemma-4-26B-A4B-it-GGUF',
+    globs: ['*UD-Q4_K_XL*', 'mmproj-BF16.gguf', 'config.json'],
+    // The license-gated google/gemma-4-26B-A4B-it would 401 for most users;
+    // unsloth's mirror ships the same tokenizer/config files ungated.
+    assetsRepo: 'unsloth/gemma-4-26B-A4B-it',
+    sizeGb: 18.2,
     description: 'MoE, fast decode',
   },
   {
@@ -107,6 +159,26 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
   },
 ];
 
+/**
+ * Every repo whose upstream revision participates in update discovery: the
+ * visible target repos and their companions, plus the `assetsRepo` each entry
+ * sources its tokenizer sidecars from.
+ *
+ * The download allowlist ({@link catalogDownloadRepos}) is deliberately
+ * narrower — sidecars are fetched INSIDE a job, never started as one — but a
+ * tokenizer or chat-template fix in the base model is an update a user must be
+ * able to see. Without these, a sidecar-only upstream change raises no badge,
+ * the update endpoint never reports it, and the UI's Installed button stays
+ * disabled: the repair path is unreachable by design.
+ */
+export function catalogUpdateRepos(): string[] {
+  const repos = new Set(catalogDownloadRepos());
+  for (const entry of MODEL_CATALOG) {
+    if (!entry.hidden && entry.assetsRepo !== undefined) repos.add(entry.assetsRepo);
+  }
+  return [...repos];
+}
+
 /** Visible target repos plus their optional companion downloads. */
 export function catalogDownloadRepos(): string[] {
   return [
@@ -119,36 +191,51 @@ export function catalogDownloadRepos(): string[] {
 }
 
 /**
- * The repo THIS platform installs for `entry`. Linux is the CUDA preview
- * target (README "Platform Support"); everything else is Apple Silicon.
+ * The repo THIS platform installs for `entry`.
  *
- * NOT because Metal cannot run NVFP4 — it can. MLX ships the same 234
- * quantized Metal kernels for `nvfp4` as for `mxfp4`, NAX variants included,
- * and only `fp8_e4m3` reconstructs BF16 at load. The MSL 4.1 hardware
- * block-scale format (`metal_fp8_ue8m0_format`) appears nowhere in MLX's Metal
- * backend, so it constrains neither format here.
+ * All platforms take the Unsloth UD-Q4_K_XL GGUF: Unsloth Dynamic quants
+ * keep embeddings and `lm_head` at high precision, which measured as the best
+ * output quality AND 1.44× decode over MXFP4 on Qwen3.8-27B with MTP — with
+ * smaller downloads on top — and ggml K-quants are losslessly repacked into
+ * MLX layout at first load, so the GGUF is as native as a pre-converted
+ * safetensors repo once cached. GGUF quantization repos ship no tokenizer
+ * files, so each entry pairs its repo with {@link CatalogEntry.assetsRepo}
+ * sidecars — required for correct tool calling (see that field's comment).
  *
- * The split is:
- * - CUDA takes NVFP4 through `CublasQQMM` (`nvfp4` -> `CUDA_R_4F_E2M1`), a
- *   native path with no MXFP4 equivalent.
- * - Metal has no such native-path advantage either way, so prefer the format
- *   that survives quantization better. NVFP4 stores a block scale as `amax/6`
- *   in E4M3, and real FFN blocks land in its subnormal band;
- *   `apply_nvfp4_pow2_lift` repairs that for dense SwiGLU FFNs but SKIPS MoE
- *   experts by design (`NVFP4_LIFT_MOE_MARKERS`, `crates/mlx-core/src/
- *   convert.rs`), because the norm there also drives the router and the
- *   shared-expert gate, neither scale-invariant. Two of the three visible
- *   entries are MoE. MXFP4's E8M0 block scales have no such failure.
- *
- * Unmeasured: whether nvfp4 or mxfp4 decodes faster on Metal. The choice above
- * is made on quantization quality, not throughput.
+ * CUDA caveat, measured not assumed: the native import repacks K-quants into
+ * the `q4k`/`q5k`/`q6k` modes, and the CUDA backend's `QuantizedMatmul`,
+ * `GatherQMM`, and dequantize currently throw
+ * `"Quantization mode … is not implemented on the CUDA backend"`
+ * (`reject_kquant`, `crates/mlx-sys/mlx/mlx/backend/cuda/quantized/
+ * quantized.cpp`). Linux inference on these checkpoints therefore waits on
+ * CUDA K-quant kernels; the DGX Spark PoC instead converted its GGUF with the
+ * NVIDIA recipes (see README "CUDA preview"), which produce CUDA-executable
+ * affine/NVFP4 layouts.
  *
  * Every consumer that turns a catalog entry into a download, a slug, or an
  * allowlist check must go through here. Reading `entry.hfRepo` directly
- * installs the macOS build on a CUDA box.
+ * installs the macOS build on a CUDA box the day a CUDA build returns.
  */
 export function catalogRepo(entry: CatalogEntry): string {
   return catalogRepoFor(entry, process.platform);
+}
+
+/**
+ * The file-selection fields that apply to `repo` when it is `entry`'s GGUF
+ * repo: {@link CatalogEntry.globs} and {@link CatalogEntry.assetsRepo}.
+ *
+ * Both describe the multi-variant GGUF artifact only. A platform-specific
+ * override repo (the pre-converted CUDA build) is a plain safetensors layout:
+ * globbing it would filter out every weight, and its config/tokenizer files
+ * are its own. Consumers must resolve selection through here rather than
+ * reading the entry fields directly.
+ */
+export function catalogSelectionForRepo(
+  entry: CatalogEntry,
+  repo: string,
+): { globs?: readonly string[]; assetsRepo?: string } {
+  if (repo !== entry.hfRepo) return {};
+  return { globs: entry.globs, assetsRepo: entry.assetsRepo };
 }
 
 /**
@@ -161,6 +248,21 @@ export function catalogRepo(entry: CatalogEntry): string {
  */
 export function catalogRepoFor(entry: CatalogEntry, platform: NodeJS.Platform): string {
   return platform === 'linux' && entry.hfRepoCuda !== undefined ? entry.hfRepoCuda : entry.hfRepo;
+}
+
+/**
+ * The catalog entry whose THIS-platform download repo is `repo`, if any.
+ *
+ * The dashboard downloader looks entries up by the repo a job was started
+ * with (already allowlisted through `catalogDownloadRepos`, so a match is
+ * guaranteed in practice) to find the entry's `globs` file filter and
+ * `assetsRepo` sidecar source. Matching goes through
+ * {@link catalogRepoFor} — never a raw `hfRepo` comparison — so a future
+ * platform-split entry resolves against the repo this platform actually
+ * installs.
+ */
+export function catalogEntryForRepo(repo: string, platform: NodeJS.Platform): CatalogEntry | undefined {
+  return MODEL_CATALOG.find((entry) => catalogRepoFor(entry, platform) === repo);
 }
 
 /** Catalog entries the wizard offers (hidden entries filtered out). */

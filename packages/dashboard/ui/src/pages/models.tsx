@@ -199,13 +199,30 @@ function LocalModelsSkeletonRows() {
  * A `null` on either side means staleness is unknowable, never "up to date".
  */
 function hasUpdate(
-  item: Pick<CatalogItem, 'hfRepo' | 'installed' | 'localRevision'>,
+  item: Pick<
+    CatalogItem,
+    'hfRepo' | 'installed' | 'localRevision' | 'assetsRepo' | 'localAssetsRepo' | 'localAssetsRevision'
+  >,
   remoteRevisions: ReadonlyMap<string, string | null>,
 ): boolean {
+  if (!item.installed || item.localRevision === null) return false;
   const remoteRevision = remoteRevisions.get(item.hfRepo) ?? null;
-  return (
-    item.installed && item.localRevision !== null && remoteRevision !== null && remoteRevision !== item.localRevision
-  );
+  if (remoteRevision !== null && remoteRevision !== item.localRevision) return true;
+  // The catalog's CURRENT assets repo participates too: when the entry
+  // switches sources the marker still names the old one — which the sweep
+  // never probes — so the lookup below returns null and the badge could
+  // never appear; a changed source is an update on its own (the job re-plans
+  // sidecars from it). A marker with no recorded source gets the same
+  // verdict: the entry prescribes sidecars the install lacks. The reverse —
+  // a catalog that dropped its assetsRepo — adds no verdict of its own: the
+  // entry prescribes no sidecars for a job to apply.
+  if (item.assetsRepo !== undefined && item.assetsRepo !== item.localAssetsRepo) return true;
+  // The tokenizer sidecars come from a second repo that moves on its own
+  // revision; a fix there repairs nothing unless the badge appears, because
+  // the Installed button is otherwise disabled and no job ever runs.
+  if (item.localAssetsRepo === null || item.localAssetsRevision === null) return false;
+  const remoteAssets = remoteRevisions.get(item.localAssetsRepo) ?? null;
+  return remoteAssets !== null && remoteAssets !== item.localAssetsRevision;
 }
 
 export default function Models({ onboarding = false }: { onboarding?: boolean }) {
@@ -794,7 +811,12 @@ export default function Models({ onboarding = false }: { onboarding?: boolean })
               key={item.hfRepo}
               {...downloadProps(item)}
               item={item}
-              draftDownload={item.draft === undefined ? undefined : downloadProps(item.draft)}
+              draftDownload={
+                item.draft === undefined
+                  ? undefined
+                  : // Drafts carry no tokenizer sidecars of their own.
+                    downloadProps({ ...item.draft, localAssetsRepo: null, localAssetsRevision: null })
+              }
             />
           ))}
         </div>
@@ -870,7 +892,18 @@ function CatalogCardSkeleton({ withDraft = false }: { withDraft?: boolean }) {
 interface CatalogDownloadProps {
   installLabel?: string;
   settlingLabel?: string;
-  item: Pick<CatalogItem, 'hfRepo' | 'installed' | 'localRevision' | 'present' | 'blockedByForeignDir' | 'slug'>;
+  item: Pick<
+    CatalogItem,
+    | 'hfRepo'
+    | 'installed'
+    | 'localRevision'
+    | 'assetsRepo'
+    | 'localAssetsRepo'
+    | 'localAssetsRevision'
+    | 'present'
+    | 'blockedByForeignDir'
+    | 'slug'
+  >;
   /** Upstream has different bytes at this repo than the local marker records. */
   updateAvailable: boolean;
   /**

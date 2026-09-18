@@ -1,23 +1,24 @@
 /**
- * Trust the macOS keychain's SSL-trusted CA roots in the CONTROL PANEL child's
- * TLS — and ONLY the SSL-trusted ones.
+ * Trust the OS trust store's extra CA roots in the CONTROL PANEL child's
+ * TLS — the ones Node's bundled Mozilla store does not already carry.
  *
  * Why this exists: a TLS-inspecting network (corporate Zscaler/Netskope-style
  * proxy, antivirus "web shield") re-signs every HTTPS certificate with its own
- * root CA. The browser works because macOS trusts that root; Node's undici
- * verifies against its bundled Mozilla store, never looks at the keychain, and
+ * root CA. The browser works because the OS trusts that root; Node's undici
+ * verifies against its bundled Mozilla store, never looks at the OS store, and
  * fails instantly with SELF_SIGNED_CERT_IN_CHAIN. The download runner lives in
  * the CONTROL PANEL utilityProcess, so every outbound HTTPS it makes —
- * modelInfo, the file list, the blobs, Xet — dies the same way.
+ * modelInfo, the file list, the blobs, Xet — dies the same way. macOS and
+ * Linux are supported; each needs its own collector because the two trust
+ * models differ fundamentally.
  *
- * Why not simply export every CA cert in the keychains: **keychain membership
- * is not trust.** macOS keeps per-certificate trust settings (Keychain Access
- * → a certificate → Trust): a stored CA can be installed-but-untrusted, set to
- * "Never Trust", or trusted for a non-SSL purpose only. Exporting on
- * `basicConstraints CA:TRUE` alone would promote exactly those into TLS
- * anchors — a regression an adversarial review caught before this shipped.
- * Effective anchor trust is therefore computed, per candidate, from BOTH
- * sources:
+ * macOS: **keychain membership is not trust.** macOS keeps per-certificate
+ * trust settings (Keychain Access → a certificate → Trust): a stored CA can
+ * be installed-but-untrusted, set to "Never Trust", or trusted for a non-SSL
+ * purpose only. Exporting on `basicConstraints CA:TRUE` alone would promote
+ * exactly those into TLS anchors — a regression an adversarial review caught
+ * before this shipped. Effective anchor trust is therefore computed, per
+ * candidate, from BOTH sources:
  *
  *   - candidates come from `security find-certificate` over the user and
  *     admin keychains, filtered to `X509Certificate.ca` (CA:TRUE) — measured
@@ -28,16 +29,39 @@
  *     carries platform-restricted roots an additive bundle cannot honor;
  *   - trust comes from `security trust-settings-export` (user + admin
  *     domains), which keys records by the cert's SHA-1 and carries
- *     `kSecTrustSettingsResult` per policy. A candidate needs an explicit,
- *     unconstrained allow record for the `sslServer` policy (mkcert-style
- *     tools set one), a deny record always wins, and any scoped deny makes
- *     the root ineligible. Verified against a live keychain: an installed
- *     cert with zero trust records (Blizzard Battle.net Local Cert) is NOT
- *     effectively trusted, an mkcert root with `sslServer → TrustRoot` IS.
+ *     `kSecTrustSettingsResult` per policy — PLUS keychain provenance for
+ *     the System keychain itself: a CA:TRUE root there is trusted unless
+ *     denied, because profile-driven (MDM/corporate) trust does not appear
+ *     in `trust-settings-export` and the explicit-record rule therefore
+ *     omitted exactly the intercepting roots this module exists to add.
+ *     Verified against a live keychain: an installed cert with zero trust
+ *     records in the LOGIN keychain (Blizzard Battle.net Local Cert) is NOT
+ *     effectively trusted and stays excluded, an mkcert root with
+ *     `sslServer → TrustRoot` IS trusted, and a deny or scoped deny vetoes
+ *     a root in either keychain.
  *
  * `verify-cert -p ssl` was tried and rejected as the trust oracle: it
  * evaluates the candidate AS A LEAF, which even Apple's own system roots fail
  * (CSSMERR_TP_CERT_SUSPENDED), so it cannot answer "is this a trusted anchor".
+ *
+ * Linux: **the store itself is the trust decision.** `update-ca-certificates`
+ * (Debian/Ubuntu) and `update-ca-trust` (Fedora/RHEL p11-kit) emit merged
+ * bundles that already exclude whatever the admin disabled (`!` lines in
+ * ca-certificates.conf) or blocklisted, so a certificate's presence in an
+ * effective store path IS its SSL trust verdict — there is no separate
+ * ledger to consult, and no deny channel to miss: a distrusted root is
+ * absent from the store, not marked inside it. Sources follow the
+ * OpenSSL/Go convention (`$SSL_CERT_FILE`, the colon-separated
+ * `$SSL_CERT_DIR`, then the well-known merged bundles and hashed
+ * directories); every parseable certificate in them is exported with no
+ * `cert.ca` filter, because OpenSSL anchors chains on leaf store entries
+ * too. Store dirs are read by MEMBERSHIP — a symlink or `HASH.N`-named
+ * entry — because a stray file in the dir (mod_ssl's `localhost.crt`,
+ * `make-dummy-cert`) is not a store entry OpenSSL would ever reach. An
+ * unreadable or missing path simply contributes nothing — the macOS
+ * "unreadable domain hides a deny" failure mode has no analog.
+ * Collected roots are then reduced to the delta over Node's bundled store:
+ * a stock machine yields an empty bundle and no env var at all.
  *
  * The fix is process-wide rather than per-call: dump the effectively-trusted
  * roots into a PEM bundle and hand the child `NODE_EXTRA_CA_CERTS` at fork
@@ -46,17 +70,21 @@
  * else that ever opens a TLS socket in that process.
  *
  * Async throughout — MAIN never blocks (`index.ts`'s header is the rule).
- * Failures degrade to `null` (no env var), never to a launch failure. A trust
- * domain that fails to READ voids the entire keychain bundle (see
- * loadTrustDecisions): exporting the surviving domains' allows without the
- * failed domain's denies could restore a trust the user explicitly revoked.
+ * Failures degrade to `null` (no env var), never to a launch failure. On
+ * macOS a trust domain that fails to READ voids the keychain bundle (see
+ * loadTrustDecisions): exporting without the failed domain's denies could
+ * restore a trust the user explicitly revoked — System-keychain candidates
+ * included, since "Never Trust" is settable on a System item. The refusal is
+ * logged by name; an inherited NODE_EXTRA_CA_CERTS still applies, so a
+ * managed machine can be unblocked by exporting its proxy root manually.
  */
 
 import { execFile } from 'node:child_process';
 import { X509Certificate } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { rootCertificates } from 'node:tls';
 import { promisify } from 'node:util';
 
 /** Text-returning command runner, injected so tests never spawn `security`. */
@@ -125,6 +153,8 @@ interface Candidate {
   sha1: string;
   /** SHA-256, used only for dedupe. */
   sha256: string;
+  /** The keychain this cert was read from — decides which trust rule applies. */
+  keychain: string;
 }
 
 /** One cert's explicit SSL-trust verdict, OR'd across the user and admin domains. */
@@ -308,7 +338,8 @@ async function collectCandidates(exec: ExecText, keychains: readonly string[]): 
     }),
   );
   const candidates: Candidate[] = [];
-  for (const { output } of outputs) {
+  for (const [index, { output }] of outputs.entries()) {
+    const keychain = keychains[index] ?? '';
     for (const block of output.match(PEM_BLOCK_RE) ?? []) {
       try {
         const cert = new X509Certificate(block);
@@ -317,6 +348,7 @@ async function collectCandidates(exec: ExecText, keychains: readonly string[]): 
           pem: block,
           sha1: cert.fingerprint.replaceAll(':', ''),
           sha256: cert.fingerprint256,
+          keychain,
         });
       } catch {
         // Not a parseable certificate block (or a format Node rejects): skip it.
@@ -331,20 +363,30 @@ async function collectCandidates(exec: ExecText, keychains: readonly string[]): 
  * domains. The system domain is not read: its entries concern the Apple
  * system roots, which this module no longer exports (see macosKeychains).
  *
- * A domain that fails to READ rejects the whole load — this is the one
- * failure in this module that must NOT degrade locally. Decisions are merged
- * as allow-OR / deny-OR across domains, so proceeding with only the domains
- * that read successfully would silently drop the failed domain's DENIES while
- * keeping the others' allows: a root the user explicitly revoked would be
- * exported on the admin domain's say-so. Rejecting propagates to
- * `prepareExtraCaBundle`'s catch, which ships no keychain roots at all (the
- * inherited NODE_EXTRA_CA_CERTS still applies, and startup is unaffected).
+ * A domain that fails to READ is reported in `unreadable` rather than
+ * rejecting the load outright. Decisions are merged as allow-OR / deny-OR
+ * across domains, so continuing with only the domains that read successfully
+ * would silently drop the failed domain's DENIES while keeping the others'
+ * allows: a root the user explicitly revoked could be exported on the other
+ * domain's say-so. Callers therefore get the flag and must WITHHOLD every
+ * candidate whose export depends on a deny being absent — which is every
+ * candidate, System-keychain roots included ("Never Trust" is settable on a
+ * System item). The flag still exists rather than a plain throw so the
+ * refusal is one decision with one log line, and so a future caller may
+ * confine it more precisely than "ship nothing".
  * One exception: a domain that has NO records at all exits the export with
  * errSecNoTrustSettings, which means "empty", not "unreadable" — that domain
  * contributes nothing and the other domain still loads.
  */
-async function loadTrustDecisions(exec: ExecText): Promise<Map<string, TrustDecision>> {
+interface TrustDecisions {
+  decisions: Map<string, TrustDecision>;
+  /** True when at least one domain's export failed for a reason other than "no records". */
+  unreadable: boolean;
+}
+
+async function loadTrustDecisions(exec: ExecText): Promise<TrustDecisions> {
   const merged = new Map<string, TrustDecision>();
+  let unreadable = false;
   const tmp = await mkdtemp(join(tmpdir(), 'mlx-trust-'));
   try {
     for (const args of [[], ['-d']]) {
@@ -356,10 +398,12 @@ async function loadTrustDecisions(exec: ExecText): Promise<Map<string, TrustDeci
         // trust-settings-export` exits 1 with "SecTrustSettingsCreateExternal-
         // Representation: No Trust Settings were found." (errSecNoTrustSettings)
         // when the domain has no records at all — the normal state on a
-        // machine whose user never touched Keychain Access trust. Only that
-        // specific failure means "no records"; anything else rejects the
-        // whole load per the docstring above.
-        if (!/No Trust Settings were found|errSecNoTrustSettings/.test(String(error))) throw error;
+        // machine whose user never touched Keychain Access trust. Any other
+        // failure marks the load UNREADABLE and keeps parsing the rest.
+        if (!/No Trust Settings were found|errSecNoTrustSettings/.test(String(error))) {
+          console.warn('[mlx] trust-settings export failed; treating that domain as unreadable:', error);
+          unreadable = true;
+        }
         continue;
       }
       const dump = await exec('plutil', ['-p', plist]);
@@ -374,8 +418,11 @@ async function loadTrustDecisions(exec: ExecText): Promise<Map<string, TrustDeci
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }
-  return merged;
+  return { decisions: merged, unreadable };
 }
+
+/** The admin-writable keychain: where an MDM-managed or installer-placed root lives. */
+const SYSTEM_KEYCHAIN = '/Library/Keychains/System.keychain';
 
 /**
  * Concatenated PEM of every effectively SSL-trusted CA root found in the
@@ -384,26 +431,54 @@ async function loadTrustDecisions(exec: ExecText): Promise<Map<string, TrustDeci
  *   - Apple system roots: included unless explicitly denied (denial is
  *     advisory here anyway — the bundle is ADDITIVE to Node's Mozilla
  *     store, which already carries the same roots);
- *   - anything else: included only with an unconstrained sslServer allow
- *     record, never when denied, and never when a SCOPED deny exists —
- *     the bundle cannot express "trusted except for host X", so a root the
- *     user distrusted for any host is not exported at all. Keychain
- *     membership alone is not trust.
+ *   - a CA:TRUE root in the SYSTEM keychain: included unless denied (global
+ *     or scoped), and only when every trust domain READ — an unreadable
+ *     domain's denies are unknown, and a System-item deny is exactly the
+ *     kind that hides there. System-keychain membership IS trust for this
+ *     purpose — writing there needs admin rights, and corporate/MDM roots
+ *     routinely carry NO explicit trust record at all: profile-driven trust
+ *     does not surface in `trust-settings-export`, so the old
+ *     explicit-allow-record rule silently omitted exactly the middlebox
+ *     roots this module exists to add (measured: a Zscaler-style fleet
+ *     root in the System keychain with zero user/admin records);
+ *   - anything else (the login keychain): included only with an
+ *     unconstrained sslServer allow record, never when denied, and never
+ *     when a SCOPED deny exists — the bundle cannot express "trusted except
+ *     for host X", so a root the user distrusted for any host is not
+ *     exported at all. Login-keychain membership alone is not trust — the
+ *     Battle.net-style junk cert lives there, and it stays excluded.
  */
 export async function keychainCaRootsPem(exec: ExecText, keychains: readonly string[]): Promise<string> {
-  const [candidates, decisions] = await Promise.all([collectCandidates(exec, keychains), loadTrustDecisions(exec)]);
+  const [candidates, trust] = await Promise.all([collectCandidates(exec, keychains), loadTrustDecisions(exec)]);
+  const { decisions } = trust;
   const seen = new Set<string>();
   const roots: string[] = [];
   for (const candidate of candidates) {
     if (seen.has(candidate.sha256)) continue;
     const decision = decisions.get(candidate.sha1);
-    // Every candidate here comes from a user/admin keychain, so keychain
-    // membership alone is NOT trust: an explicit, unconstrained sslServer
-    // allow is required, any global deny vetoes, and any scoped deny makes
-    // the root ineligible (the bundle cannot express the scope).
-    const trusted =
-      decision?.allowForSsl === true && decision?.denyForSsl !== true && decision?.scopedDenyForSsl !== true;
-    if (!trusted) continue;
+    // Any deny vetoes everywhere: a global deny is explicit distrust, and a
+    // SCOPED deny makes the root ineligible because the bundle cannot
+    // express the scope (it would grant trust for exactly the denied host).
+    const denied = decision?.denyForSsl === true || decision?.scopedDenyForSsl === true;
+    const untrustworthy =
+      candidate.keychain === SYSTEM_KEYCHAIN
+        ? // System-keychain membership IS trust (admin-gated; profile-driven
+          // trust lives here), so an explicit deny is what vetoes it — and a
+          // deny is exactly what an UNREADABLE domain hides. Measured on a real
+          // keychain: records for System.keychain certificates appear in the
+          // ADMIN domain's export (both of this machine's admin records point
+          // at System-keychain certs; the system domain carries only bare
+          // default entries, zero per-policy items) — so a failed admin read is
+          // precisely when a System item's "Never Trust" is unknowable.
+          // Shipping such a root then would bypass a revocation the user
+          // performed, so it is withheld until every domain reads.
+          denied || trust.unreadable
+        : // Every other candidate comes from the user's login keychain, where
+          // membership is NOT trust: an explicit, unconstrained sslServer
+          // allow is required, and an UNREADABLE trust domain cannot supply
+          // one.
+          denied || decision?.allowForSsl !== true || trust.unreadable;
+    if (untrustworthy) continue;
     seen.add(candidate.sha256);
     roots.push(candidate.pem);
   }
@@ -411,16 +486,150 @@ export async function keychainCaRootsPem(exec: ExecText, keychains: readonly str
 }
 
 /**
+ * The effective OpenSSL-style store files on Linux, in search order. These
+ * are the generated, post-decision artifacts — never the admin's source
+ * directories (`/usr/local/share/ca-certificates`, `pki/ca-trust/source`),
+ * whose contents only count once the update tool merges them into a bundle
+ * or hashed dir below.
+ */
+const LINUX_CA_FILES = [
+  '/etc/ssl/certs/ca-certificates.crt', // Debian/Ubuntu (update-ca-certificates)
+  '/etc/pki/tls/certs/ca-bundle.crt', // Fedora/RHEL (→ p11-kit extracted)
+  '/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem', // p11-kit, TLS-scoped
+  '/etc/ssl/ca-bundle.pem', // openSUSE
+  '/etc/ssl/cert.pem', // Alpine
+  '/etc/pki/tls/cacert.pem', // OpenELEC
+];
+
+/**
+ * Hashed-store directories. Membership is defined by hash-name
+ * reachability, not by presence: Debian links every cert twice (named and
+ * `HASH.N` symlinks), p11-kit emits `HASH.N` entries — while a stray file
+ * like Fedora's `localhost.crt` or `make-dummy-cert` sits in the dir
+ * without ever being a store entry.
+ */
+const LINUX_CA_DIRS = ['/etc/ssl/certs', '/etc/pki/tls/certs'];
+
+/**
+ * The OpenSSL hashed-lookup entry name: 8 hex digits of subject-name hash,
+ * a dot, a collision counter (`HASH.0`, `HASH.1`, …). `HASH.rN` CRL links
+ * are correctly excluded — a CRL is never a CA anchor.
+ */
+const HASHED_ENTRY_RE = /^[0-9a-f]{8}\.\d+$/i;
+
+/**
+ * Where a Linux TLS-intercepting root can be found: the env vars cover
+ * hand-rolled setups, the well-known paths cover the generated stores.
+ * Unlike under OpenSSL, where SSL_CERT_FILE/SSL_CERT_DIR REPLACE the
+ * defaults, here they are additive — this module can only ever add anchors
+ * to Node's store, so unioning every source is the correct bias toward
+ * coverage. Missing/unreadable paths contribute nothing.
+ */
+export interface LinuxCaSources {
+  files: readonly string[];
+  dirs: readonly string[];
+}
+
+export function linuxCaSources(env: NodeJS.ProcessEnv = process.env): LinuxCaSources {
+  return {
+    files: [env.SSL_CERT_FILE ?? '', ...LINUX_CA_FILES].filter((p) => p !== ''),
+    dirs: [...(env.SSL_CERT_DIR ?? '').split(':'), ...LINUX_CA_DIRS].filter((p) => p !== ''),
+  };
+}
+
+/**
+ * Read one store source, bounded like the `security` calls' 64 MB
+ * maxBuffer. `stat` follows symlinks, so a fifo/device/other non-regular
+ * entry — env-controlled, or sitting in a scanned dir — is skipped BEFORE
+ * an open that could block forever, and an oversize file never reaches
+ * memory.
+ */
+async function readStoreEntry(path: string): Promise<string> {
+  try {
+    const info = await stat(path);
+    if (!info.isFile() || info.size > 64 * 1024 * 1024) return '';
+    return await readFile(path, 'utf8');
+  } catch {
+    return '';
+  }
+}
+
+/** Fingerprints of Node's bundled Mozilla roots — the baseline to delta against. */
+function bundledCaFingerprints(): Set<string> {
+  const fingerprints = new Set<string>();
+  for (const pem of rootCertificates) {
+    try {
+      fingerprints.add(new X509Certificate(pem).fingerprint256);
+    } catch {
+      // A bundled root Node itself cannot parse is no anchor either way.
+    }
+  }
+  return fingerprints;
+}
+
+/**
+ * Concatenated PEM of every certificate in the given Linux stores that Node
+ * does not already bundle, deduped by fingerprint. Membership in an
+ * effective store IS the trust decision (see the module header): bundle
+ * files contribute every parseable block, while dirs contribute only
+ * entries OpenSSL's hashed lookup could reach (a symlink, or a
+ * `HASH.N`-named file) — a stray cert file is not a store entry. There is
+ * deliberately no `cert.ca` filter and no fail-closed path: an unreadable
+ * source contributes nothing rather than voiding the bundle, because there
+ * is no hidden deny ledger an absent read could be covering for.
+ *
+ * Note PEM_BLOCK_RE only matches `BEGIN CERTIFICATE` — p11-kit's
+ * distrust-flagged blocks (`ca-bundle.trust.crt`, `BEGIN TRUSTED
+ * CERTIFICATE`) are excluded by that label alone. The exclusion is
+ * load-bearing, not a nicety: those blocks carry the deny semantics this
+ * format has.
+ */
+export async function linuxCaRootsPem(sources: LinuxCaSources): Promise<string> {
+  const texts = await Promise.all([
+    ...sources.files.map(readStoreEntry),
+    ...sources.dirs.map(async (dir) => {
+      let entries;
+      try {
+        entries = await readdir(dir, { withFileTypes: true });
+      } catch {
+        return '';
+      }
+      const parts = await Promise.all(
+        entries
+          .filter((entry) => entry.isSymbolicLink() || HASHED_ENTRY_RE.test(entry.name))
+          .map((entry) => readStoreEntry(join(dir, entry.name))),
+      );
+      return parts.join('\n');
+    }),
+  ]);
+  const seen = bundledCaFingerprints();
+  const roots: string[] = [];
+  for (const block of texts.join('\n').match(PEM_BLOCK_RE) ?? []) {
+    let fingerprint: string;
+    try {
+      fingerprint = new X509Certificate(block).fingerprint256;
+    } catch {
+      continue;
+    }
+    if (seen.has(fingerprint)) continue;
+    seen.add(fingerprint);
+    roots.push(block);
+  }
+  return roots.length === 0 ? '' : `${roots.join('\n')}\n`;
+}
+
+/**
  * Write the extra-CA bundle for the CONTROL PANEL child and return its path,
- * or `null` when there is nothing to add (non-macOS, no trusted roots, no
- * inherited bundle, or ANY failure). The caller awaits this inside
- * `bootstrap()`, whose rejection handler is `app.exit(1)` — an optional TLS
- * convenience must never be a fatal startup dependency, so every failure
- * mode collapses to `null` here rather than rejecting.
+ * or `null` when there is nothing to add (unsupported platform, no extra
+ * roots beyond Node's bundled store, no inherited bundle, or ANY failure).
+ * The caller awaits this inside `bootstrap()`, whose rejection handler is
+ * `app.exit(1)` — an optional TLS convenience must never be a fatal startup
+ * dependency, so every failure mode collapses to `null` here rather than
+ * rejecting.
  *
  * An inherited `NODE_EXTRA_CA_CERTS` (a developer's shell can carry one into an
  * unpackaged run) is MERGED into the bundle rather than dropped: the variable
- * names exactly one file, and handing the child only the keychain dump would
+ * names exactly one file, and handing the child only the collected roots would
  * silently un-trust whatever the developer had configured.
  */
 export async function prepareExtraCaBundle(opts: {
@@ -429,27 +638,43 @@ export async function prepareExtraCaBundle(opts: {
   dir: string;
   exec: ExecText;
   inheritedPath?: string | undefined;
+  /** macOS override — the keychain list to scan (tests). */
   keychains?: readonly string[];
+  /** Linux override — the store paths to scan (tests). */
+  linuxSources?: LinuxCaSources;
 }): Promise<string | null> {
-  if (opts.platform !== 'darwin') return null;
+  if (opts.platform !== 'darwin' && opts.platform !== 'linux') return null;
   const parts: string[] = [];
   if (opts.inheritedPath !== undefined && opts.inheritedPath !== '') {
     try {
       parts.push(await readFile(opts.inheritedPath, 'utf8'));
     } catch {
-      // A dangling inherited path is not ours to fix; the keychain roots still apply.
+      // A dangling inherited path is not ours to fix; the collected roots still apply.
     }
   }
   try {
     // Whole call inside the catch: collectCandidates swallows per-keychain
-    // errors, but loadTrustDecisions' mkdtemp/cleanup can still reject
-    // (ENOSPC), and that rejection must not escape.
-    parts.push(await keychainCaRootsPem(opts.exec, opts.keychains ?? macosKeychains()));
+    // errors and linuxCaRootsPem per-path ones, but loadTrustDecisions'
+    // mkdtemp/cleanup can still reject (ENOSPC), and that rejection must
+    // not escape.
+    parts.push(
+      await (opts.platform === 'darwin'
+        ? keychainCaRootsPem(opts.exec, opts.keychains ?? macosKeychains())
+        : linuxCaRootsPem(opts.linuxSources ?? linuxCaSources())),
+    );
   } catch (error) {
-    console.warn('[mlx] could not export keychain CA roots:', error);
+    console.warn('[mlx] could not export system CA roots:', error);
   }
   const pem = parts.join('\n').trim();
-  if (pem === '') return null;
+  const certCount = (pem.match(/BEGIN CERTIFICATE/g) ?? []).length;
+  if (pem === '') {
+    // Named, not silent: an emptied bundle is the difference between a
+    // downloading app and a TLS error on an intercepting network, and this
+    // line is the only place that fact is observable (see the module
+    // docstring for why the child's failures carry no such detail).
+    console.warn('[mlx] no extra CA roots to bundle (system store contributed none)');
+    return null;
+  }
   const bundlePath = join(opts.dir, EXTRA_CA_BUNDLE_FILE);
   try {
     await mkdir(opts.dir, { recursive: true });
@@ -457,5 +682,6 @@ export async function prepareExtraCaBundle(opts: {
   } catch {
     return null;
   }
+  console.log(`[mlx] extra CA bundle: ${certCount} certificate(s) → ${bundlePath}`);
   return bundlePath;
 }

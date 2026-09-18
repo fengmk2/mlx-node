@@ -33,13 +33,28 @@ interface DiscoveryMetadata {
 }
 
 /**
- * The Qwen3.5 discovery filter retains its XL policy. Gemma4 and Muse
+ * The Qwen3.5/Qwen3.8 discovery filter retains its XL policy. Gemma4 and Muse
  * accept all supported tensor formats, including Q4_0 QAT checkpoints.
  * Match the Unsloth Dynamic XL target names users download, while excluding
  * ordinary Q4_K_M files and companion artifacts such as imatrix/mmproj/draft.
  */
 const QWEN35_XL_GGUF = /(?:^|[-_.])Q\d+_K_XL\.gguf$/i;
-const GGUF_COMPANION_NAME = /(?:^|[-_.])(?:imatrix|mmproj|dflash|draft)(?:[-_.]|$)/i;
+// `mtp` joins the rule because the catalog ships MTP weights BESIDE a target
+// (Qwen3.8's `MTP/mtp-*.gguf`, Gemma's `mtp-*.gguf`) and nothing in the runtime
+// pairs a standalone GGUF MTP file: counting one as weights certifies a
+// directory the loader cannot open, and discovery would enumerate the sidecar
+// as a model.
+const GGUF_COMPANION_NAME = /(?:^|[-_.])(?:imatrix|mmproj|dflash|draft|mtp)(?:[-_.]|$)/i;
+
+/**
+ * True when a `.gguf` filename is a companion artifact (projector, calibration,
+ * draft, MTP) rather than a loadable model payload. Discovery, the dashboard's
+ * publish gate, and the CLI's weight classification all key off this one rule —
+ * a file any of them certifies as weights is a file the others must accept.
+ */
+export function isGgufCompanionName(fileName: string): boolean {
+  return GGUF_COMPANION_NAME.test(fileName);
+}
 // Match the native loaders' primary files/shards. A draft or projector
 // SafeTensors file beside a GGUF is not a converted target checkpoint.
 const PRIMARY_SAFETENSORS = /^(?:model|weights)\.safetensors$|^model(?:-|\.safetensors-).+-of-.+\.safetensors$/;

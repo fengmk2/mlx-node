@@ -54,6 +54,21 @@ export interface CatalogItem {
    * `null` means staleness is unknowable, never "up to date".
    */
   localRevision: string | null;
+  /**
+   * Base-model repo the install's tokenizer sidecars came from, and the commit
+   * they were pinned to — or `null` when the install used none or predates the
+   * field. Update discovery compares this pair too: a sidecar-only upstream
+   * change moves nothing in the primary repo, so without it no badge appears
+   * and the Installed button (disabled) keeps the repair job unreachable.
+   */
+  localAssetsRepo: string | null;
+  localAssetsRevision: string | null;
+  /**
+   * Base-model repo the catalog entry CURRENTLY sources its tokenizer
+   * sidecars from — compared against `localAssetsRepo` so a switched source
+   * is itself an update (the marker's repo is what the probe map lacks).
+   */
+  assetsRepo?: string;
   /** Separate optional draft weights, never a standalone chat-model entry. */
   draft?: CatalogDraftItem;
 }

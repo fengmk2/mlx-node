@@ -107,7 +107,8 @@ impl GgufTensorType {
             Self::F16 | Self::BF16 => 2,
             Self::Q4_0 => 18, // block size: 2 byte scale + 16 bytes (32 x 4-bit)
             Self::Q4_1 => 20, // 2 byte scale + 2 byte bias + 16 bytes
-            Self::Q5_1 => 24, // f16 scale/min, 32 high bits, 16 low-nibble bytes
+            // f16 scale + f16 bias + 4 bytes of high bits + 16 nibble bytes.
+            Self::Q5_1 => 24,
             Self::Q8_0 => 34, // 2 byte scale + 32 bytes
             Self::Q3K | Self::IQ3S => 110,
             // f16 d + f16 dmin + 12 packed 6-bit (sub-scale, min) pairs +
@@ -826,8 +827,9 @@ pub fn symmetric_zero_point(ty: GgufTensorType) -> Option<i32> {
     match ty {
         GgufTensorType::Q4_0 => Some(8),
         GgufTensorType::Q8_0 => Some(128),
-        GgufTensorType::Q4_1
-        | GgufTensorType::Q5_1
+        // Q5_1 stores a real per-block minimum beside its scale, like Q4_1.
+        GgufTensorType::Q5_1
+        | GgufTensorType::Q4_1
         | GgufTensorType::F32
         | GgufTensorType::F16
         | GgufTensorType::BF16
@@ -879,27 +881,26 @@ fn load_quantized_tensor(
     let block_size: usize = 32;
     let n_blocks = num_elements / block_size;
 
-    // Determine weights_per_byte for packed format
-    let weights_per_byte: usize = match tensor.tensor_type {
-        GgufTensorType::Q4_0 | GgufTensorType::Q4_1 => 2, // 4-bit: 2 weights per byte
-        GgufTensorType::Q5_1 | GgufTensorType::Q8_0 => 1, // 8-bit: 1 weight per byte
+    // Words one 32-value block occupies. 4- and 8-bit codes divide a word
+    // evenly; Q5_1's 5-bit codes do not (8 codes span 40 bits), so its block is
+    // 5 whole words — the same LSB-first bitstream MLX's own writer produces,
+    // which is why the codes cross over unchanged.
+    let words_per_block: usize = match tensor.tensor_type {
+        GgufTensorType::Q4_0 | GgufTensorType::Q4_1 => 4, // 32 x 4-bit = 128 bits
+        GgufTensorType::Q5_1 => 5,                        // 32 x 5-bit = 160 bits
+        GgufTensorType::Q8_0 => 8,                        // 32 x 8-bit = 256 bits
         _ => unreachable!(),
     };
 
-    // Q5_1 uses MLX's native five-bit bitstream: five u32 words per 32 codes.
+    // Weight shape: the innermost dimension shrinks to its packed word count.
     let (&last, leading_dims) = shape.split_last().ok_or_else(|| {
         Error::from_reason(format!(
             "Quantized tensor '{}' must have at least one dimension",
             tensor.name
         ))
     })?;
-    let packed_width = if tensor.tensor_type == GgufTensorType::Q5_1 {
-        last / 32 * 5
-    } else {
-        last / (weights_per_byte as i64 * 4)
-    };
     let mut w_shape = leading_dims.to_vec();
-    w_shape.push(packed_width);
+    w_shape.push(last / block_size as i64 * words_per_block as i64);
 
     // Scales/biases shape: last dim divided by block_size
     let mut sb_shape = leading_dims.to_vec();
@@ -930,7 +931,7 @@ fn load_quantized_tensor(
                     unpacked[16 + j] = (block[2 + j] >> 4) as i8;
                 }
                 // Pack 8 values per u32 (4 bits each)
-                let base = i * (block_size / (weights_per_byte * 4));
+                let base = i * words_per_block;
                 for k in 0..(block_size / 8) {
                     let mut packed: u32 = 0;
                     for b in 0..8 {
@@ -953,7 +954,7 @@ fn load_quantized_tensor(
                     unpacked[j] = (block[4 + j] & 0x0F) as i8;
                     unpacked[16 + j] = (block[4 + j] >> 4) as i8;
                 }
-                let base = i * (block_size / (weights_per_byte * 4));
+                let base = i * words_per_block;
                 for k in 0..(block_size / 8) {
                     let mut packed: u32 = 0;
                     for b in 0..8 {
@@ -964,31 +965,43 @@ fn load_quantized_tensor(
             }
         }
         GgufTensorType::Q5_1 => {
-            // Preserve source codes and FP16 scale/minimum without requantization.
+            // Block: 2 bytes f16 scale (d), 2 bytes f16 bias (m), 4 bytes of
+            // high bits (qh, one bit per weight), 16 nibble bytes (qs). ggml
+            // packs the 32 values as two halves: value `j` (0..16) takes the
+            // LOW nibble of `qs[j]` and bit `j` of `qh`; value `j + 16` takes
+            // the HIGH nibble and bit `j + 16`. Each code is `d * q + m` with
+            // q in 0..32 — exactly MLX's affine contract at 5 bits, so only
+            // the container changes and the dequantized values are identical.
             biases = vec![0u16; sb_elements];
             for i in 0..n_blocks {
                 let block = &raw[i * type_size..(i + 1) * type_size];
                 scales[i] = u16::from_le_bytes([block[0], block[1]]);
                 biases[i] = u16::from_le_bytes([block[2], block[3]]);
-                let high_bytes = block
-                    .get(4..8)
-                    .and_then(|bytes| bytes.try_into().ok())
-                    .ok_or_else(|| {
-                        Error::from_reason(format!(
-                            "Invalid Q5_1 high bits in tensor '{}' block {i}",
-                            tensor.name
-                        ))
-                    })?;
-                let high = u32::from_le_bytes(high_bytes);
-                for j in 0..32 {
-                    let low = (block[8 + j % 16] >> (4 * (j / 16))) & 15;
-                    let code = u32::from(low) | (((high >> j) & 1) << 4);
-                    let bit = j * 5;
-                    weights_packed[i * 5 + bit / 32] |= code << (bit % 32);
-                    if bit % 32 > 27 {
-                        weights_packed[i * 5 + bit / 32 + 1] |= code >> (32 - bit % 32);
+                let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+                let qs = &block[8..24];
+
+                let base = i * words_per_block;
+                let mut acc: u64 = 0;
+                let mut pending: u32 = 0;
+                let mut word = base;
+                for value in 0..block_size {
+                    let (nibble, bit) = if value < block_size / 2 {
+                        (qs[value] & 0x0F, (qh >> value) & 1)
+                    } else {
+                        let j = value - block_size / 2;
+                        (qs[j] >> 4, (qh >> (j + block_size / 2)) & 1)
+                    };
+                    acc |= u64::from(u32::from(nibble) | (bit << 4)) << pending;
+                    pending += 5;
+                    while pending >= 32 {
+                        weights_packed[word] = acc as u32;
+                        acc >>= 32;
+                        pending -= 32;
+                        word += 1;
                     }
                 }
+                debug_assert_eq!(pending, 0, "a 32-value 5-bit block is 5 whole words");
+                debug_assert_eq!(word, base + words_per_block);
             }
         }
         GgufTensorType::Q8_0 => {
@@ -998,7 +1011,7 @@ fn load_quantized_tensor(
                 scales[i] = u16::from_le_bytes([block[0], block[1]]);
 
                 // Convert signed int8 to unsigned (add 128 / flip sign bit) then pack into u32
-                let base = i * (block_size / 4); // 8 bits per weight, 4 per u32
+                let base = i * words_per_block; // 8 bits per weight, 4 per u32
                 for k in 0..(block_size / 4) {
                     let mut packed: u32 = 0;
                     for b in 0..4 {
@@ -1285,11 +1298,38 @@ fn is_gemma4_mmproj_gguf(metadata: &HashMap<String, GgufMetaValue>) -> bool {
                 == Some("gemma4ua"))
 }
 
+/// The plain-Gemma4 SigLIP tower projector llama.cpp ships beside the dense
+/// GGUFs (`mmproj-BF16.gguf` in the Unsloth UD repos). Kept a separate
+/// predicate from the unified `gemma4uv`/`gemma4ua` media file: the tower
+/// encodes patches itself and maps onto `vision_tower.*`, a namespace the
+/// unified embedder names never touch.
+fn is_gemma4v_mmproj_gguf(metadata: &HashMap<String, GgufMetaValue>) -> bool {
+    metadata
+        .get("general.architecture")
+        .and_then(GgufMetaValue::as_str)
+        == Some("clip")
+        && metadata
+            .get("clip.vision.projector_type")
+            .and_then(GgufMetaValue::as_str)
+            == Some("gemma4v")
+}
+
 fn is_muse_glimmer_main_gguf(metadata: &HashMap<String, GgufMetaValue>) -> bool {
     metadata
         .get("general.architecture")
         .and_then(GgufMetaValue::as_str)
         == Some("muse-glimmer")
+}
+
+/// llama.cpp writes the sparse Qwen3.5 family under its own architecture tag
+/// and only that tag carries `expert_count`. Requiring it keeps a
+/// mis-dispatched dense file out of the MoE loader (and vice versa) with a
+/// header-only check.
+fn is_qwen35_moe_main_gguf(metadata: &HashMap<String, GgufMetaValue>) -> bool {
+    metadata
+        .get("general.architecture")
+        .and_then(GgufMetaValue::as_str)
+        == Some("qwen35moe")
 }
 
 fn is_muse_glimmer_mmproj_gguf(metadata: &HashMap<String, GgufMetaValue>) -> bool {
@@ -1362,11 +1402,37 @@ fn gemma4_name_to_hf(name: &str) -> Option<String> {
     result = result.replace(".ffn_down.", ".mlp.down_proj.");
     result = result.replace(".ffn_up.", ".mlp.up_proj.");
 
+    // Sparse layers (gemma-4-26B-A4B) put the router and the expert stacks in
+    // their own namespaces, not under `mlp.`. llama.cpp names the two router
+    // buffers after the projection they sit beside, so they are matched before
+    // the infix rules that would otherwise swallow them into `router.proj.*` /
+    // `experts.down_proj.*`: `ffn_gate_inp.scale` is the `[hidden]` learnable
+    // rms vector and `ffn_down_exps.scale` the `[num_experts]` routing scale.
+    // Suffix-anchored, not an infix replace: `.ffn_down_exps.scales` is the
+    // quant group's own sidecar and a substring match would rename it too,
+    // stranding the expert stack without its scales.
+    for (from, to) in [
+        (".ffn_gate_inp.scale", ".router.scale"),
+        (".ffn_down_exps.scale", ".router.per_expert_scale"),
+    ] {
+        if result.ends_with(from) {
+            result.replace_range(result.len() - from.len().., to);
+        }
+    }
+    result = result.replace(".ffn_gate_inp.", ".router.proj.");
+    result = result.replace(".ffn_gate_up_exps.", ".experts.gate_up_proj.");
+    result = result.replace(".ffn_down_exps.", ".experts.down_proj.");
+
     result = result.replace(".attn_norm.", ".input_layernorm.");
     result = result.replace(".post_attention_norm.", ".post_attention_layernorm.");
     result = result.replace(".ffn_norm.", ".pre_feedforward_layernorm.");
     result = result.replace(".post_ffw_norm.", ".post_feedforward_layernorm.");
     result = result.replace(".layer_output_scale.weight", ".layer_scalar");
+    // Sparse layers carry the second feed-forward norm pair under numbered
+    // names, which the unnumbered rules above cannot see.
+    result = result.replace(".pre_ffw_norm_2.", ".pre_feedforward_layernorm_2.");
+    result = result.replace(".post_ffw_norm_1.", ".post_feedforward_layernorm_1.");
+    result = result.replace(".post_ffw_norm_2.", ".post_feedforward_layernorm_2.");
 
     // Global tensors rename whole-string, so they carry the quant-group suffix
     // explicitly (a quantized `token_embd`/`output` ships `.scales`/`.biases`
@@ -1411,6 +1477,59 @@ fn gemma4_mmproj_name_to_hf(name: &str) -> Option<String> {
         "v.patch_norm.3.weight" => "model.vision_embedder.pos_norm.weight",
         "v.patch_norm.3.bias" => "model.vision_embedder.pos_norm.bias",
         _ => return Some(gguf_name_to_hf(name)),
+    };
+    Some(mapped.to_string())
+}
+
+/// Map the `gemma4v` SigLIP tower mmproj (`mmproj-BF16.gguf` beside the dense
+/// Unsloth GGUFs) onto the `vision_tower.*` checkpoint namespace that
+/// `apply_vision_weights` consumes.
+///
+/// Unlike the unified mmproj mapper this returns `None` for anything outside
+/// the tower's fixed inventory rather than falling through to
+/// `gguf_name_to_hf`: that fallback spells vision keys in the Qwen-VL merger
+/// namespace (`vision_tower.blocks.*`, `vision_tower.patch_embed.proj.*`), so
+/// an unrecognized tensor would land under names no Gemma4 consumer reads —
+/// dropped is honest, mislabeled is not.
+fn gemma4v_mmproj_name_to_hf(name: &str) -> Option<String> {
+    // Whole-string match, so a quantized projection keeps its `.scales`/
+    // `.biases` sidecars attached through the rename (the same contract the
+    // unified mapper's `mm.input_projection` arm follows).
+    if let Some(renamed) = rename_global_quant_group(
+        name,
+        "mm.input_projection",
+        "model.embed_vision.embedding_projection",
+    ) {
+        return Some(renamed);
+    }
+    if let Some(rest) = name.strip_prefix("v.blk.") {
+        let (index, suffix) = rest.split_once('.')?;
+        let mapped = match suffix {
+            "attn_q.weight" => "self_attn.q_proj.weight",
+            "attn_k.weight" => "self_attn.k_proj.weight",
+            "attn_v.weight" => "self_attn.v_proj.weight",
+            "attn_out.weight" => "self_attn.o_proj.weight",
+            "attn_q_norm.weight" => "self_attn.q_norm.weight",
+            "attn_k_norm.weight" => "self_attn.k_norm.weight",
+            "ln1.weight" => "input_layernorm.weight",
+            "attn_post_norm.weight" => "post_attention_layernorm.weight",
+            "ln2.weight" => "pre_feedforward_layernorm.weight",
+            "ffn_post_norm.weight" => "post_feedforward_layernorm.weight",
+            "ffn_gate.weight" => "mlp.gate_proj.weight",
+            "ffn_up.weight" => "mlp.up_proj.weight",
+            "ffn_down.weight" => "mlp.down_proj.weight",
+            _ => return None,
+        };
+        return Some(format!(
+            "model.vision_tower.encoder.layers.{index}.{mapped}"
+        ));
+    }
+    let mapped = match name {
+        "v.patch_embd.weight" => "model.vision_tower.patch_embedder.input_proj.weight",
+        "v.position_embd.weight" => "model.vision_tower.patch_embedder.position_embedding_table",
+        "v.std_bias" => "model.vision_tower.std_bias",
+        "v.std_scale" => "model.vision_tower.std_scale",
+        _ => return None,
     };
     Some(mapped.to_string())
 }
@@ -1540,12 +1659,16 @@ fn gguf_name_to_hf_for_metadata(
         gemma4_name_to_hf(name)
     } else if is_gemma4_mmproj_gguf(metadata) {
         gemma4_mmproj_name_to_hf(name)
+    } else if is_gemma4v_mmproj_gguf(metadata) {
+        gemma4v_mmproj_name_to_hf(name)
     } else if is_muse_glimmer_main_gguf(metadata) {
         muse_glimmer_name_to_hf(name)
     } else if is_muse_glimmer_mmproj_gguf(metadata) {
         muse_glimmer_mmproj_name_to_hf(name)
     } else if is_muse_glimmer_dflash_gguf(metadata) {
         muse_glimmer_dflash_name_to_hf(name)
+    } else if is_qwen35_moe_main_gguf(metadata) {
+        Some(qwen35_moe_name_to_hf(name, metadata))
     } else {
         Some(qwen35_name_to_hf(name, metadata))
     }
@@ -1788,6 +1911,30 @@ fn validate_qwen35_standalone_geometry(metadata: &HashMap<String, GgufMetaValue>
     Ok(())
 }
 
+/// Sparse Qwen3.5 layers ship expert stacks plus a shared expert under infixes
+/// the dense mapper does not know. Every rule is a dot-delimited infix
+/// `replace()`, so the `.scales` / `.biases` sidecars of a quantized expert
+/// stack ride along unchanged — the same contract the dense projections rely
+/// on. The `blk.` prefix is deliberately left intact: `qwen35_name_to_hf` owns
+/// it, and its inline-MTP rewrite has to see the original block index.
+fn qwen35_moe_name_to_hf(name: &str, metadata: &HashMap<String, GgufMetaValue>) -> String {
+    let mut result = name.to_string();
+    if result.starts_with("blk.") {
+        // `ffn_gate_inp_shexp` first: the router gate's infix is a prefix of
+        // the shared-expert gate's, so the longer form must claim the name
+        // before the shorter rule can see it.
+        result = result.replace(".ffn_gate_inp_shexp.", ".mlp.shared_expert_gate.");
+        result = result.replace(".ffn_gate_inp.", ".mlp.gate.");
+        result = result.replace(".ffn_gate_exps.", ".mlp.switch_mlp.gate_proj.");
+        result = result.replace(".ffn_up_exps.", ".mlp.switch_mlp.up_proj.");
+        result = result.replace(".ffn_down_exps.", ".mlp.switch_mlp.down_proj.");
+        result = result.replace(".ffn_gate_shexp.", ".mlp.shared_expert.gate_proj.");
+        result = result.replace(".ffn_up_shexp.", ".mlp.shared_expert.up_proj.");
+        result = result.replace(".ffn_down_shexp.", ".mlp.shared_expert.down_proj.");
+    }
+    qwen35_name_to_hf(&result, metadata)
+}
+
 /// Qwen3.5 GGUFs with inline MTP encode the draft layer as the final block and
 /// attach the four nextn projections/norms to that same block. HF/MLX stores
 /// those tensors under the mtp prefix, outside the main decoder layer list.
@@ -2028,6 +2175,54 @@ fn fixup_gemma4_mmproj_layout(
     Ok(())
 }
 
+/// GGUF stores the `gemma4v` tower's patch projection as the conv kernel
+/// `[patch_w, patch_h, channels, hidden]` in ggml dim order, which
+/// `parse_gguf` already reverses into row-major `[hidden, channels, patch_h,
+/// patch_w]` (see `GgufTensorInfo::mlx_shape`). The checkpoint's `input_proj`
+/// is a `Linear` over HWC-flattened patches — `[hidden, patch*patch*channels]`
+/// with the channel index varying fastest — so the fixup is the same
+/// (0,2,3,1)-transpose-then-flatten the unified CHW→HWC path applies.
+///
+/// The position table is stored `[hidden, positions, 2]` in ggml order, which
+/// reverses to `[2, positions, hidden]` — already the checkpoint's
+/// `position_embedding_table` layout, so it only needs a shape check. Every
+/// other `gemma4v` tensor is a 1-D/2-D passthrough.
+fn fixup_gemma4v_mmproj_layout(
+    weights: &mut HashMap<String, MxArray>,
+    metadata: &HashMap<String, GgufMetaValue>,
+) -> Result<()> {
+    if !is_gemma4v_mmproj_gguf(metadata) {
+        return Ok(());
+    }
+
+    let patch_key = "model.vision_tower.patch_embedder.input_proj.weight";
+    if let Some(weight) = weights.remove(patch_key) {
+        let shape = weight.shape()?.to_vec();
+        if shape.len() != 4 {
+            return Err(Error::from_reason(format!(
+                "Gemma4v mmproj tensor '{patch_key}' must be 4-D [hidden, channels, patch_h, patch_w], got {shape:?}"
+            )));
+        }
+        let (out, channels, patch_h, patch_w) = (shape[0], shape[1], shape[2], shape[3]);
+        let transformed = weight
+            .transpose(Some(&[0, 2, 3, 1]))?
+            .reshape(&[out, patch_h * patch_w * channels])?;
+        weights.insert(patch_key.to_string(), transformed);
+    }
+
+    let position_key = "model.vision_tower.patch_embedder.position_embedding_table";
+    if let Some(position) = weights.get(position_key) {
+        let shape = position.shape()?.to_vec();
+        if shape.len() != 3 || shape[0] != 2 {
+            return Err(Error::from_reason(format!(
+                "Gemma4v mmproj tensor '{position_key}' must have shape [2, positions, hidden], got {shape:?}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 /// Post-process weights after remapping to fix shapes/values that differ between GGUF and HF.
 ///
 /// - conv1d.weight: GGUF stores 2D [C, K] → reshape to [C, K, 1] (model expectation)
@@ -2077,6 +2272,50 @@ fn fixup_shapes(weights: &mut HashMap<String, MxArray>) -> Result<()> {
     // The +1.0 shift is handled by persistence.rs sanitize_weights() when
     // it detects unsanitized HF checkpoints (MTP weights or wrong conv1d axis).
     // We do NOT apply it here — the GGUF values are the correct final values.
+
+    Ok(())
+}
+
+/// Reshape the sparse Qwen3.5 shared-expert gate to the container's rank.
+///
+/// llama.cpp's `qwen35moe` writer stores `ffn_gate_inp_shexp.weight` as a bare
+/// 1-D `[hidden]` vector, while the MLX block holds it as a `Linear(hidden, 1)`
+/// whose `set_weight` accepts exactly `[1, hidden]` — a 1-D array fails the
+/// load with "Weight shape mismatch: expected [1, hidden]". The reshape is
+/// rank-preserving, so only the 1-D form is touched: a writer that already
+/// emits the 2-D row stays byte-identical, and a quantized group is left alone
+/// because the loader reads it through `try_build_ql` (reshaping its packed
+/// `.weight` while its `.scales` stayed put would divorce the pair).
+fn fixup_qwen35_moe_shared_expert_gate(
+    weights: &mut HashMap<String, MxArray>,
+    metadata: &HashMap<String, GgufMetaValue>,
+) -> Result<()> {
+    if !is_qwen35_moe_main_gguf(metadata) {
+        return Ok(());
+    }
+
+    let keys: Vec<String> = weights
+        .keys()
+        .filter(|key| key.ends_with(".mlp.shared_expert_gate.weight"))
+        .filter(|key| {
+            let prefix = key.strip_suffix(".weight").unwrap_or(key);
+            !weights.contains_key(&format!("{prefix}.scales"))
+        })
+        .cloned()
+        .collect();
+    for key in keys {
+        if let Some(arr) = weights.remove(&key) {
+            let ndim = arr.ndim()?;
+            if ndim == 1 {
+                let hidden = arr.shape_at(0)?;
+                let reshaped = arr.reshape(&[1, hidden])?;
+                info!("Reshaped {key}: [{hidden}] → [1, {hidden}]");
+                weights.insert(key, reshaped);
+            } else {
+                weights.insert(key, arr);
+            }
+        }
+    }
 
     Ok(())
 }
@@ -2429,6 +2668,20 @@ pub fn extract_config(metadata: &HashMap<String, GgufMetaValue>) -> serde_json::
         ("context_length", "max_position_embeddings"),
         ("rope.freq_base", "rope_theta"),
         ("attention.layer_norm_rms_epsilon", "rms_norm_eps"),
+        // Sparse-only keys. The lookup is arch-prefixed, so they resolve only
+        // for a `qwen35moe` header — the dense family writes no such metadata.
+        // `num_experts` is mandatory for the MoE loader, and a `qwen35moe`
+        // header has no dense `feed_forward_length`: its two FFN widths are the
+        // expert and shared-expert ones, matching the HF config's
+        // `moe_intermediate_size` / `shared_expert_intermediate_size` and its
+        // absent top-level `intermediate_size`.
+        ("expert_count", "num_experts"),
+        ("expert_used_count", "num_experts_per_tok"),
+        ("expert_feed_forward_length", "moe_intermediate_size"),
+        (
+            "expert_shared_feed_forward_length",
+            "shared_expert_intermediate_size",
+        ),
     ];
 
     for &(gguf_suffix, hf_key) in mappings {
@@ -2569,6 +2822,7 @@ impl SourceQuantProfile {
             // loader needs to rebuild the omitted `.biases`.
             GgufTensorType::Q4_0 => Some(Self::affine(4).symmetric(ty)),
             GgufTensorType::Q4_1 => Some(Self::affine(4)),
+            // 5-bit codes with a stored per-block minimum, like Q4_1.
             GgufTensorType::Q5_1 => Some(Self::affine(5)),
             GgufTensorType::Q8_0 => Some(Self::affine(8).symmetric(ty)),
             // `load_kquant_repack` keeps ggml's geometry verbatim, so the
@@ -4055,11 +4309,17 @@ pub async fn convert_gguf_to_safetensors(
     weights = remap_keys(weights, &gguf.metadata)?;
 
     // Unified Gemma4 mmproj tensors need name-aware CHW→HWC and position-table
-    // permutations after remapping, before the generic shape fixups run.
+    // permutations after remapping, before the generic shape fixups run. The
+    // gemma4v SigLIP tower needs its own conv-kernel→Linear reshape.
     fixup_gemma4_mmproj_layout(&mut weights, &gguf.metadata)?;
+    fixup_gemma4v_mmproj_layout(&mut weights, &gguf.metadata)?;
 
     // Fix shapes that differ between GGUF and HF format
     fixup_shapes(&mut weights)?;
+
+    // Sparse Qwen3.5 stores its shared-expert gate as a bare vector while the
+    // MLX block is a `Linear(hidden, 1)`.
+    fixup_qwen35_moe_shared_expert_gate(&mut weights, &gguf.metadata)?;
 
     // Fix Qwen3.5 linear attention head deinterleaving and A_log conversion
     fixup_qwen35_linear_attn(&mut weights, &gguf.metadata, native_qwen35_layout)?;
@@ -4880,20 +5140,79 @@ fn resolve_native_gguf_source(
     }
 }
 
-fn gemma4_native_mmproj(input: &Path) -> Result<Option<PathBuf>> {
+/// Which Gemma4 media projector a config pairs with, chosen by the parsed
+/// config — not by whatever `mmproj-*.gguf` happens to sit beside the text
+/// file. The unified checkpoint consumes the encoder-free `gemma4uv`/`gemma4ua`
+/// media tensors; a plain `vision_config` consumes the `gemma4v` SigLIP tower.
+/// Filtering on the projector type keeps a gemma4v file beside a unified
+/// config (and a gemma4uv file beside a plain one) invisible to the pairing,
+/// so it is ignored rather than paired into a namespace the loader drops.
+#[derive(Clone, Copy)]
+enum Gemma4MmprojKind {
+    /// Unified encoder-free media projector (`gemma4uv` / `gemma4ua`).
+    UnifiedMedia,
+    /// Standard SigLIP vision tower (`gemma4v`).
+    SigLipVision,
+}
+
+impl Gemma4MmprojKind {
+    fn matches(self, metadata: &HashMap<String, GgufMetaValue>) -> bool {
+        match self {
+            Self::UnifiedMedia => is_gemma4_mmproj_gguf(metadata),
+            Self::SigLipVision => is_gemma4v_mmproj_gguf(metadata),
+        }
+    }
+}
+
+/// Deterministic dtype preference among same-kind projector candidates, read
+/// off the filename: `BF16` > `F16` > `F32` > anything else (case-insensitive
+/// substring). Multi-dtype repos — the real `unsloth/gemma-4-26B-A4B-it-GGUF`
+/// ships all three gemma4v towers — must resolve to a single companion rather
+/// than hard-error on ambiguity, and BF16 wins because it is what the model
+/// computes in and what upstream labels primary. ("bf16" itself contains
+/// "f16", so the order of these checks IS the order of the preference.)
+fn mmproj_dtype_tier(path: &Path) -> u8 {
+    let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    if name.contains("bf16") {
+        0
+    } else if name.contains("f16") {
+        1
+    } else if name.contains("f32") {
+        2
+    } else {
+        3
+    }
+}
+
+fn gemma4_native_mmproj(input: &Path, kind: Gemma4MmprojKind) -> Result<Option<PathBuf>> {
     let parent = input.parent().unwrap_or(Path::new("."));
     let exact = parent.join(format!(
         "mmproj-{}",
         input.file_name().unwrap().to_string_lossy()
     ));
     if exact.is_file() {
-        if !is_gemma4_mmproj_gguf(&parse_gguf(&exact)?.metadata) {
+        let metadata = parse_gguf(&exact)?.metadata;
+        if kind.matches(&metadata) {
+            return Ok(Some(exact));
+        }
+        // A file that is not a Gemma4 projector at all earns the loud pairing
+        // error. A parseable Gemma4 projector of the OTHER kind is simply not
+        // this config's companion — it must not shadow the directory scan, so
+        // fall through and let a right-kind `mmproj-*.gguf` elsewhere pair.
+        if !is_gemma4_mmproj_gguf(&metadata) && !is_gemma4v_mmproj_gguf(&metadata) {
             return Err(Error::from_reason(format!(
                 "Matching media companion '{}' is not a Gemma4 projector",
                 exact.display()
             )));
         }
-        return Ok(Some(exact));
+        info!(
+            "Gemma4 media companion '{}' is a projector type this config cannot consume; scanning for a matching one",
+            exact.display()
+        );
     }
     let mut candidates = Vec::new();
     for entry in fs::read_dir(parent)? {
@@ -4903,7 +5222,7 @@ fn gemma4_native_mmproj(input: &Path) -> Result<Option<PathBuf>> {
             && name.starts_with("mmproj-")
             && name.to_ascii_lowercase().ends_with(".gguf")
         {
-            if !is_gemma4_mmproj_gguf(&parse_gguf(&path)?.metadata) {
+            if !kind.matches(&parse_gguf(&path)?.metadata) {
                 continue;
             }
             candidates.push(path);
@@ -4912,17 +5231,53 @@ fn gemma4_native_mmproj(input: &Path) -> Result<Option<PathBuf>> {
     match candidates.len() {
         0 => Ok(None),
         1 => Ok(candidates.pop()),
-        _ => Err(Error::from_reason(format!(
-            "Ambiguous Gemma4 media projectors beside '{}'; name the matching companion '{}'",
-            input.display(),
-            exact.display()
-        ))),
+        _ => {
+            // Multi-dtype repos are the normal case, not an ambiguity: prefer
+            // the best dtype class the filenames advertise, and only keep the
+            // ambiguity error when the preference still leaves a tie.
+            let best = candidates
+                .iter()
+                .map(|path| mmproj_dtype_tier(path))
+                .min()
+                .unwrap();
+            let mut preferred: Vec<PathBuf> = candidates
+                .iter()
+                .filter(|path| mmproj_dtype_tier(path) == best)
+                .cloned()
+                .collect();
+            if preferred.len() > 1 {
+                return Err(Error::from_reason(format!(
+                    "Ambiguous Gemma4 media projectors beside '{}'; name the matching companion '{}'",
+                    input.display(),
+                    exact.display()
+                )));
+            }
+            let chosen = preferred.pop().unwrap();
+            let skipped: Vec<String> = candidates
+                .iter()
+                .filter(|path| *path != &chosen)
+                .map(|path| {
+                    path.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            info!(
+                "Multiple Gemma4 media projectors beside '{}'; chose '{}' over {}",
+                input.display(),
+                chosen.display(),
+                skipped.join(", ")
+            );
+            Ok(Some(chosen))
+        }
     }
 }
 
 /// Prepare a complete, losslessly packed Gemma checkpoint in the application
-/// cache. The source directory remains read-only; the matching unified media
-/// projector is converted in the same transaction as the text model.
+/// cache. The source directory remains read-only; the matching media
+/// projector — required for unified media configs, opportunistic for a plain
+/// `vision_config` — is converted in the same transaction as the text model.
 pub(crate) async fn prepare_gemma4_native_gguf(input: &Path) -> Result<PathBuf> {
     let root = native_gguf_cache_root()?;
     prepare_gemma4_native_gguf_in(input, &root).await
@@ -4947,16 +5302,24 @@ async fn prepare_gemma4_native_gguf_in(input: &Path, root: &Path) -> Result<Path
     }
     let needs_media = crate::models::gemma4::persistence::native_gguf_requires_media(parent)?;
     let companion = if needs_media {
-        gemma4_native_mmproj(&input)?
+        let found = gemma4_native_mmproj(&input, Gemma4MmprojKind::UnifiedMedia)?;
+        if found.is_none() {
+            return Err(Error::from_reason(format!(
+                "Gemma4 config declares media inputs but no matching mmproj GGUF was found beside '{}'",
+                input.display()
+            )));
+        }
+        found
+    } else if crate::models::gemma4::persistence::native_gguf_declares_vision_tower(parent)? {
+        // A plain SigLIP `vision_config` pairs opportunistically: convert the
+        // gemma4v tower when it sits beside the text GGUF, degrade to
+        // text-only when it does not — the validator only demands the tower
+        // once vision tensors are present, so absent means text-only, never
+        // an error.
+        gemma4_native_mmproj(&input, Gemma4MmprojKind::SigLipVision)?
     } else {
         None
     };
-    if needs_media && companion.is_none() {
-        return Err(Error::from_reason(format!(
-            "Gemma4 config declares media inputs but no matching mmproj GGUF was found beside '{}'",
-            input.display()
-        )));
-    }
     let root = initialize_native_gguf_cache_root(root)?;
     prepare_native_gguf_inner(
         &input,
@@ -5052,6 +5415,7 @@ async fn prepare_muse_glimmer_native_gguf_in(input: &Path, root: &Path) -> Resul
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NativeGgufFamily {
     Qwen35,
+    Qwen35Moe,
     Gemma4,
     MuseGlimmer,
 }
@@ -5071,6 +5435,9 @@ impl NativeGgufFamily {
     fn layout(self) -> &'static str {
         match self {
             Self::Qwen35 => "tiled",
+            // A distinct string keeps the sparse family's cache key from
+            // aliasing the dense one on the same source filename.
+            Self::Qwen35Moe => "tiled-moe-v1",
             Self::Gemma4 => "gemma4-text-dtype-v2",
             Self::MuseGlimmer => "muse-glimmer-packed-v1",
         }
@@ -5079,7 +5446,7 @@ impl NativeGgufFamily {
     fn companion_filename(self) -> &'static str {
         match self {
             Self::MuseGlimmer => "draft.safetensors",
-            Self::Qwen35 | Self::Gemma4 => "vision.safetensors",
+            Self::Qwen35 | Self::Qwen35Moe | Self::Gemma4 => "vision.safetensors",
         }
     }
 }
@@ -5110,6 +5477,44 @@ async fn prepare_qwen35_native_gguf_in(input_path: &Path, cache_root: &Path) -> 
 
 async fn prepare_qwen35_native_gguf_inner(input_path: &Path, cache_root: &Path) -> Result<PathBuf> {
     prepare_native_gguf_inner(input_path, cache_root, NativeGgufFamily::Qwen35, None).await
+}
+
+/// Prepare a sparse Qwen3.5 (`qwen35moe`) GGUF for native loading.
+///
+/// Shares the dense Qwen3.5 native cache, layout preservation, and standalone
+/// geometry validation; the only differences are the family's MoE rename table
+/// and its own cache-key layout tag.
+pub(crate) async fn prepare_qwen35_moe_native_gguf(input_path: &Path) -> Result<PathBuf> {
+    let cache_root = native_gguf_cache_root()?;
+    prepare_qwen35_moe_native_gguf_inner(input_path, &cache_root).await
+}
+
+#[cfg(test)]
+async fn prepare_qwen35_moe_native_gguf_in(
+    input_path: &Path,
+    cache_root: &Path,
+) -> Result<PathBuf> {
+    let cache_root = initialize_native_gguf_cache_root(cache_root).map_err(|error| {
+        Error::from_reason(format!(
+            "Failed to create native GGUF cache root '{}': {error}",
+            cache_root.display()
+        ))
+    })?;
+    prepare_qwen35_moe_native_gguf_inner(input_path, &cache_root).await
+}
+
+async fn prepare_qwen35_moe_native_gguf_inner(
+    input_path: &Path,
+    cache_root: &Path,
+) -> Result<PathBuf> {
+    let input_path = input_path.canonicalize()?;
+    if !is_qwen35_moe_main_gguf(&parse_gguf(&input_path)?.metadata) {
+        return Err(Error::from_reason(
+            "Qwen3.5 MoE load requires a sparse 'qwen35moe' text GGUF; a dense qwen35, \
+             projector, draft or another architecture cannot be loaded through this family",
+        ));
+    }
+    prepare_native_gguf_inner(&input_path, cache_root, NativeGgufFamily::Qwen35Moe, None).await
 }
 
 async fn prepare_native_gguf_inner(
@@ -5154,11 +5559,17 @@ async fn prepare_native_gguf_inner(
     let source_identity_digest = source_file_identity_digest(&input_path, &metadata);
     let asset_digest = qwen35_native_asset_digest(parent)?;
     let companion_digest = native_gguf_companion_digest(companion)?;
-    let native_qwen35_layout = family == NativeGgufFamily::Qwen35;
+    // Both Qwen3.5 families preserve llama.cpp's tiled GDN order, so they share
+    // the conversion option; only the dense family keeps its historical
+    // preparation digest.
+    let native_qwen35_layout = matches!(
+        family,
+        NativeGgufFamily::Qwen35 | NativeGgufFamily::Qwen35Moe
+    );
     let layout = family.layout();
     // Bound the filename even when the main and companion both have long
     // names/identities. Keep the two source fingerprints in the marker too.
-    let preparation_digest = if native_qwen35_layout {
+    let preparation_digest = if family == NativeGgufFamily::Qwen35 {
         // Preserve existing Qwen cache keys and avoid an unrelated reimport.
         asset_digest.clone()
     } else {
@@ -5756,6 +6167,58 @@ mod tests {
         input
     }
 
+    /// A minimal `gemma4v` SigLIP tower mmproj written to `path`: the two
+    /// layout-relevant tensors (4-D conv patch kernel, 3-D position table),
+    /// one encoder block weight, the standardize pair, and the multimodal
+    /// projection. Conversion does not demand the full 356-tensor inventory,
+    /// so this exercises every code path the real `mmproj-BF16.gguf` drives.
+    fn gemma4v_mmproj_fixture(path: &Path) {
+        fs::write(
+            path,
+            build_minimal_gguf(
+                &[
+                    ("general.architecture", GgufMetaValue::String("clip".into())),
+                    (
+                        "clip.vision.projector_type",
+                        GgufMetaValue::String("gemma4v".into()),
+                    ),
+                ],
+                &[
+                    // ggml dims: [patch_w, patch_h, channels, hidden] → MLX
+                    // [1, 3, 2, 2] → input_proj [1, 12] after the fixup.
+                    (
+                        "v.patch_embd.weight",
+                        &[2, 2, 3, 1],
+                        GgufTensorType::F32,
+                        &[0; 48],
+                    ),
+                    // ggml dims: [hidden, positions, 2] → MLX [2, 2, 1].
+                    (
+                        "v.position_embd.weight",
+                        &[1, 2, 2],
+                        GgufTensorType::F32,
+                        &[0; 16],
+                    ),
+                    (
+                        "v.blk.0.attn_q.weight",
+                        &[2, 2],
+                        GgufTensorType::BF16,
+                        &[0; 8],
+                    ),
+                    ("v.std_bias", &[1], GgufTensorType::F32, &[0; 4]),
+                    ("v.std_scale", &[1], GgufTensorType::F32, &[0; 4]),
+                    (
+                        "mm.input_projection.weight",
+                        &[2, 2],
+                        GgufTensorType::BF16,
+                        &[0; 8],
+                    ),
+                ],
+            ),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn gemma_native_directory_resolution_is_unambiguous_and_preserves_safetensors() {
         let root = GemmaNativeTestDir::new();
@@ -5787,10 +6250,13 @@ mod tests {
         let root = GemmaNativeTestDir::new();
         let input = gemma_native_fixture(root.path());
         let first = root.path().join("mmproj-gemma.gguf");
-        assert_eq!(gemma4_native_mmproj(&input).unwrap(), Some(first.clone()));
+        assert_eq!(
+            gemma4_native_mmproj(&input, Gemma4MmprojKind::UnifiedMedia).unwrap(),
+            Some(first.clone())
+        );
         fs::copy(&first, root.path().join("mmproj-other.gguf")).unwrap();
         assert!(
-            gemma4_native_mmproj(&input)
+            gemma4_native_mmproj(&input, Gemma4MmprojKind::UnifiedMedia)
                 .unwrap_err()
                 .reason
                 .contains("Ambiguous")
@@ -5800,7 +6266,10 @@ mod tests {
             input.file_name().unwrap().to_string_lossy()
         ));
         fs::copy(first, &exact).unwrap();
-        assert_eq!(gemma4_native_mmproj(&input).unwrap(), Some(exact));
+        assert_eq!(
+            gemma4_native_mmproj(&input, Gemma4MmprojKind::UnifiedMedia).unwrap(),
+            Some(exact)
+        );
     }
 
     #[tokio::test]
@@ -5948,6 +6417,281 @@ mod tests {
             );
             assert!(!output.join("vision.safetensors").exists());
         }
+    }
+
+    /// The `unsloth/gemma-4-26B-A4B-it` config.json shape: a plain `gemma4`
+    /// model_type with the SigLIP `vision_config` the gemma4v mmproj fills.
+    fn gemma4_siglip_vision_config() -> serde_json::Value {
+        serde_json::json!({
+            "model_type": "gemma4",
+            "image_token_id": 258880,
+            "text_config": {"num_hidden_layers": 0},
+            "vision_config": {
+                "model_type": "gemma4_vision",
+                "hidden_size": 1152,
+                "num_hidden_layers": 27,
+                "num_attention_heads": 16,
+                "head_dim": 72,
+                "patch_size": 16,
+                "position_embedding_size": 10240,
+                "use_clipped_linears": false,
+                "standardize": true,
+            },
+        })
+    }
+
+    #[tokio::test]
+    async fn gemma_native_converts_the_gemma4v_siglip_tower_when_present() {
+        // `unsloth/gemma-4-26B-A4B-it-GGUF` shape: the sibling config.json keeps
+        // a SigLIP `vision_config`, the text GGUF carries text tensors only, and
+        // `mmproj-BF16.gguf` declares `clip.vision.projector_type = "gemma4v"`.
+        // The tower converts into `vision.safetensors` and the cache records
+        // the companion identity. The fixture's gemma4uv file stays in place
+        // to prove a unified media projector beside a plain config is ignored.
+        let root = GemmaNativeTestDir::new();
+        let source = root.path().join("source");
+        let input = gemma_native_fixture(&source);
+        fs::write(
+            source.join("config.json"),
+            gemma4_siglip_vision_config().to_string(),
+        )
+        .unwrap();
+        gemma4v_mmproj_fixture(&source.join("mmproj-BF16.gguf"));
+
+        let cache = root.path().join("cache");
+        let output = prepare_gemma4_native_gguf_in(&input, &cache)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "a gemma4v-paired Gemma4 checkpoint must convert: {}",
+                    error.reason
+                )
+            });
+        let media =
+            crate::utils::safetensors::load_safetensors_lazy(output.join("vision.safetensors"))
+                .unwrap();
+        for key in [
+            "model.vision_tower.patch_embedder.input_proj.weight",
+            "model.vision_tower.patch_embedder.position_embedding_table",
+            "model.vision_tower.encoder.layers.0.self_attn.q_proj.weight",
+            "model.vision_tower.std_bias",
+            "model.vision_tower.std_scale",
+            "model.embed_vision.embedding_projection.weight",
+        ] {
+            assert!(media.contains_key(key), "missing converted tower key {key}");
+        }
+        // The conv kernel lands flattened to the Linear's [hidden, C*p*p].
+        assert_eq!(
+            media["model.vision_tower.patch_embedder.input_proj.weight"]
+                .shape()
+                .unwrap()
+                .as_ref(),
+            &[1, 12]
+        );
+        assert_eq!(
+            media["model.vision_tower.patch_embedder.position_embedding_table"]
+                .shape()
+                .unwrap()
+                .as_ref(),
+            &[2, 2, 1]
+        );
+        let marker = fs::read_to_string(output.join(".complete")).unwrap();
+        assert!(
+            !marker.contains("companion_sha256=none\n"),
+            "the gemma4v companion must be recorded in the cache marker"
+        );
+        assert_eq!(
+            prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap(),
+            output
+        );
+    }
+
+    #[tokio::test]
+    async fn gemma_native_prepares_a_vision_declaring_text_only_checkpoint() {
+        // Same `unsloth/gemma-4-26B-A4B-it-GGUF` shape — a SigLIP
+        // `vision_config` over text-only tensors — but the projector beside it
+        // declares a projector_type mlx-node has no importer for. The text
+        // model must still convert, and must not claim media it cannot
+        // execute.
+        let root = GemmaNativeTestDir::new();
+        let source = root.path().join("source");
+        let input = gemma_native_fixture(&source);
+        fs::remove_file(source.join("mmproj-gemma.gguf")).unwrap();
+        fs::write(
+            source.join("config.json"),
+            gemma4_siglip_vision_config().to_string(),
+        )
+        .unwrap();
+        // An unsupported projector type: not a Gemma4 media companion, so it is
+        // neither required nor converted.
+        fs::write(
+            source.join("mmproj-BF16.gguf"),
+            build_minimal_gguf(
+                &[
+                    ("general.architecture", GgufMetaValue::String("clip".into())),
+                    (
+                        "clip.vision.projector_type",
+                        GgufMetaValue::String("gemma4z".into()),
+                    ),
+                ],
+                &[(
+                    "v.patch_embd.weight",
+                    &[2, 2],
+                    GgufTensorType::BF16,
+                    &[0; 8],
+                )],
+            ),
+        )
+        .unwrap();
+
+        let cache = root.path().join("cache");
+        let output = prepare_gemma4_native_gguf_in(&input, &cache)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "a vision-declaring text-only Gemma4 checkpoint must convert: {}",
+                    error.reason
+                )
+            });
+        assert!(
+            !output.join("vision.safetensors").exists(),
+            "no supported projector was present, so no media sidecar may be published"
+        );
+        let marker = fs::read_to_string(output.join(".complete")).unwrap();
+        assert!(
+            marker.contains("companion_sha256=none\n"),
+            "the text cache must record that it has no media companion"
+        );
+        // The unsupported projector must not change the cache identity either.
+        assert_eq!(
+            prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap(),
+            output
+        );
+    }
+
+    #[tokio::test]
+    async fn gemma_native_ignores_projector_types_the_config_cannot_consume() {
+        let root = GemmaNativeTestDir::new();
+
+        // A gemma4v tower beside a unified-media config cannot fill the
+        // encoder-free media slots: the required-companion error fires exactly
+        // as if no mmproj were present — the file is invisible to the pairing.
+        let source = root.path().join("source-unified");
+        let input = gemma_native_fixture(&source);
+        fs::remove_file(source.join("mmproj-gemma.gguf")).unwrap();
+        gemma4v_mmproj_fixture(&source.join("mmproj-BF16.gguf"));
+        let cache = root.path().join("cache-unified");
+        assert!(
+            prepare_gemma4_native_gguf_in(&input, &cache)
+                .await
+                .unwrap_err()
+                .reason
+                .contains("no matching mmproj"),
+            "a gemma4v file must not satisfy a unified-media config"
+        );
+        assert!(!cache.exists());
+
+        // A gemma4uv projector beside a plain `vision_config` is likewise the
+        // wrong kind: ignored, not converted, and the cache records no
+        // companion — its unified media tensors belong to a namespace the
+        // SigLIP tower never reads.
+        let source = root.path().join("source-plain");
+        let input = gemma_native_fixture(&source);
+        fs::write(
+            source.join("config.json"),
+            gemma4_siglip_vision_config().to_string(),
+        )
+        .unwrap();
+        let cache = root.path().join("cache-plain");
+        let output = prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap();
+        assert!(!output.join("vision.safetensors").exists());
+        let marker = fs::read_to_string(output.join(".complete")).unwrap();
+        assert!(marker.contains("companion_sha256=none\n"));
+    }
+
+    #[test]
+    fn gemma_native_projector_kind_filter_matches_the_config_namespace() {
+        let root = GemmaNativeTestDir::new();
+        let input = gemma_native_fixture(root.path());
+        // The fixture's mmproj-gemma.gguf is gemma4uv: invisible to the
+        // SigLIP probe, paired for the unified one.
+        assert_eq!(
+            gemma4_native_mmproj(&input, Gemma4MmprojKind::SigLipVision).unwrap(),
+            None
+        );
+        let exact = root.path().join(format!(
+            "mmproj-{}",
+            input.file_name().unwrap().to_string_lossy()
+        ));
+        gemma4v_mmproj_fixture(&exact);
+        assert_eq!(
+            gemma4_native_mmproj(&input, Gemma4MmprojKind::SigLipVision).unwrap(),
+            Some(exact)
+        );
+        // A wrong-kind file at the exact-name slot is ignored rather than
+        // paired or errored — and it must NOT shadow the scan: the gemma4uv
+        // file beside it still satisfies the unified probe.
+        let root2 = GemmaNativeTestDir::new();
+        let input2 = gemma_native_fixture(root2.path());
+        let exact2 = root2.path().join(format!(
+            "mmproj-{}",
+            input2.file_name().unwrap().to_string_lossy()
+        ));
+        gemma4v_mmproj_fixture(&exact2);
+        assert_eq!(
+            gemma4_native_mmproj(&input2, Gemma4MmprojKind::UnifiedMedia).unwrap(),
+            Some(root2.path().join("mmproj-gemma.gguf"))
+        );
+        // Fall through to an empty scan and the probe reports absent, not an
+        // error — same as if no mmproj file existed at all.
+        fs::remove_file(root2.path().join("mmproj-gemma.gguf")).unwrap();
+        assert_eq!(
+            gemma4_native_mmproj(&input2, Gemma4MmprojKind::UnifiedMedia).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn gemma_native_projector_selection_prefers_bf16_among_same_kind_dtypes() {
+        // The real `unsloth/gemma-4-26B-A4B-it-GGUF` repo ships gemma4v towers
+        // at BF16/F16/F32: a full-repo download must resolve deterministically
+        // to BF16 rather than hard-error on ambiguity.
+        let root = GemmaNativeTestDir::new();
+        let input = gemma_native_fixture(root.path());
+        fs::remove_file(root.path().join("mmproj-gemma.gguf")).unwrap();
+        for name in ["mmproj-F32.gguf", "mmproj-F16.gguf", "mmproj-BF16.gguf"] {
+            gemma4v_mmproj_fixture(&root.path().join(name));
+        }
+        assert_eq!(
+            gemma4_native_mmproj(&input, Gemma4MmprojKind::SigLipVision).unwrap(),
+            Some(root.path().join("mmproj-BF16.gguf"))
+        );
+
+        // The preference applies to the unified kind too — and a non-BF16
+        // best tier still wins (F16 > F32 > unnamed like mmproj-gemma.gguf).
+        let root2 = GemmaNativeTestDir::new();
+        let input2 = gemma_native_fixture(root2.path());
+        let unified = root2.path().join("mmproj-gemma.gguf");
+        for name in ["mmproj-F16.gguf", "mmproj-F32.gguf"] {
+            fs::copy(&unified, root2.path().join(name)).unwrap();
+        }
+        assert_eq!(
+            gemma4_native_mmproj(&input2, Gemma4MmprojKind::UnifiedMedia).unwrap(),
+            Some(root2.path().join("mmproj-F16.gguf"))
+        );
+
+        // Two candidates in the same preferred tier are still ambiguous.
+        let root3 = GemmaNativeTestDir::new();
+        let input3 = gemma_native_fixture(root3.path());
+        fs::remove_file(root3.path().join("mmproj-gemma.gguf")).unwrap();
+        gemma4v_mmproj_fixture(&root3.path().join("mmproj-BF16-a.gguf"));
+        gemma4v_mmproj_fixture(&root3.path().join("mmproj-BF16-b.gguf"));
+        assert!(
+            gemma4_native_mmproj(&input3, Gemma4MmprojKind::SigLipVision)
+                .unwrap_err()
+                .reason
+                .contains("Ambiguous")
+        );
     }
 
     #[tokio::test]
@@ -6301,6 +7045,762 @@ mod tests {
         assert!(marker.contains("assets_sha256="));
 
         fs::remove_dir_all(root).ok();
+    }
+
+    /// Header of a structurally complete standalone `qwen35moe` checkpoint:
+    /// every key `validate_qwen35_standalone_geometry` and the MoE loader
+    /// require, with dims small enough to hand-write tensor payloads.
+    fn qwen35_moe_standalone_metadata() -> Vec<(&'static str, GgufMetaValue)> {
+        vec![
+            (
+                "general.architecture",
+                GgufMetaValue::String("qwen35moe".to_string()),
+            ),
+            ("qwen35moe.embedding_length", GgufMetaValue::Uint32(4)),
+            ("qwen35moe.block_count", GgufMetaValue::Uint32(2)),
+            ("qwen35moe.attention.head_count", GgufMetaValue::Uint32(2)),
+            (
+                "qwen35moe.attention.head_count_kv",
+                GgufMetaValue::Uint32(1),
+            ),
+            ("qwen35moe.attention.key_length", GgufMetaValue::Uint32(2)),
+            ("qwen35moe.rope.dimension_count", GgufMetaValue::Uint32(2)),
+            ("qwen35moe.expert_count", GgufMetaValue::Uint32(4)),
+            ("qwen35moe.expert_used_count", GgufMetaValue::Uint32(2)),
+            (
+                "qwen35moe.expert_feed_forward_length",
+                GgufMetaValue::Uint32(8),
+            ),
+            (
+                "qwen35moe.expert_shared_feed_forward_length",
+                GgufMetaValue::Uint32(8),
+            ),
+            ("qwen35moe.ssm.state_size", GgufMetaValue::Uint32(2)),
+            ("qwen35moe.ssm.inner_size", GgufMetaValue::Uint32(4)),
+            ("qwen35moe.ssm.time_step_rank", GgufMetaValue::Uint32(2)),
+            ("qwen35moe.ssm.group_count", GgufMetaValue::Uint32(1)),
+            ("qwen35moe.ssm.conv_kernel", GgufMetaValue::Uint32(4)),
+            (
+                "qwen35moe.full_attention_interval",
+                GgufMetaValue::Uint32(2),
+            ),
+        ]
+    }
+
+    /// The MoE tensors of layer 0 in GGUF ne order (reversed from the MLX
+    /// shape), one entry per rename-table infix.
+    fn qwen35_moe_layer_zero_tensors()
+    -> Vec<(&'static str, &'static [u64], GgufTensorType, Vec<u8>)> {
+        vec![
+            (
+                "blk.0.ffn_gate_inp.weight",
+                &[4, 4],
+                GgufTensorType::F32,
+                vec![0; 4 * 4 * 4],
+            ),
+            (
+                "blk.0.ffn_gate_inp_shexp.weight",
+                &[4],
+                GgufTensorType::F32,
+                vec![0; 4 * 4],
+            ),
+            (
+                "blk.0.ffn_gate_exps.weight",
+                &[4, 8, 4],
+                GgufTensorType::BF16,
+                vec![0; 4 * 8 * 4 * 2],
+            ),
+            (
+                "blk.0.ffn_up_exps.weight",
+                &[4, 8, 4],
+                GgufTensorType::BF16,
+                vec![0; 4 * 8 * 4 * 2],
+            ),
+            (
+                "blk.0.ffn_down_exps.weight",
+                &[8, 4, 4],
+                GgufTensorType::BF16,
+                vec![0; 8 * 4 * 4 * 2],
+            ),
+            (
+                "blk.0.ffn_gate_shexp.weight",
+                &[4, 8],
+                GgufTensorType::BF16,
+                vec![0; 4 * 8 * 2],
+            ),
+            (
+                "blk.0.ffn_up_shexp.weight",
+                &[4, 8],
+                GgufTensorType::BF16,
+                vec![0; 4 * 8 * 2],
+            ),
+            (
+                "blk.0.ffn_down_shexp.weight",
+                &[8, 4],
+                GgufTensorType::BF16,
+                vec![0; 8 * 4 * 2],
+            ),
+        ]
+    }
+
+    fn build_qwen35_moe_fixture(tensors: &[(&str, &[u64], GgufTensorType, Vec<u8>)]) -> Vec<u8> {
+        let metadata = qwen35_moe_standalone_metadata();
+        let descriptors: Vec<(&str, &[u64], GgufTensorType, &[u8])> = tensors
+            .iter()
+            .map(|(name, dims, ty, data)| (*name, *dims, *ty, data.as_slice()))
+            .collect();
+        build_minimal_gguf(&metadata, &descriptors)
+    }
+
+    /// A standalone sparse Qwen3.5 GGUF must synthesize a config the MoE
+    /// loader accepts (experts, expert width, shared-expert width) and rename
+    /// every expert infix, including the 1-D shared-expert gate the MLX block
+    /// holds as a `Linear(hidden, 1)`.
+    #[tokio::test]
+    async fn native_qwen35_moe_prepare_synthesizes_config_and_expert_names() {
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-standalone-qwen35moe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let mut tensors = qwen35_moe_layer_zero_tensors();
+        tensors.push((
+            "output_norm.weight",
+            &[4],
+            GgufTensorType::BF16,
+            vec![0; 4 * 2],
+        ));
+        let input = root.join("agentworld-UD-Q4_K_XL.gguf");
+        fs::write(&input, build_qwen35_moe_fixture(&tensors)).unwrap();
+        let cache_root = root.join("native-cache");
+
+        let output = prepare_qwen35_moe_native_gguf_in(&input, &cache_root)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "standalone sparse GGUF preparation must synthesize config.json: {}",
+                    error.reason
+                )
+            });
+
+        let config: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("config.json")).unwrap()).unwrap();
+        assert_eq!(config["model_type"], serde_json::json!("qwen3_5_moe"));
+        assert_eq!(config["num_hidden_layers"], serde_json::json!(2));
+        assert_eq!(config["hidden_size"], serde_json::json!(4));
+        assert_eq!(config["head_dim"], serde_json::json!(2));
+        assert_eq!(config["num_experts"], serde_json::json!(4));
+        assert_eq!(config["num_experts_per_tok"], serde_json::json!(2));
+        assert_eq!(config["moe_intermediate_size"], serde_json::json!(8));
+        assert_eq!(
+            config["shared_expert_intermediate_size"],
+            serde_json::json!(8)
+        );
+        assert_eq!(config["linear_num_value_heads"], serde_json::json!(2));
+        assert_eq!(config["linear_num_key_heads"], serde_json::json!(1));
+        assert_eq!(config["full_attention_interval"], serde_json::json!(2));
+        assert_eq!(
+            config["layer_types"],
+            serde_json::json!(["linear_attention", "full_attention"])
+        );
+        assert_eq!(config["qwen35_gguf_gdn_layout"], serde_json::json!("tiled"));
+
+        let params =
+            crate::utils::safetensors::load_safetensors_lazy(output.join("model.safetensors"))
+                .unwrap();
+        let shape = |key: &str| {
+            params
+                .get(key)
+                .unwrap_or_else(|| panic!("{key} missing from the native-packed cache"))
+                .shape()
+                .unwrap()
+                .to_vec()
+        };
+        assert_eq!(shape("model.layers.0.mlp.gate.weight"), vec![4, 4]);
+        assert_eq!(
+            shape("model.layers.0.mlp.switch_mlp.gate_proj.weight"),
+            vec![4, 8, 4]
+        );
+        assert_eq!(
+            shape("model.layers.0.mlp.switch_mlp.up_proj.weight"),
+            vec![4, 8, 4]
+        );
+        assert_eq!(
+            shape("model.layers.0.mlp.switch_mlp.down_proj.weight"),
+            vec![4, 4, 8]
+        );
+        assert_eq!(
+            shape("model.layers.0.mlp.shared_expert.gate_proj.weight"),
+            vec![8, 4]
+        );
+        assert_eq!(
+            shape("model.layers.0.mlp.shared_expert.up_proj.weight"),
+            vec![8, 4]
+        );
+        assert_eq!(
+            shape("model.layers.0.mlp.shared_expert.down_proj.weight"),
+            vec![4, 8]
+        );
+        // llama.cpp writes a bare `[hidden]` vector; `Linear::set_weight` in
+        // the MoE block accepts exactly `[1, hidden]`.
+        assert_eq!(
+            shape("model.layers.0.mlp.shared_expert_gate.weight"),
+            vec![1, 4]
+        );
+
+        let marker = fs::read_to_string(output.join(".complete")).unwrap();
+        assert!(marker.contains("layout=tiled-moe-v1\n"));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// The sparse family keeps its own cache-key layout tag, so the same GGUF
+    /// converted through the dense and the sparse entry points can never
+    /// publish into one directory.
+    #[tokio::test]
+    async fn qwen35_moe_native_cache_key_does_not_alias_the_dense_family() {
+        assert_ne!(
+            NativeGgufFamily::Qwen35.layout(),
+            NativeGgufFamily::Qwen35Moe.layout()
+        );
+        assert_eq!(
+            NativeGgufFamily::Qwen35.companion_filename(),
+            NativeGgufFamily::Qwen35Moe.companion_filename()
+        );
+
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-qwen35moe-cache-key-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let input = root.join("sparse.gguf");
+        fs::write(
+            &input,
+            build_qwen35_moe_fixture(&qwen35_moe_layer_zero_tensors()),
+        )
+        .unwrap();
+        let cache_root = root.join("native-cache");
+
+        let sparse = prepare_qwen35_moe_native_gguf_in(&input, &cache_root)
+            .await
+            .unwrap();
+        // The dense entry point accepts any GGUF path, so this exercises the
+        // key itself rather than a header rejection.
+        let dense = prepare_qwen35_native_gguf_in(&input, &cache_root)
+            .await
+            .unwrap();
+        assert_ne!(
+            sparse, dense,
+            "the sparse family must not reuse the dense family's cache directory"
+        );
+        assert!(
+            fs::read_to_string(sparse.join(".complete"))
+                .unwrap()
+                .contains("layout=tiled-moe-v1\n")
+        );
+        assert!(
+            fs::read_to_string(dense.join(".complete"))
+                .unwrap()
+                .contains("layout=tiled\n")
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// A sparse GGUF handed to the dense entry point (or the reverse) fails on
+    /// the header, before any weight byte is read.
+    #[tokio::test]
+    async fn qwen35_moe_prepare_rejects_a_non_sparse_header() {
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-qwen35moe-header-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let input = root.join("dense.gguf");
+        fs::write(
+            &input,
+            build_minimal_gguf(
+                &[(
+                    "general.architecture",
+                    GgufMetaValue::String("qwen35".to_string()),
+                )],
+                &[("output_norm.weight", &[1], GgufTensorType::BF16, &[0, 0])],
+            ),
+        )
+        .unwrap();
+
+        let error = prepare_qwen35_moe_native_gguf_in(&input, &root.join("native-cache"))
+            .await
+            .expect_err("a dense qwen35 header must not load through the sparse family");
+        assert!(error.reason.contains("qwen35moe"));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Every sparse rename rule, including the quant sidecars that ride the
+    /// infix replace and the shared-expert gate's `_inp` neighbour.
+    #[test]
+    fn qwen35moe_rename_table_covers_experts_shared_experts_and_sidecars() {
+        let metadata = HashMap::from([(
+            "general.architecture".to_string(),
+            GgufMetaValue::String("qwen35moe".to_string()),
+        )]);
+
+        for (gguf, hf) in [
+            (
+                "blk.7.ffn_gate_inp.weight",
+                "model.layers.7.mlp.gate.weight",
+            ),
+            (
+                "blk.7.ffn_gate_inp.scales",
+                "model.layers.7.mlp.gate.scales",
+            ),
+            // The shared-expert gate must not be captured by the router rule.
+            (
+                "blk.7.ffn_gate_inp_shexp.weight",
+                "model.layers.7.mlp.shared_expert_gate.weight",
+            ),
+            (
+                "blk.7.ffn_gate_inp_shexp.biases",
+                "model.layers.7.mlp.shared_expert_gate.biases",
+            ),
+            (
+                "blk.7.ffn_gate_exps.weight",
+                "model.layers.7.mlp.switch_mlp.gate_proj.weight",
+            ),
+            (
+                "blk.7.ffn_up_exps.scales",
+                "model.layers.7.mlp.switch_mlp.up_proj.scales",
+            ),
+            (
+                "blk.7.ffn_down_exps.biases",
+                "model.layers.7.mlp.switch_mlp.down_proj.biases",
+            ),
+            (
+                "blk.7.ffn_gate_shexp.weight",
+                "model.layers.7.mlp.shared_expert.gate_proj.weight",
+            ),
+            (
+                "blk.7.ffn_up_shexp.weight",
+                "model.layers.7.mlp.shared_expert.up_proj.weight",
+            ),
+            (
+                "blk.7.ffn_down_shexp.weight",
+                "model.layers.7.mlp.shared_expert.down_proj.weight",
+            ),
+            // Everything the dense mapper already owns stays as it is.
+            ("blk.7.ffn_up.weight", "model.layers.7.mlp.up_proj.weight"),
+            (
+                "blk.0.attn_norm.weight",
+                "model.layers.0.input_layernorm.weight",
+            ),
+            (
+                "blk.0.post_attention_norm.weight",
+                "model.layers.0.post_attention_layernorm.weight",
+            ),
+            ("blk.0.ssm_a", "model.layers.0.linear_attn.A_log"),
+            (
+                "blk.0.attn_qkv.weight",
+                "model.layers.0.linear_attn.in_proj_qkv.weight",
+            ),
+            (
+                "blk.0.attn_gate.weight",
+                "model.layers.0.linear_attn.in_proj_z.weight",
+            ),
+            ("token_embd.weight", "model.embed_tokens.weight"),
+            ("token_embd.scales", "model.embed_tokens.scales"),
+            ("output_norm.weight", "model.norm.weight"),
+            ("output.weight", "lm_head.weight"),
+        ] {
+            assert_eq!(
+                gguf_name_to_hf_for_metadata(gguf, &metadata).as_deref(),
+                Some(hf),
+                "{gguf} must map to {hf}"
+            );
+        }
+    }
+
+    /// The sparse rename table runs before the shared inline-MTP rewrite, so a
+    /// sparse draft block lands under `mtp.layers.0` with its experts intact.
+    #[test]
+    fn qwen35moe_inline_mtp_rewrites_sparse_expert_names() {
+        let mut gguf = source_quant_fixture(&[
+            ("blk.1.nextn.eh_proj.weight", GgufTensorType::BF16),
+            ("blk.1.nextn.enorm.weight", GgufTensorType::BF16),
+            ("blk.1.nextn.hnorm.weight", GgufTensorType::BF16),
+            ("blk.1.nextn.shared_head_norm.weight", GgufTensorType::BF16),
+            ("blk.1.ffn_up_exps.weight", GgufTensorType::BF16),
+            ("blk.1.ffn_gate_inp.weight", GgufTensorType::BF16),
+        ]);
+        gguf.metadata.insert(
+            "general.architecture".into(),
+            GgufMetaValue::String("qwen35moe".into()),
+        );
+        gguf.metadata
+            .insert("qwen35moe.block_count".into(), GgufMetaValue::Uint32(2));
+
+        let mtp_index = qwen35_inline_mtp_index(&gguf).unwrap().unwrap();
+        gguf.metadata.insert(
+            QWEN35_INLINE_MTP_INDEX_METADATA.into(),
+            GgufMetaValue::Uint64(mtp_index),
+        );
+
+        for (gguf_name, hf) in [
+            ("blk.1.nextn.eh_proj.weight", "mtp.fc.weight"),
+            (
+                "blk.1.ffn_up_exps.weight",
+                "mtp.layers.0.mlp.switch_mlp.up_proj.weight",
+            ),
+            ("blk.1.ffn_gate_inp.weight", "mtp.layers.0.mlp.gate.weight"),
+        ] {
+            assert_eq!(
+                gguf_name_to_hf_for_metadata(gguf_name, &gguf.metadata).as_deref(),
+                Some(hf),
+                "{gguf_name} must map to {hf}"
+            );
+        }
+    }
+
+    /// A 3-D K-quant expert stack imports losslessly: the repacker keeps the
+    /// leading expert axis and reshapes only the innermost one, so one 3-D
+    /// `ffn_down_exps` tensor becomes the `switch_mlp.down_proj` trio.
+    #[tokio::test]
+    async fn qwen35moe_three_dimensional_kquant_experts_keep_their_leading_axis() {
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-qwen35moe-kquant-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+
+        // MLX [E=2, out=4, in=256] ⇔ GGUF ne order [256, 4, 2]: one Q4_K
+        // super-block per row, 8 rows.
+        let mut codes = [0u8; 256];
+        for (v, c) in codes.iter_mut().enumerate() {
+            *c = ((v + 3 * (v / 32)) % 16) as u8;
+        }
+        let mut sc = [0u8; 8];
+        let mut m = [0u8; 8];
+        for j in 0..8 {
+            sc[j] = ((3 * j + 7) & 63) as u8;
+            m[j] = ((61 - 5 * j) & 63) as u8;
+        }
+        let block = pack_q4k_block(&codes, &sc, &m, 0.5, -0.25);
+        let payload: Vec<u8> = (0..8).flat_map(|_| block.iter().copied()).collect();
+
+        let input = root.join("sparse-experts.gguf");
+        fs::write(
+            &input,
+            build_qwen35_moe_fixture(&[
+                (
+                    "blk.0.ffn_down_exps.weight",
+                    &[256, 4, 2],
+                    GgufTensorType::Q4K,
+                    payload,
+                ),
+                (
+                    "output_norm.weight",
+                    &[4],
+                    GgufTensorType::BF16,
+                    vec![0; 4 * 2],
+                ),
+            ]),
+        )
+        .unwrap();
+
+        let gguf = parse_gguf(&input).unwrap();
+        let output = prepare_qwen35_moe_native_gguf_in(&input, &root.join("native-cache"))
+            .await
+            .unwrap();
+        let params =
+            crate::utils::safetensors::load_safetensors_lazy(output.join("model.safetensors"))
+                .unwrap();
+
+        let weight = &params["model.layers.0.mlp.switch_mlp.down_proj.weight"];
+        assert_eq!(weight.dtype().unwrap(), DType::Uint32);
+        assert_eq!(weight.shape().unwrap().to_vec(), vec![2, 4, 32]);
+        assert_eq!(
+            unpack_lsb_codes(&weight.to_uint32().unwrap(), 4, 256),
+            codes.iter().map(|&c| u32::from(c)).collect::<Vec<_>>()
+        );
+        let scales = &params["model.layers.0.mlp.switch_mlp.down_proj.scales"];
+        assert_eq!(scales.dtype().unwrap(), DType::Uint8);
+        assert_eq!(scales.shape().unwrap().to_vec(), vec![2, 4, 16]);
+        // 8 packed rows, each one super-block's (sc, m) pairs.
+        let want_scales: Vec<u8> = (0..8)
+            .flat_map(|_| (0..8).flat_map(|j| [sc[j], m[j]]))
+            .collect();
+        assert_eq!(scales.to_uint8().unwrap(), want_scales);
+        let biases = &params["model.layers.0.mlp.switch_mlp.down_proj.biases"];
+        assert_eq!(biases.dtype().unwrap(), DType::Float16);
+        assert_eq!(biases.shape().unwrap().to_vec(), vec![2, 4, 2]);
+        assert_eq!(
+            biases.to_uint16_native().unwrap()[..2],
+            [
+                half::f16::from_f32(0.5).to_bits(),
+                half::f16::from_f32(-0.25).to_bits(),
+            ]
+        );
+
+        let config: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("config.json")).unwrap()).unwrap();
+        assert_eq!(
+            config["quantization"]["language_model.model.layers.0.mlp.switch_mlp.down_proj"]["mode"],
+            serde_json::json!("q4k")
+        );
+
+        // The repack is rank-agnostic: the source's own leading axis survives.
+        let source = gguf
+            .tensors
+            .iter()
+            .find(|tensor| tensor.name == "blk.0.ffn_down_exps.weight")
+            .unwrap();
+        assert_eq!(source.mlx_shape(), vec![2, 4, 256]);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Real-file oracle for `unsloth/Qwen-AgentWorld-35B-A3B-GGUF`
+    /// (`Qwen-AgentWorld-35B-A3B-UD-Q4_K_XL.gguf`).
+    ///
+    /// Header only: every one of the 733 descriptors must map into the sparse
+    /// runtime namespace with no unmapped name, no collision, and no leftover
+    /// ggml infix; the synthesized config must carry every expert field the MoE
+    /// loader requires.
+    #[test]
+    #[ignore = "requires the official Qwen-AgentWorld-35B-A3B GGUF (MLX_TEST_QWEN35_MOE_GGUF)"]
+    fn real_qwen35_moe_descriptors_map_into_the_runtime_namespace() {
+        let input = std::env::var("MLX_TEST_QWEN35_MOE_GGUF")
+            .expect("set MLX_TEST_QWEN35_MOE_GGUF to the UD-Q4_K_XL checkpoint");
+        let gguf = parse_gguf(Path::new(&input)).expect("real GGUF header must parse");
+        assert!(
+            is_qwen35_moe_main_gguf(&gguf.metadata),
+            "the real checkpoint must carry the qwen35moe architecture tag"
+        );
+        assert_eq!(qwen35_inline_mtp_index(&gguf).unwrap(), None);
+
+        validate_qwen35_standalone_geometry(&gguf.metadata)
+            .expect("the real header must satisfy the standalone geometry gate");
+
+        let mut mapped = std::collections::BTreeSet::new();
+        for tensor in &gguf.tensors {
+            let hf = gguf_name_to_hf_for_metadata(&tensor.name, &gguf.metadata)
+                .unwrap_or_else(|| panic!("{} has no runtime mapping", tensor.name));
+            assert!(
+                mapped.insert(hf.clone()),
+                "{hf} is produced by two source tensors"
+            );
+        }
+        assert_eq!(mapped.len(), gguf.tensors.len());
+
+        let mut expected = std::collections::BTreeSet::new();
+        for name in [
+            "model.embed_tokens.weight",
+            "model.norm.weight",
+            "lm_head.weight",
+        ] {
+            expected.insert(name.to_string());
+        }
+        for layer in 0..gguf
+            .metadata
+            .get("qwen35moe.block_count")
+            .and_then(GgufMetaValue::as_u64)
+            .expect("block_count") as usize
+        {
+            let prefix = format!("model.layers.{layer}");
+            for suffix in [
+                "mlp.switch_mlp.gate_proj.weight",
+                "mlp.switch_mlp.up_proj.weight",
+                "mlp.switch_mlp.down_proj.weight",
+                "mlp.gate.weight",
+                "mlp.shared_expert_gate.weight",
+                "mlp.shared_expert.gate_proj.weight",
+                "mlp.shared_expert.up_proj.weight",
+                "mlp.shared_expert.down_proj.weight",
+                "input_layernorm.weight",
+                "post_attention_layernorm.weight",
+            ] {
+                expected.insert(format!("{prefix}.{suffix}"));
+            }
+            if (layer + 1) % 4 == 0 {
+                for suffix in [
+                    "self_attn.q_proj.weight",
+                    "self_attn.k_proj.weight",
+                    "self_attn.v_proj.weight",
+                    "self_attn.o_proj.weight",
+                    "self_attn.q_norm.weight",
+                    "self_attn.k_norm.weight",
+                ] {
+                    expected.insert(format!("{prefix}.{suffix}"));
+                }
+            } else {
+                for suffix in [
+                    "linear_attn.in_proj_qkv.weight",
+                    "linear_attn.in_proj_z.weight",
+                    "linear_attn.in_proj_b.weight",
+                    "linear_attn.in_proj_a.weight",
+                    "linear_attn.conv1d.weight",
+                    "linear_attn.dt_bias",
+                    "linear_attn.A_log",
+                    "linear_attn.norm.weight",
+                    "linear_attn.out_proj.weight",
+                ] {
+                    expected.insert(format!("{prefix}.{suffix}"));
+                }
+            }
+        }
+        assert_eq!(
+            mapped, expected,
+            "the rename table must cover the file exactly"
+        );
+
+        let config = extract_config(&gguf.metadata);
+        assert_eq!(config["model_type"], serde_json::json!("qwen3_5_moe"));
+        assert_eq!(config["num_hidden_layers"], serde_json::json!(40));
+        assert_eq!(config["hidden_size"], serde_json::json!(2048));
+        assert_eq!(config["head_dim"], serde_json::json!(256));
+        assert_eq!(config["num_attention_heads"], serde_json::json!(16));
+        assert_eq!(config["num_key_value_heads"], serde_json::json!(2));
+        assert_eq!(config["num_experts"], serde_json::json!(256));
+        assert_eq!(config["num_experts_per_tok"], serde_json::json!(8));
+        assert_eq!(config["moe_intermediate_size"], serde_json::json!(512));
+        assert_eq!(
+            config["shared_expert_intermediate_size"],
+            serde_json::json!(512)
+        );
+        assert_eq!(config["linear_num_value_heads"], serde_json::json!(32));
+        assert_eq!(config["linear_num_key_heads"], serde_json::json!(16));
+        assert_eq!(config["linear_key_head_dim"], serde_json::json!(128));
+        assert_eq!(config["linear_value_head_dim"], serde_json::json!(128));
+        assert_eq!(config["linear_conv_kernel_dim"], serde_json::json!(4));
+        assert_eq!(config["full_attention_interval"], serde_json::json!(4));
+        assert_eq!(config["partial_rotary_factor"], serde_json::json!(0.25));
+        assert_eq!(config["max_position_embeddings"], serde_json::json!(262144));
+        assert_eq!(config["vocab_size"], serde_json::json!(248320));
+    }
+
+    /// Full conversion of the real checkpoint into the native cache. Slow
+    /// (21 GiB in, the same in safetensors out) and only meaningful on the
+    /// machine that holds the file, hence `#[ignore]`.
+    #[tokio::test]
+    #[ignore = "requires the official Qwen-AgentWorld-35B-A3B GGUF (MLX_TEST_QWEN35_MOE_GGUF)"]
+    async fn real_qwen35_moe_gguf_prepares_the_native_cache() {
+        let input = PathBuf::from(
+            std::env::var("MLX_TEST_QWEN35_MOE_GGUF")
+                .expect("set MLX_TEST_QWEN35_MOE_GGUF to the UD-Q4_K_XL checkpoint"),
+        );
+        let cache_root = PathBuf::from(
+            std::env::var("MLX_TEST_QWEN35_MOE_CACHE_ROOT")
+                .expect("set MLX_TEST_QWEN35_MOE_CACHE_ROOT to a scratch directory"),
+        );
+        fs::create_dir_all(&cache_root).unwrap();
+
+        let output = prepare_qwen35_moe_native_gguf_in(&input, &cache_root)
+            .await
+            .unwrap_or_else(|error| panic!("real checkpoint conversion failed: {}", error.reason));
+
+        let marker = fs::read_to_string(output.join(".complete")).unwrap();
+        assert!(marker.contains("layout=tiled-moe-v1\n"));
+
+        let config: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("config.json")).unwrap()).unwrap();
+        assert_eq!(config["model_type"], serde_json::json!("qwen3_5_moe"));
+        assert_eq!(config["qwen35_gguf_gdn_layout"], serde_json::json!("tiled"));
+        assert_eq!(config["num_experts"], serde_json::json!(256));
+        assert_eq!(
+            config["quantization"]["language_model.model.layers.0.mlp.switch_mlp.gate_proj"]["mode"],
+            serde_json::json!("q4k")
+        );
+
+        let gguf = parse_gguf(&input).unwrap();
+        // The repack is rank-agnostic: an imported expert stack keeps the
+        // source tensor's leading axes and only the innermost one changes to
+        // the format's packed width.
+        let packed_shape = |source: &str| -> Vec<i64> {
+            let tensor = gguf
+                .tensors
+                .iter()
+                .find(|tensor| tensor.name == source)
+                .unwrap_or_else(|| panic!("{source} missing from the header"));
+            let format = tensor.tensor_type.k_quant_format().expect("K-quant source");
+            let mut shape = tensor.mlx_shape();
+            let k = *shape.last().unwrap() as usize;
+            *shape.last_mut().unwrap() = format.weight_cols(k) as i64;
+            shape
+        };
+
+        let params =
+            crate::utils::safetensors::load_safetensors_lazy(output.join("model.safetensors"))
+                .unwrap();
+        let shape = |key: &str| {
+            params
+                .get(key)
+                .unwrap_or_else(|| panic!("{key} missing from the converted cache"))
+                .shape()
+                .unwrap()
+                .to_vec()
+        };
+        assert_eq!(
+            shape("model.layers.0.mlp.switch_mlp.gate_proj.weight"),
+            vec![256, 512, 256]
+        );
+        assert_eq!(
+            shape("model.layers.0.mlp.switch_mlp.gate_proj.weight"),
+            packed_shape("blk.0.ffn_gate_exps.weight")
+        );
+        assert_eq!(
+            shape("model.layers.0.mlp.switch_mlp.down_proj.weight"),
+            packed_shape("blk.0.ffn_down_exps.weight")
+        );
+        assert_eq!(
+            shape("model.layers.0.mlp.gate.weight"),
+            gguf.tensors
+                .iter()
+                .find(|tensor| tensor.name == "blk.0.ffn_gate_inp.weight")
+                .unwrap()
+                .mlx_shape()
+        );
+        // llama.cpp's bare `[hidden]` vector lands as the `Linear(hidden, 1)`
+        // row the MoE block expects.
+        assert_eq!(
+            shape("model.layers.0.mlp.shared_expert_gate.weight"),
+            vec![1, 2048]
+        );
+        assert_eq!(
+            params["model.layers.0.mlp.switch_mlp.gate_proj.weight"]
+                .dtype()
+                .unwrap(),
+            DType::Uint32
+        );
+        assert_eq!(
+            params["model.layers.0.mlp.switch_mlp.gate_proj.scales"]
+                .dtype()
+                .unwrap(),
+            DType::Uint8
+        );
+        assert_eq!(
+            params["model.layers.0.mlp.switch_mlp.down_proj.scales"]
+                .dtype()
+                .unwrap(),
+            DType::Uint8
+        );
+        assert!(params.contains_key("model.layers.3.self_attn.q_proj.weight"));
+        assert!(params.contains_key("model.layers.0.linear_attn.A_log"));
     }
 
     #[test]
@@ -7109,6 +8609,359 @@ mod tests {
         .unwrap();
         fs::remove_file(&tmp).ok();
         weights
+    }
+
+    /// Hand-build one ggml `block_q5_1`: f16 `d`, f16 `m`, 4 high-bit bytes,
+    /// 16 nibble bytes — the layout Unsloth's UD recipes put the expert down
+    /// projections in.
+    fn pack_q5_1_block(codes: &[u8; 32], d: f32, m: f32) -> [u8; 24] {
+        let mut block = [0u8; 24];
+        block[0..2].copy_from_slice(&half::f16::from_f32(d).to_le_bytes());
+        block[2..4].copy_from_slice(&half::f16::from_f32(m).to_le_bytes());
+        let mut qh = 0u32;
+        for j in 0..16 {
+            assert!(codes[j] < 32 && codes[j + 16] < 32, "5-bit codes only");
+            // Low nibble of `qs[j]` holds value `j`, its high nibble value
+            // `j + 16`; the fifth bit of each lives in `qh` at the same index.
+            block[8 + j] = (codes[j] & 0x0F) | ((codes[j + 16] & 0x0F) << 4);
+            qh |= u32::from((codes[j] >> 4) & 1) << j;
+            qh |= u32::from((codes[j + 16] >> 4) & 1) << (j + 16);
+        }
+        block[4..8].copy_from_slice(&qh.to_le_bytes());
+        block
+    }
+
+    /// A Q5_1 block repacks losslessly: the 5-bit codes survive value-for-value
+    /// in MLX's LSB-first stream and `d`/`m` become the affine scale/bias, so
+    /// MLX's affine dequantize at (group 32, 5 bits) reproduces `d*q + m`
+    /// exactly.
+    #[test]
+    fn q5_1_import_round_trips_codes_scales_biases_and_values() {
+        let mut codes = [0u8; 32];
+        for (v, code) in codes.iter_mut().enumerate() {
+            // Spans both nibble halves and both `qh` bit ranges, so a
+            // half-swap or a missing fifth bit cannot pass.
+            *code = ((v as u32 * 7 + 3) % 32) as u8;
+        }
+        let block = pack_q5_1_block(&codes, 0.5, -0.25);
+        // 256 values is eight 32-value blocks, each a whole number of words.
+        let payload: Vec<u8> = (0..8).flat_map(|_| block.iter().copied()).collect();
+        let weights = load_single_kquant_block(GgufTensorType::Q5_1, &payload);
+
+        let weight = weights.get("blk.0.ffn_down.weight").expect("packed weight");
+        assert_eq!(weight.dtype().unwrap(), DType::Uint32);
+        // 256 values at 5 bits = 40 uint32 words.
+        assert_eq!(weight.shape().unwrap().to_vec(), vec![1, 40]);
+        let packed: Vec<u32> = weight.to_uint32().unwrap().iter().copied().collect();
+        let want_codes: Vec<u32> = (0..8)
+            .flat_map(|_| codes.iter().map(|&c| u32::from(c)))
+            .collect();
+        assert_eq!(unpack_lsb_codes(&packed, 5, 256), want_codes);
+
+        let scales = weights.get("blk.0.ffn_down.scales").expect("scales");
+        assert_eq!(scales.dtype().unwrap(), DType::Float16);
+        assert_eq!(scales.shape().unwrap().to_vec(), vec![1, 8]);
+        assert_eq!(
+            scales.to_uint16_native().unwrap(),
+            vec![half::f16::from_f32(0.5).to_bits(); 8]
+        );
+        // Q5_1 stores a real per-block minimum, so its group keeps a `.biases`
+        // companion (unlike the symmetric Q4_0/Q8_0 forms).
+        let biases = weights.get("blk.0.ffn_down.biases").expect("biases");
+        assert_eq!(biases.dtype().unwrap(), DType::Float16);
+        assert_eq!(
+            biases.to_uint16_native().unwrap(),
+            vec![half::f16::from_f32(-0.25).to_bits(); 8]
+        );
+
+        // The value contract: MLX's own affine dequantize must reproduce
+        // `d * q + m` for every code, which is what makes this repack
+        // lossless rather than an approximation.
+        let dequantized = dequantize_affine(
+            &weights["blk.0.ffn_down.weight"],
+            &weights["blk.0.ffn_down.scales"],
+            &weights["blk.0.ffn_down.biases"],
+            5,
+            32,
+        );
+        let want: Vec<f32> = (0..8)
+            .flat_map(|_| {
+                let d = half::f16::from_f32(0.5).to_f32();
+                let m = half::f16::from_f32(-0.25).to_f32();
+                codes.iter().map(move |&q| d * f32::from(q) + m)
+            })
+            .collect();
+        assert_eq!(dequantized, want);
+    }
+
+    /// Dequantize an MLX affine group through the same FFI the loaders use.
+    fn dequantize_affine(
+        weight: &MxArray,
+        scales: &MxArray,
+        biases: &MxArray,
+        bits: u32,
+        group_size: usize,
+    ) -> Vec<f32> {
+        let mode = std::ffi::CString::new("affine").unwrap();
+        let handle = unsafe {
+            mlx_sys::mlx_dequantize(
+                weight.as_raw_ptr(),
+                scales.as_raw_ptr(),
+                biases.as_raw_ptr(),
+                group_size as i32,
+                bits as i32,
+                -1,
+                mode.as_ptr(),
+            )
+        };
+        assert!(!handle.is_null(), "affine dequantize failed");
+        let array = MxArray::from_handle(handle, "q5_1_dequant").unwrap();
+        array.eval();
+        array.to_float32().unwrap().to_vec()
+    }
+
+    /// llama.cpp's sparse Gemma4 names map onto the router/expert namespace the
+    /// loader reads, including the two `.scale` buffers whose HF names are not
+    /// an infix rewrite of their GGUF ones.
+    #[test]
+    fn gemma4_sparse_rename_table_covers_router_and_expert_stacks() {
+        let metadata = HashMap::from([(
+            "general.architecture".to_string(),
+            GgufMetaValue::String("gemma4".to_string()),
+        )]);
+
+        for (gguf_name, hf) in [
+            (
+                "blk.0.ffn_gate_inp.weight",
+                "model.layers.0.router.proj.weight",
+            ),
+            ("blk.0.ffn_gate_inp.scale", "model.layers.0.router.scale"),
+            (
+                "blk.0.ffn_down_exps.scale",
+                "model.layers.0.router.per_expert_scale",
+            ),
+            (
+                "blk.0.ffn_gate_up_exps.weight",
+                "model.layers.0.experts.gate_up_proj.weight",
+            ),
+            (
+                "blk.0.ffn_gate_up_exps.scales",
+                "model.layers.0.experts.gate_up_proj.scales",
+            ),
+            (
+                "blk.0.ffn_down_exps.weight",
+                "model.layers.0.experts.down_proj.weight",
+            ),
+            // The `.scales` sidecar shares its prefix with the `.scale`
+            // buffer, so the buffer's rule must not touch it.
+            (
+                "blk.0.ffn_down_exps.scales",
+                "model.layers.0.experts.down_proj.scales",
+            ),
+            (
+                "blk.0.ffn_down_exps.biases",
+                "model.layers.0.experts.down_proj.biases",
+            ),
+            // The dense Gemma4 projections keep their existing mapping.
+            (
+                "blk.0.ffn_gate.weight",
+                "model.layers.0.mlp.gate_proj.weight",
+            ),
+            (
+                "blk.0.ffn_down.weight",
+                "model.layers.0.mlp.down_proj.weight",
+            ),
+        ] {
+            assert_eq!(
+                gguf_name_to_hf_for_metadata(gguf_name, &metadata).as_deref(),
+                Some(hf),
+                "{gguf_name} must map to {hf}"
+            );
+        }
+    }
+
+    /// A 3-D Q5_1 expert stack becomes an affine 5-bit group in the written
+    /// quantization metadata, and the loader's affine switch builder accepts
+    /// that group at the real ggml geometry (group 32, 5 bits).
+    #[test]
+    fn q5_1_expert_stack_publishes_affine_five_bit_metadata_the_loader_accepts() {
+        let mut gguf = source_quant_fixture(&[
+            ("blk.0.ffn_down_exps.weight", GgufTensorType::Q5_1),
+            // The real UD recipe mixes formats, which is what makes the writer
+            // spell out an entry per tensor instead of one top-level triple.
+            ("blk.0.ffn_gate_up_exps.weight", GgufTensorType::Q4K),
+            ("blk.1.ffn_down_exps.weight", GgufTensorType::Q8_0),
+        ]);
+        gguf.metadata.insert(
+            "general.architecture".into(),
+            GgufMetaValue::String("gemma4".into()),
+        );
+        gguf.metadata
+            .insert("gemma4.expert_count".into(), GgufMetaValue::Uint32(2));
+
+        let quant = preserved_source_quantization(&gguf, true)
+            .unwrap()
+            .expect("a Q5_1 tensor must publish a quantization block");
+        let entry = &quant["language_model.model.layers.0.experts.down_proj"];
+        assert_eq!(entry["bits"], serde_json::json!(5));
+        assert_eq!(entry["group_size"], serde_json::json!(32));
+        assert_eq!(entry["mode"], serde_json::json!("affine"));
+        assert!(
+            entry.get(SYMMETRIC_ZERO_POINT_KEY).is_none(),
+            "Q5_1 stores a real per-block minimum; it is not symmetric"
+        );
+
+        let (_, _, _, per_layer) =
+            crate::models::quant_dispatch::parse_quant_settings(Some(&quant), 4, 64)
+                .expect("the published block must parse");
+        let plq = per_layer["layers.0.experts.down_proj"];
+        assert_eq!(plq.bits, 5);
+        assert_eq!(plq.group_size, 32);
+        assert_eq!(
+            plq.mode,
+            crate::models::quant_dispatch::PerLayerMode::Affine
+        );
+
+        // Real ggml geometry: K = 256 → 5-bit codes pack into 40 words.
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert(
+            "layers.0.experts.down_proj.weight".to_string(),
+            MxArray::from_uint32(&[0u32; 2 * 4 * 40], &[2, 4, 40]).expect("packed experts"),
+        );
+        params.insert(
+            "layers.0.experts.down_proj.scales".to_string(),
+            MxArray::from_float16(&[half::f16::from_f32(0.5).to_bits(); 2 * 4 * 8], &[2, 4, 8])
+                .expect("expert scales"),
+        );
+        params.insert(
+            "layers.0.experts.down_proj.biases".to_string(),
+            MxArray::from_float16(&[half::f16::from_f32(-0.25).to_bits(); 2 * 4], &[2, 4, 1])
+                .expect("expert biases"),
+        );
+        // The guards the Gemma4 loader runs before its switch builders must all
+        // accept the group the importer wrote: float sidecars for an affine
+        // mode, and a `.biases` companion (affine dequantize requires one).
+        crate::models::quant_dispatch::ensure_kquant_storage_resolves_kquant(
+            &params,
+            "layers.0.experts.down_proj",
+            plq.mode,
+            "gemma4",
+        )
+        .expect("float-only affine sidecars must not read as K-quant storage");
+        crate::models::quant_dispatch::ensure_affine_biases_present(
+            &params,
+            "layers.0.experts.down_proj",
+            plq.mode,
+            "gemma4",
+        )
+        .expect("Q5_1 keeps its stored minimum as the group's .biases");
+        let built = crate::models::gemma4::quantized_linear::try_build_quantized_switch_linear(
+            &params,
+            "layers.0.experts.down_proj",
+            plq.group_size,
+            plq.bits,
+        );
+        assert!(
+            built.is_some(),
+            "an affine 5-bit expert stack must build through the Gemma4 switch builder"
+        );
+    }
+
+    /// Real-file oracle for `unsloth/gemma-4-26B-A4B-it-GGUF`
+    /// (`gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf`): the sparse Gemma4 header must map
+    /// into the router/expert namespace with nothing left behind.
+    #[test]
+    #[ignore = "requires the official Gemma4 26B-A4B GGUF (MLX_TEST_GEMMA4_SPARSE_GGUF)"]
+    fn real_gemma4_sparse_descriptors_map_into_the_runtime_namespace() {
+        let input = std::env::var("MLX_TEST_GEMMA4_SPARSE_GGUF")
+            .expect("set MLX_TEST_GEMMA4_SPARSE_GGUF to the UD-Q4_K_XL checkpoint");
+        let gguf = parse_gguf(Path::new(&input)).expect("real GGUF header must parse");
+
+        let mut mapped = std::collections::BTreeSet::new();
+        for tensor in &gguf.tensors {
+            let Some(hf) = gguf_name_to_hf_for_metadata(&tensor.name, &gguf.metadata) else {
+                continue;
+            };
+            assert!(
+                mapped.insert(hf.clone()),
+                "{hf} is produced by two source tensors"
+            );
+        }
+        // Only the derived RoPE frequency table is dropped.
+        assert_eq!(mapped.len(), gguf.tensors.len() - 1);
+
+        let block_count = gguf
+            .metadata
+            .get("gemma4.block_count")
+            .and_then(GgufMetaValue::as_u64)
+            .expect("block_count") as usize;
+        for layer in 0..block_count {
+            let prefix = format!("model.layers.{layer}");
+            for suffix in [
+                "router.proj.weight",
+                "router.scale",
+                "router.per_expert_scale",
+                "experts.gate_up_proj.weight",
+                "experts.down_proj.weight",
+                "pre_feedforward_layernorm_2.weight",
+                "post_feedforward_layernorm_1.weight",
+                "post_feedforward_layernorm_2.weight",
+            ] {
+                assert!(
+                    mapped.contains(&format!("{prefix}.{suffix}")),
+                    "{prefix}.{suffix} missing from the mapped namespace"
+                );
+            }
+        }
+        for hf in &mapped {
+            assert!(
+                !hf.contains("_exps")
+                    && !hf.contains("ffn_gate_inp")
+                    && !hf.contains("pre_ffw_norm")
+                    && !hf.contains("post_ffw_norm")
+                    && !hf.contains("blk."),
+                "{hf} still carries a ggml-only name"
+            );
+        }
+        for name in [
+            "model.embed_tokens.weight",
+            "model.norm.weight",
+            "model.layers.0.router.proj.weight",
+            "model.layers.29.experts.down_proj.weight",
+        ] {
+            assert!(
+                mapped.contains(name),
+                "{name} missing from the mapped namespace"
+            );
+        }
+
+        // A quantized source tensor's sidecars are derived at import time
+        // (`{prefix}.scales`, plus `.biases` for the asymmetric formats) and
+        // then renamed by the same table as its `.weight`. A rule that moves
+        // the `.scale` buffer but not those (or vice versa) strands the packed
+        // weight, and the failure is silent until load.
+        for tensor in &gguf.tensors {
+            if !tensor.tensor_type.is_quantized() {
+                continue;
+            }
+            let Some(source_prefix) = tensor.name.strip_suffix(".weight") else {
+                continue;
+            };
+            let mapped = gguf_name_to_hf_for_metadata(&tensor.name, &gguf.metadata)
+                .expect("a quantized tensor must map");
+            let mapped_prefix = mapped.strip_suffix(".weight").unwrap_or(&mapped);
+            for suffix in [".scales", ".biases"] {
+                let derived = format!("{source_prefix}{suffix}");
+                let Some(renamed) = gguf_name_to_hf_for_metadata(&derived, &gguf.metadata) else {
+                    continue;
+                };
+                assert_eq!(
+                    renamed,
+                    format!("{mapped_prefix}{suffix}"),
+                    "derived sidecar '{derived}' must follow its packed weight"
+                );
+            }
+        }
     }
 
     #[test]
@@ -8204,6 +10057,19 @@ mod tests {
             (
                 "clip.vision.projector_type".to_string(),
                 GgufMetaValue::String("gemma4uv".to_string()),
+            ),
+        ])
+    }
+
+    fn gemma4v_mmproj_metadata() -> HashMap<String, GgufMetaValue> {
+        HashMap::from([
+            (
+                "general.architecture".to_string(),
+                GgufMetaValue::String("clip".to_string()),
+            ),
+            (
+                "clip.vision.projector_type".to_string(),
+                GgufMetaValue::String("gemma4v".to_string()),
             ),
         ])
     }
@@ -9795,6 +11661,131 @@ mod tests {
         );
         assert!(weights.contains_key("model.embed_vision.embedding_projection.weight"));
         assert!(weights.contains_key("model.embed_audio.embedding_projection.weight"));
+    }
+
+    #[test]
+    fn gemma4v_mmproj_mapping_covers_the_tower_and_drops_unknown_tensors() {
+        let metadata = gemma4v_mmproj_metadata();
+        for (suffix, mapped) in [
+            ("attn_q.weight", "self_attn.q_proj.weight"),
+            ("attn_k.weight", "self_attn.k_proj.weight"),
+            ("attn_v.weight", "self_attn.v_proj.weight"),
+            ("attn_out.weight", "self_attn.o_proj.weight"),
+            ("attn_q_norm.weight", "self_attn.q_norm.weight"),
+            ("attn_k_norm.weight", "self_attn.k_norm.weight"),
+            ("ln1.weight", "input_layernorm.weight"),
+            ("attn_post_norm.weight", "post_attention_layernorm.weight"),
+            ("ln2.weight", "pre_feedforward_layernorm.weight"),
+            ("ffn_post_norm.weight", "post_feedforward_layernorm.weight"),
+            ("ffn_gate.weight", "mlp.gate_proj.weight"),
+            ("ffn_up.weight", "mlp.up_proj.weight"),
+            ("ffn_down.weight", "mlp.down_proj.weight"),
+        ] {
+            let source = format!("v.blk.26.{suffix}");
+            assert_eq!(
+                gguf_name_to_hf_for_metadata(&source, &metadata),
+                Some(format!("model.vision_tower.encoder.layers.26.{mapped}")),
+                "mapping mismatch for {source}"
+            );
+        }
+        let cases = [
+            (
+                "v.patch_embd.weight",
+                Some("model.vision_tower.patch_embedder.input_proj.weight"),
+            ),
+            (
+                "v.position_embd.weight",
+                Some("model.vision_tower.patch_embedder.position_embedding_table"),
+            ),
+            ("v.std_bias", Some("model.vision_tower.std_bias")),
+            ("v.std_scale", Some("model.vision_tower.std_scale")),
+            (
+                "mm.input_projection.weight",
+                Some("model.embed_vision.embedding_projection.weight"),
+            ),
+            (
+                "mm.input_projection.scales",
+                Some("model.embed_vision.embedding_projection.scales"),
+            ),
+            (
+                "mm.input_projection.biases",
+                Some("model.embed_vision.embedding_projection.biases"),
+            ),
+            // Outside the tower's fixed inventory: dropped, not mislabeled
+            // into the Qwen-VL merger names the generic fallback would emit.
+            ("v.blk.0.attn_q.scales", None),
+            ("v.blk.0.attn_qkv.weight", None),
+            ("v.blk.0", None),
+            ("v.pre_ln.weight", None),
+            ("v.post_ln.weight", None),
+            ("v.patch_embd.bias", None),
+            ("mm.0.weight", None),
+            ("mm.a.input_projection.weight", None),
+            ("token_embd.weight", None),
+            ("blk.0.attn_q.weight", None),
+        ];
+        for (source, expected) in cases {
+            assert_eq!(
+                gguf_name_to_hf_for_metadata(source, &metadata).as_deref(),
+                expected,
+                "mapping mismatch for {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn gemma4v_mmproj_layout_flattens_the_conv_kernel_and_keeps_positions() {
+        let metadata = gemma4v_mmproj_metadata();
+        // `parse_gguf` reverses ggml dims (`mlx_shape`), so the file's
+        // [2, 2, 3, 1] conv kernel arrives as row-major [1, 3, 2, 2] =
+        // [hidden, channels, patch_h, patch_w].
+        let mut weights = HashMap::from([
+            (
+                "model.vision_tower.patch_embedder.input_proj.weight".to_string(),
+                MxArray::from_float32(
+                    &(0..12).map(|v| v as f32).collect::<Vec<_>>(),
+                    &[1, 3, 2, 2],
+                )
+                .unwrap(),
+            ),
+            (
+                "model.vision_tower.patch_embedder.position_embedding_table".to_string(),
+                MxArray::from_float32(&[0.0, 1.0, 2.0, 3.0], &[2, 2, 1]).unwrap(),
+            ),
+        ]);
+        fixup_gemma4v_mmproj_layout(&mut weights, &metadata).unwrap();
+
+        let patch = weights
+            .get("model.vision_tower.patch_embedder.input_proj.weight")
+            .unwrap();
+        // [out, C, H, W] → [out, H, W, C] → flatten to the HWC-ordered
+        // [hidden, patch*patch*channels] Linear contract.
+        assert_eq!(patch.shape().unwrap().as_ref(), &[1, 12]);
+        assert_eq!(
+            patch
+                .to_float32()
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![0.0, 4.0, 8.0, 1.0, 5.0, 9.0, 2.0, 6.0, 10.0, 3.0, 7.0, 11.0]
+        );
+
+        // ggml [hidden, positions, 2] already reverses to the checkpoint's
+        // [2, positions, hidden] — value order is a strict passthrough.
+        let position = weights
+            .get("model.vision_tower.patch_embedder.position_embedding_table")
+            .unwrap();
+        assert_eq!(position.shape().unwrap().as_ref(), &[2, 2, 1]);
+        assert_eq!(
+            position
+                .to_float32()
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![0.0, 1.0, 2.0, 3.0]
+        );
     }
 
     #[test]

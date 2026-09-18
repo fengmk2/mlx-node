@@ -24,9 +24,10 @@ import {
   statSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 
 import { matchFamily } from '@mlx-node/agent/catalog';
+import { isGgufCompanionName } from '@mlx-node/lm/model-discovery';
 
 export interface LocalModel {
   /** Checkpoint directory name under `modelsDir` (the model's local id). */
@@ -69,6 +70,20 @@ export interface DownloadCompletion {
    * compatibility with markers written before selection scope was recorded.
    */
   scope?: 'full' | 'partial';
+  /**
+   * Base-model repo that supplied this install's tokenizer/config sidecars,
+   * and the exact commit they were pinned to — the provenance update
+   * discovery compares in addition to `repo`/`revision`.
+   *
+   * Sidecar files carry no other source identity (they are folded into
+   * `files` like primary files), so without these two a base-repo tokenizer
+   * fix is invisible: the primary revision matches, no badge is raised, and
+   * no job exists to run the repair. Absent on installs that used no
+   * assetsRepo and on markers written before this field existed — unknown
+   * provenance compares as "no update known", never as "up to date".
+   */
+  assetsRepo?: string;
+  assetsRevision?: string;
   /** ISO timestamp of the atomic publish. */
   completedAt: string;
 }
@@ -77,10 +92,13 @@ export interface DownloadCompletion {
  * A file that carries a model's weights: safetensors, GGUF, or PaddlePaddle
  * params. The single source of truth for "is this a weight payload" — shared
  * with the download runner (`download.ts` imports it) so the publish-time
- * payload gate and the install check agree on the same extension set.
+ * payload gate and the install check agree. A companion GGUF does not count:
+ * a Gemma-style manifest carrying only `mmproj-BF16.gguf` (partial upstream
+ * upload, renamed target) must fail the payload gate rather than publish.
  */
 export function isWeightFile(path: string): boolean {
-  return path.endsWith('.safetensors') || path.endsWith('.gguf') || path.endsWith('.pdiparams');
+  if (path.endsWith('.gguf')) return !isGgufCompanionName(basename(path));
+  return path.endsWith('.safetensors') || path.endsWith('.pdiparams');
 }
 
 /**
@@ -147,7 +165,16 @@ export function isModelPresent(modelDir: string): boolean {
   if (isRegularFile(join(modelDir, 'model.safetensors'))) return true;
   if (isRegularFile(join(modelDir, 'weights.safetensors'))) return true;
   if (isRegularFile(join(modelDir, 'inference.pdiparams'))) return true;
-  if (entries.some((file) => file.endsWith('.gguf') && isRegularFile(join(modelDir, file)))) return true;
+  // A companion `.gguf` (mmproj/imatrix/dflash/draft) is NOT a loadable model:
+  // counting one as present disables Install on the card for a directory the
+  // loader never lists.
+  if (
+    entries.some(
+      (file) => file.endsWith('.gguf') && !isGgufCompanionName(file) && isRegularFile(join(modelDir, file)),
+    )
+  ) {
+    return true;
+  }
   // Sharded safetensors: every shard the index references must exist on disk —
   // otherwise an interrupted download that landed the index + only the first
   // shard would falsely read as present (matches the CLI's completeness check,
@@ -205,7 +232,11 @@ export function readCompletion(finalDir: string): DownloadCompletion | undefined
     typeof marker.completedAt !== 'string' ||
     !Array.isArray(marker.files) ||
     !marker.files.every((file) => typeof file === 'string') ||
-    (marker.scope !== undefined && marker.scope !== 'full' && marker.scope !== 'partial')
+    (marker.scope !== undefined && marker.scope !== 'full' && marker.scope !== 'partial') ||
+    // Sidecar provenance is optional (pre-provenance markers lack it) but must
+    // be a string when present — a numeric/object value is a malformed marker.
+    (marker.assetsRepo !== undefined && typeof marker.assetsRepo !== 'string') ||
+    (marker.assetsRevision !== undefined && typeof marker.assetsRevision !== 'string')
   ) {
     return undefined;
   }
@@ -214,6 +245,11 @@ export function readCompletion(finalDir: string): DownloadCompletion | undefined
     revision: marker.revision,
     files: marker.files,
     scope: marker.scope as DownloadCompletion['scope'],
+    // The fields every consumer actually reads — a marker parsed here drops
+    // anything not named, so new provenance MUST be threaded through or it
+    // never reaches update discovery.
+    ...(typeof marker.assetsRepo === 'string' ? { assetsRepo: marker.assetsRepo } : {}),
+    ...(typeof marker.assetsRevision === 'string' ? { assetsRevision: marker.assetsRevision } : {}),
     completedAt: marker.completedAt,
   };
 }

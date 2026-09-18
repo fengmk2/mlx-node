@@ -1,12 +1,15 @@
 import { X509Certificate } from 'node:crypto';
-import { mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { rootCertificates } from 'node:tls';
 
 import { describe, expect, it } from 'vite-plus/test';
 
 import {
   keychainCaRootsPem,
+  linuxCaRootsPem,
+  linuxCaSources,
   macosKeychains,
   parseTrustSettingsDump,
   prepareExtraCaBundle,
@@ -18,8 +21,10 @@ const ROOT_CA = readFileSync(join(FIXTURES, 'test-root-ca.pem'), 'utf8').trim();
 const LEAF = readFileSync(join(FIXTURES, 'test-leaf.pem'), 'utf8').trim();
 const ROOT_SHA1 = new X509Certificate(ROOT_CA).fingerprint.replaceAll(':', '');
 
-/** An arbitrary keychain path stand-in; candidates from ANY keychain now require explicit trust. */
+/** An arbitrary keychain path stand-in; candidates from it require explicit trust. */
 const SYSTEM_ROOTS = '/k/some-keychain';
+/** The two real keychain paths, in `macosKeychains()` order — the trust rules branch on them. */
+const [SYSTEM_KEYCHAIN, LOGIN_KEYCHAIN] = macosKeychains() as [string, string];
 
 const EMPTY_DUMP = `{
   "trustList" => {
@@ -400,6 +405,82 @@ describe('keychainCaRootsPem', () => {
     expect(installedOnly).toBe('');
   });
 
+  it('trusts a System-keychain CA root with no trust record, but never one a deny covers', async () => {
+    // Profile-driven (MDM/corporate MITM) roots land in the System keychain
+    // WITHOUT any `trust-settings-export` record, so the explicit-record rule
+    // silently omitted exactly the roots an intercepting network needs.
+    // System-keychain membership is admin-gated and therefore trust here.
+    const noRecords = await keychainCaRootsPem(fakeExec({ certs: { [SYSTEM_KEYCHAIN]: ROOT_CA } }), [SYSTEM_KEYCHAIN]);
+    expect(noRecords).toContain(ROOT_CA);
+
+    // The vetoes still apply: an explicit global deny…
+    const denied = await keychainCaRootsPem(
+      fakeExec({
+        certs: { [SYSTEM_KEYCHAIN]: ROOT_CA },
+        trust: trustDump([{ sha1: ROOT_SHA1, settings: [{ policy: 'sslServer', result: 3 }] }]),
+      }),
+      [SYSTEM_KEYCHAIN],
+    );
+    expect(denied).toBe('');
+
+    // …and a scoped one, which this bundle cannot express.
+    const scopedDeny = await keychainCaRootsPem(
+      fakeExec({
+        certs: { [SYSTEM_KEYCHAIN]: ROOT_CA },
+        trust: trustDump([
+          {
+            sha1: ROOT_SHA1,
+            settings: [{ policy: 'sslServer', result: 3, policyString: 'huggingface.co' }],
+          },
+        ]),
+      }),
+      [SYSTEM_KEYCHAIN],
+    );
+    expect(scopedDeny).toBe('');
+  });
+
+  it('withholds every root when a trust domain cannot be read, System keychain included', async () => {
+    // An unreadable domain hides its DENIES, and "Never Trust" is settable on
+    // a System-keychain item — so shipping such a root while its domain
+    // cannot be read would bypass a revocation the user performed. The
+    // System-keychain rule therefore only applies to fully readable
+    // trust settings:
+    const systemRoot = await keychainCaRootsPem(
+      fakeExec({ certs: { [SYSTEM_KEYCHAIN]: ROOT_CA }, userExport: 'fail' }),
+      [SYSTEM_KEYCHAIN],
+    );
+    expect(systemRoot).toBe('');
+
+    // The same root WITHOUT the unreadable domain is exported (the rule this
+    // guards), so the assertion above is about the flag, not about the cert.
+    const readable = await keychainCaRootsPem(fakeExec({ certs: { [SYSTEM_KEYCHAIN]: ROOT_CA } }), [SYSTEM_KEYCHAIN]);
+    expect(readable).toContain(ROOT_CA);
+
+    const loginRoot = await keychainCaRootsPem(
+      fakeExec({
+        certs: { [LOGIN_KEYCHAIN]: ROOT_CA },
+        trust: trustDump([{ sha1: ROOT_SHA1, settings: [{ policy: 'sslServer', result: 1 }] }]),
+        adminExport: 'fail',
+      }),
+      [LOGIN_KEYCHAIN],
+    );
+    expect(loginRoot).toBe('');
+  });
+
+  it('still requires an explicit record for the login keychain, where membership is not trust', async () => {
+    const loginOnly = await keychainCaRootsPem(fakeExec({ certs: { [LOGIN_KEYCHAIN]: ROOT_CA } }), [LOGIN_KEYCHAIN]);
+    expect(loginOnly).toBe('');
+
+    const withRecord = await keychainCaRootsPem(
+      fakeExec({
+        certs: { [LOGIN_KEYCHAIN]: ROOT_CA },
+        trust: trustDump([{ sha1: ROOT_SHA1, settings: [{ policy: 'sslServer', result: 1 }] }]),
+      }),
+      [LOGIN_KEYCHAIN],
+    );
+    expect(withRecord).toContain(ROOT_CA);
+  });
+
   it('excludes a root with a scoped deny even when another record allows it', async () => {
     // Cross-record composition: an unconditional sslServer allow in one
     // record plus a hostname-scoped deny ("never trust for huggingface.co")
@@ -482,6 +563,99 @@ describe('keychainCaRootsPem', () => {
   });
 });
 
+describe('linuxCaSources', () => {
+  it('covers the well-known generated stores, not the admin source dirs', () => {
+    const sources = linuxCaSources({});
+    // The post-decision artifacts: merged bundles and hashed dirs produced
+    // by update-ca-certificates / update-ca-trust.
+    expect(sources.files).toContain('/etc/ssl/certs/ca-certificates.crt'); // Debian/Ubuntu
+    expect(sources.files).toContain('/etc/pki/tls/certs/ca-bundle.crt'); // Fedora/RHEL
+    expect(sources.files).toContain('/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem'); // p11-kit TLS
+    expect(sources.dirs).toContain('/etc/ssl/certs');
+    // Admin SOURCE dirs are never stores: their contents are only trusted
+    // once the update tool merges them into an effective path.
+    expect(sources.dirs).not.toContain('/usr/local/share/ca-certificates');
+    expect(sources.dirs).not.toContain('/etc/pki/ca-trust/source');
+  });
+
+  it('honors SSL_CERT_FILE and the colon-separated SSL_CERT_DIR as extra sources', () => {
+    const sources = linuxCaSources({ SSL_CERT_FILE: '/corp/proxy-roots.pem', SSL_CERT_DIR: '/x/one:/x/two:' });
+    expect(sources.files[0]).toBe('/corp/proxy-roots.pem');
+    expect(sources.dirs.slice(0, 2)).toEqual(['/x/one', '/x/two']);
+    // Additive, not a replacement: the defaults are still scanned.
+    expect(sources.files).toContain('/etc/ssl/certs/ca-certificates.crt');
+    expect(sources.dirs).toContain('/etc/ssl/certs');
+  });
+});
+
+describe('linuxCaRootsPem', () => {
+  it('emits a root found in a store bundle file', async () => {
+    const file = join(tmpDir(), 'bundle.pem');
+    writeFileSync(file, `${ROOT_CA}\n`);
+    const pem = await linuxCaRootsPem({ files: [file], dirs: [] });
+    expect(pem).toContain(ROOT_CA);
+  });
+
+  it('emits only the delta over Node’s bundled store', async () => {
+    // A stock merged bundle mostly re-lists the Mozilla roots Node already
+    // carries; those are the baseline, not additions.
+    const bundled = rootCertificates[0];
+    expect(bundled).toBeDefined();
+    const file = join(tmpDir(), 'bundle.pem');
+    writeFileSync(file, `${bundled}\n${ROOT_CA}\n`);
+    const pem = await linuxCaRootsPem({ files: [file], dirs: [] });
+    expect(pem.match(/BEGIN CERTIFICATE/g)).toHaveLength(1);
+    expect(pem).toContain(ROOT_CA);
+    expect(pem).not.toContain(bundled!);
+  });
+
+  it('collects from hashed-store dirs and dedupes across sources', async () => {
+    const dir = join(tmpDir(), 'certs');
+    mkdirSync(dir);
+    writeFileSync(join(dir, 'a1b2c3d4.0'), `${ROOT_CA}\n`); // hashed-symlink shape
+    writeFileSync(join(dir, '5e6f7a8b.1'), 'not a certificate\n');
+    const file = join(tmpDir(), 'bundle.pem');
+    writeFileSync(file, `${ROOT_CA}\n`); // same root in a bundle too
+    const pem = await linuxCaRootsPem({ files: [file], dirs: [dir, join(tmpDir(), 'missing-dir')] });
+    expect(pem.match(/BEGIN CERTIFICATE/g)).toHaveLength(1);
+    expect(pem).toContain(ROOT_CA);
+  });
+
+  it('reads only hash-reachable dir entries — a stray cert file is not a store member', async () => {
+    // Fedora's /etc/pki/tls/certs/localhost.crt (mod_ssl's self-signed cert)
+    // sits in the dir without being hash-linked: OpenSSL never anchors on
+    // it, so neither do we. Symlinks (Debian's named + HASH.N links) and
+    // HASH.N-named files are the members.
+    const dir = join(tmpDir(), 'certs');
+    const outside = join(tmpDir(), 'target.pem');
+    mkdirSync(dir);
+    writeFileSync(join(dir, 'localhost.crt'), `${LEAF}\n`); // real file, not linked → not a member
+    writeFileSync(outside, `${ROOT_CA}\n`);
+    symlinkSync(outside, join(dir, 'Named_Root.pem')); // named symlink → member
+    const pem = await linuxCaRootsPem({ files: [], dirs: [dir] });
+    expect(pem).toContain(ROOT_CA);
+    expect(pem).not.toContain(LEAF);
+    expect(pem.match(/BEGIN CERTIFICATE/g)).toHaveLength(1);
+  });
+
+  it('exports a leaf the store contains — membership is the trust decision', async () => {
+    // Unlike the keychain path there is no `cert.ca` filter: OpenSSL
+    // anchors chains on leaf store entries too, so dropping one would break
+    // a deliberately pinned self-signed endpoint the OS trusts.
+    const file = join(tmpDir(), 'bundle.pem');
+    writeFileSync(file, `${LEAF}\n`);
+    const pem = await linuxCaRootsPem({ files: [file], dirs: [] });
+    expect(pem).toContain(LEAF);
+  });
+
+  it('skips unreadable and unparseable sources instead of failing', async () => {
+    const file = join(tmpDir(), 'bundle.pem');
+    writeFileSync(file, '-----BEGIN CERTIFICATE-----\nnot-a-cert\n-----END CERTIFICATE-----\n');
+    const pem = await linuxCaRootsPem({ files: [join(tmpDir(), 'missing.pem'), file], dirs: [] });
+    expect(pem).toBe('');
+  });
+});
+
 describe('prepareExtraCaBundle', () => {
   it('treats an empty trust domain as no records, not a read failure', async () => {
     // `security trust-settings-export` exits 1 with "No Trust Settings were
@@ -505,11 +679,12 @@ describe('prepareExtraCaBundle', () => {
   });
 
   it('ships no keychain roots when a trust domain cannot be read', async () => {
-    // Decisions merge allow-OR/deny-OR across the user and admin domains, so
-    // exporting with only the domains that read successfully would keep their
-    // allows while silently dropping the failed domain's denies — restoring a
-    // trust the user explicitly revoked. The whole keychain bundle is
-    // abandoned instead (startup itself is unaffected).
+    // Decisions merge allow-OR/deny-OR across the user and admin domains, so a
+    // non-System-keychain root must not be licensed by the domains that DID
+    // read: their allows would ride along while the failed domain's denies are
+    // silently dropped — restoring a trust the user explicitly revoked.
+    // (System-keychain roots are the deliberate exception: they need no trust
+    // record, see the unreadable-domain test above.) Startup is unaffected.
     const dir = tmpDir();
     const result = await prepareExtraCaBundle({
       platform: 'darwin',
@@ -524,14 +699,71 @@ describe('prepareExtraCaBundle', () => {
     expect(result).toBeNull();
   });
 
-  it('is a no-op off macOS', async () => {
+  it('is a no-op on an unsupported platform', async () => {
     const result = await prepareExtraCaBundle({
-      platform: 'linux',
+      platform: 'win32',
       dir: tmpDir(),
       exec: fakeExec({ certs: { [SYSTEM_ROOTS]: ROOT_CA } }),
       keychains: [SYSTEM_ROOTS],
     });
     expect(result).toBeNull();
+  });
+
+  it('bundles a Linux store root Node does not carry', async () => {
+    const dir = tmpDir();
+    const store = join(dir, 'ca-certificates.crt');
+    writeFileSync(store, `${ROOT_CA}\n`);
+    const result = await prepareExtraCaBundle({
+      platform: 'linux',
+      dir,
+      exec: fakeExec({ certs: {} }),
+      linuxSources: { files: [store], dirs: [] },
+    });
+    expect(result).toBe(join(dir, 'system-ca-roots.pem'));
+    expect(readFileSync(result!, 'utf8')).toContain(ROOT_CA);
+    expect(statSync(result!).mode & 0o777).toBe(0o600);
+  });
+
+  it('never invokes exec on the Linux path', async () => {
+    // The collector is pure file reads; a regression that shelled out would
+    // be swallowed by the catch and surface only as a stray warn — count it.
+    let calls = 0;
+    const exec: ExecText = async () => {
+      calls += 1;
+      throw new Error('must not be called on linux');
+    };
+    const store = join(tmpDir(), 'bundle.pem');
+    writeFileSync(store, `${ROOT_CA}\n`);
+    await prepareExtraCaBundle({ platform: 'linux', dir: tmpDir(), exec, linuxSources: { files: [store], dirs: [] } });
+    expect(calls).toBe(0);
+  });
+
+  it('returns null on a stock Linux machine whose store adds nothing', async () => {
+    const result = await prepareExtraCaBundle({
+      platform: 'linux',
+      dir: tmpDir(),
+      exec: fakeExec({ certs: {} }),
+      linuxSources: { files: [join(tmpDir(), 'no-such-store.pem')], dirs: [] },
+    });
+    expect(result).toBeNull();
+  });
+
+  it('merges an inherited bundle into Linux store roots too', async () => {
+    const dir = tmpDir();
+    const store = join(dir, 'ca-bundle.crt');
+    const inherited = join(dir, 'inherited.pem');
+    writeFileSync(store, `${ROOT_CA}\n`);
+    writeFileSync(inherited, `${LEAF}\n`);
+    const result = await prepareExtraCaBundle({
+      platform: 'linux',
+      dir,
+      exec: fakeExec({ certs: {} }),
+      inheritedPath: inherited,
+      linuxSources: { files: [store], dirs: [] },
+    });
+    const written = readFileSync(result!, 'utf8');
+    expect(written).toContain(ROOT_CA);
+    expect(written).toContain(LEAF);
   });
 
   it('writes a 0600 bundle of trusted roots and returns its path', async () => {

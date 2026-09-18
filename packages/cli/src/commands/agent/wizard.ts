@@ -10,7 +10,7 @@
 
 import { join } from 'node:path';
 
-import { catalogRepo, visibleCatalog } from '@mlx-node/agent';
+import { type CatalogEntry, catalogRepo, catalogSelectionForRepo, visibleCatalog } from '@mlx-node/agent';
 
 export interface WizardIO {
   select: (opts: { message: string; choices: Array<{ name: string; value: string }> }) => Promise<string>;
@@ -41,9 +41,29 @@ function repoSlug(hfRepo: string): string {
  * dir in play the output is pinned to `<modelsDir>/<slug>` — otherwise a
  * copy-pasted hint would download to the DEFAULT dir and a re-run under
  * a custom `--models-dir` would still find nothing.
+ *
+ * The GGUF selection fields ride along so the wizard installs exactly the
+ * same file set the dashboard does: one UD-Q4_K_XL variant out of a
+ * multi-quant GGUF repo, plus the base-model tokenizer sidecars that GGUF
+ * repos lack (without them the runtime falls back to its embedded tokenizer
+ * extraction and tool calling silently breaks). Both fields describe the
+ * GGUF build only — a platform override (the pre-converted CUDA repo)
+ * installs as a plain safetensors directory.
  */
-function downloadModelArgv(hfRepo: string, modelsDir: string | undefined): string[] {
+function downloadModelArgv(entry: CatalogEntry, modelsDir: string | undefined): string[] {
+  const hfRepo = catalogRepo(entry);
+  const selection = catalogSelectionForRepo(entry, hfRepo);
   const argv = ['-m', hfRepo];
+  for (const glob of selection.globs ?? []) {
+    argv.push('-g', glob);
+  }
+  if (selection.assetsRepo !== undefined) {
+    argv.push('--assets-repo', selection.assetsRepo);
+  }
+  // The catalog's prescribed selection is the COMPLETE model, so the marker
+  // must not read as a partial (arbitrary-subset) glob run: the dashboard
+  // only treats full markers as installed and only offers updates for them.
+  argv.push('--complete');
   if (modelsDir) {
     argv.push('-o', join(modelsDir, repoSlug(hfRepo)));
   }
@@ -76,10 +96,7 @@ export async function runFirstRunWizard(deps: WizardDeps): Promise<string> {
 
   if (!deps.io.isTTY) {
     const commands = catalog
-      .map(
-        (entry) =>
-          `  mlx download model ${downloadModelArgv(catalogRepo(entry), deps.modelsDir).map(shellQuote).join(' ')}`,
-      )
+      .map((entry) => `  mlx download model ${downloadModelArgv(entry, deps.modelsDir).map(shellQuote).join(' ')}`)
       .join('\n');
     throw new Error(
       `No local models found. Run in a terminal for the setup wizard, or download one directly:\n${commands}`,
@@ -96,6 +113,12 @@ export async function runFirstRunWizard(deps: WizardDeps): Promise<string> {
     })),
   });
 
-  await deps.download(downloadModelArgv(chosen, deps.modelsDir));
+  // The select value is the platform-resolved repo; map it back to the entry
+  // so its globs/assetsRepo reach the download argv.
+  const chosenEntry = ordered.find((entry) => catalogRepo(entry) === chosen);
+  if (chosenEntry === undefined) {
+    throw new Error(`Wizard choice "${chosen}" is not in the visible catalog`);
+  }
+  await deps.download(downloadModelArgv(chosenEntry, deps.modelsDir));
   return chosen;
 }

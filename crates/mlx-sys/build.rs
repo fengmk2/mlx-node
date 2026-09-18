@@ -131,17 +131,66 @@ fn metal_toolchain_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Explicit deployment-target floor for the macOS build products. When unset,
-/// every toolchain stamps its own default and the artifact floor silently
-/// tracks the build machine: the metal compiler uses the SDK's default min-OS
-/// and MLX's CMake defaults `CMAKE_OSX_DEPLOYMENT_TARGET` to the build host's
-/// macOS version. Setting `MACOSX_DEPLOYMENT_TARGET` (already honored by
-/// rustc and cc for the Rust side) makes the floor deliberate for the CMake
-/// and metallib products too.
+/// Deployment-target floor for the macOS build products when
+/// `MACOSX_DEPLOYMENT_TARGET` is unset.
+///
+/// The project's floor is macOS 26.0: one published artifact carries the NAX
+/// kernels behind a runtime gate while the metallib links at the floor (see
+/// the `MLX_METAL_FORCE_NAX` block below). Leaving the default to the
+/// toolchains breaks that promise silently — MLX's CMake and `xcrun metal`
+/// both target the BUILD HOST, so a build on macOS 27 emits `air64_v29`
+/// shaders ("language version 4.1") that a macOS 26 host refuses to load at
+/// runtime while the rest of the app launches fine (measured: default
+/// `xcrun metal` = `air64_v29-apple-macosx27.0.0`,
+/// `-mmacosx-version-min=26.0` = `air64_v28-apple-macosx26.0.0`). This MLX
+/// revision's kernels also fail to COMPILE against the newer default
+/// language version, so the floor is a build requirement, not a preference.
+const MACOS_DEPLOYMENT_TARGET_FLOOR: &str = "26.0";
+
+/// The build host's macOS version as `(major, minor)`, via `sw_vers`.
+fn host_macos_version() -> Option<(u64, u64)> {
+    // The absolute path survives build environments with a stripped PATH —
+    // a PATH lookup that fails here would silently drop the floor back to
+    // the toolchain default (the air64_v29 problem above).
+    let output = Command::new("/usr/bin/sw_vers")
+        .arg("-productVersion")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut parts = text.trim().split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().and_then(|part| part.parse().ok()).unwrap_or(0);
+    Some((major, minor))
+}
+
+/// The floor applied when `MACOSX_DEPLOYMENT_TARGET` is unset: the project
+/// floor, never ABOVE the build host's own version. A local source build is
+/// documented to work on macOS 14 or newer — pinning 26.0 there emits
+/// binaries the host cannot run, and an older SDK can reject the future
+/// `-mmacosx-version-min` outright. The floor only matters on hosts NEWER
+/// than it (the air64_v29 case above), so capping the unset fallback at the
+/// host version loses nothing: macOS 27+ still gets 26.0, older hosts get
+/// exactly what their toolchain would have produced anyway.
+fn default_macos_deployment_target() -> Option<String> {
+    let (major, minor) = host_macos_version()?;
+    if (major, minor) > (26, 0) {
+        Some(MACOS_DEPLOYMENT_TARGET_FLOOR.to_string())
+    } else {
+        Some(format!("{major}.{minor}"))
+    }
+}
+
+/// Explicit deployment-target floor for the macOS build products. Setting
+/// `MACOSX_DEPLOYMENT_TARGET` (already honored by rustc and cc for the Rust
+/// side) overrides it for the CMake and metallib products too.
 fn macos_deployment_target() -> Option<String> {
     env::var("MACOSX_DEPLOYMENT_TARGET")
         .ok()
         .filter(|v| !v.is_empty())
+        .or_else(default_macos_deployment_target)
 }
 
 /// Compile the paged-attention `.metal` sources into
@@ -179,6 +228,9 @@ fn compile_paged_attn_metallib(manifest_dir: &Path, out_dir: &Path) -> PathBuf {
         "cache/copy_blocks.metal",
     ];
 
+    // Resolved once: it probes the host (`sw_vers`), not something per file.
+    let deployment_target = macos_deployment_target();
+
     let mut air_files = Vec::new();
     for file in &metal_files {
         let src_path = metal_src_dir.join(file);
@@ -203,7 +255,7 @@ fn compile_paged_attn_metallib(manifest_dir: &Path, out_dir: &Path) -> PathBuf {
         // what MLX's kernel CMake does for mlx.metallib. The metal driver
         // reads MACOSX_DEPLOYMENT_TARGET from the environment too, but the
         // explicit flag keeps the floor visible in the command line.
-        if let Some(target) = macos_deployment_target() {
+        if let Some(target) = &deployment_target {
             compile_cmd.arg(format!("-mmacosx-version-min={target}"));
         }
         let status = compile_cmd.status().expect("Failed to execute xcrun metal");

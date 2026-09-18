@@ -9,7 +9,7 @@
 import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { type CatalogEntry, catalogRepo, MODEL_CATALOG } from '@mlx-node/agent/catalog';
+import { type CatalogEntry, catalogRepo, catalogSelectionForRepo, MODEL_CATALOG } from '@mlx-node/agent/catalog';
 import { findDFlash2Draft, isDFlash2Companion } from '@mlx-node/lm/draft-companion';
 
 import { isDownloaderOwned, isModelInstalled, isModelPresent, isPathOccupied, readCompletion } from './models.js';
@@ -65,6 +65,19 @@ export interface CatalogItem extends CatalogEntry {
    * A `null` here means "no update badge", never "up to date".
    */
   localRevision: string | null;
+  /**
+   * The base-model repo the install's tokenizer sidecars came from, and the
+   * commit they were pinned to (marker `assetsRepo`/`assetsRevision`) — or
+   * `null` when the install used none, or predates the field.
+   *
+   * Update discovery compares this pair in addition to `repo`/`revision`: a
+   * sidecar-only upstream change moves nothing in the primary repo, so
+   * without it the badge never appears and the repair job — which verifies
+   * planned sidecars before reading an install as done — can never run.
+   * `null` means "no assets-side update known", never "up to date".
+   */
+  localAssetsRepo: string | null;
+  localAssetsRevision: string | null;
 }
 
 export interface CatalogDraftItem {
@@ -179,11 +192,18 @@ export function catalogWithState(modelsDir: string): CatalogItem[] {
       ...entry,
       draft,
       hfRepo,
+      // Selection fields describe the GGUF repo only, so serve the SAME gated
+      // value the job plans sidecars from: a platform-override build resolves
+      // to a repo that plans none, and serving the raw field would pin an
+      // update badge its marker could never record.
+      assetsRepo: catalogSelectionForRepo(entry, hfRepo).assetsRepo,
       slug,
       installed,
       present,
       blockedByForeignDir,
       localRevision: completion?.revision ?? null,
+      localAssetsRepo: completion?.assetsRepo ?? null,
+      localAssetsRevision: completion?.assetsRevision ?? null,
     };
   });
 }
