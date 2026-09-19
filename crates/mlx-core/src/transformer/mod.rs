@@ -11,6 +11,7 @@ pub mod attention;
 #[cfg(test)]
 mod attention_vjp_test;
 pub mod block;
+pub(crate) mod cold_tier;
 pub mod kv_cache;
 pub mod kv_cache_spec;
 pub mod mlp;
@@ -19,6 +20,8 @@ mod mlp_test;
 pub mod paged_attention_inputs;
 pub(crate) mod paged_flags;
 pub mod paged_kv_cache_adapter;
+#[cfg(target_os = "macos")]
+pub(crate) mod paged_metadata_cache;
 pub(crate) mod paged_policy;
 pub mod rotating_kv_cache;
 

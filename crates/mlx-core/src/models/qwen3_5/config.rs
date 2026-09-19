@@ -1,5 +1,7 @@
 use napi_derive::napi;
 
+use crate::models::paged_config::PagedCacheConfig;
+
 /// Name of the env var that overrides `paged_cache_initial_memory_mb` at
 /// load time (u32 MiB). Env wins over config; unset both keeps the
 /// historical fixed pool (initial == max).
@@ -99,7 +101,7 @@ pub(crate) fn resolve_qwen35_paged_default(
     match env_override {
         Some("1") | Some("true") | Some("TRUE") => Some(true),
         Some("0") | Some("false") | Some("FALSE") => Some(false),
-        _ => Some(explicit.unwrap_or(true)),
+        _ => PagedCacheConfig::resolve_use_paged_default(explicit, true),
     }
 }
 

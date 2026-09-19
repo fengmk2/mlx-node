@@ -26,11 +26,11 @@ use napi::bindgen_prelude::*;
 
 use crate::decode_profiler::DecodeProfiler;
 use crate::engine::backend::{
-    ChatBackend, ChunkSink, DecodeStep, FinalizeArgs, ResetScope, SaveStateArgs, StreamEmitter,
-    ThinkingSetup, TurnOutput, TurnSetup, WholeTurnArgs,
+    ChatBackend, ChunkSink, DecodeStep, FinalizeArgs, ResetScope, SaveStateArgs,
+    ThinkEndResolution, ThinkingSetup, TurnOutput, TurnSetup, WholeTurnArgs,
 };
 use crate::engine::cache::IMAGE_CHANGE_RESTART_PREFIX;
-use crate::engine::decode::{DecodeLoopArgs, StreamingCtx, run_decode_loop};
+use crate::engine::decode::{DecodeLoopArgs, TurnStreaming, run_decode_loop};
 use crate::engine::finalize::compute_performance_metrics;
 use crate::engine::params::{ChatParams, generated_capacity_hint};
 use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
@@ -66,6 +66,9 @@ pub(crate) struct AdmittedPagedTurn {
     pub eos_id: u32,
     pub think_end_id: Option<u32>,
     pub think_end_str: Option<String>,
+    /// Additional ids that also end reasoning (K2-Horizon's other
+    /// `</ifm|think*>` family members). Empty for single-tag families.
+    pub think_end_extra_ids: Vec<u32>,
     pub config: ChatConfig,
     pub params: ChatParams,
     pub thinking: ThinkingSetup,
@@ -978,8 +981,14 @@ pub(crate) fn admit_paged_turn<B: ChatBackend>(
 ) -> Result<AdmittedPagedTurn> {
     let tokenizer = backend.tokenizer()?;
     let eos_id = backend.session_eos_id(&tokenizer)?;
-    let think_end_id = tokenizer.think_end_id();
-    let think_end_str = tokenizer.think_end_str().map(str::to_string);
+    // Per-turn reasoning close token — the default hook answers the
+    // tokenizer-global `</think>`; K2-Horizon's override resolves the
+    // effort-dependent `</ifm|think*>` variant.
+    let ThinkEndResolution {
+        think_end_id,
+        think_end_str,
+        think_end_extra_ids,
+    } = backend.think_end_for_turn(&config, &tokenizer);
     let params = backend.resolve_params(&config);
     let template_thinking_enabled =
         crate::engine::params::resolve_enable_thinking(&config).unwrap_or(true);
@@ -1033,6 +1042,22 @@ pub(crate) fn admit_paged_turn<B: ChatBackend>(
     };
     let is_delta = live_continuation.is_some();
     let tokens = live_continuation.unwrap_or(full_tokens);
+    if crate::inference_trace::enabled() {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        for token in &tokens {
+            digest.update(token.to_le_bytes());
+        }
+        let digest = digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        crate::inference_trace::write(format_args!(
+            "[MLX_TRACE] admitted_prompt is_delta={is_delta} tokens={} sha256={digest}",
+            tokens.len(),
+        ));
+    }
     let images = if is_delta {
         Vec::new()
     } else {
@@ -1078,6 +1103,7 @@ pub(crate) fn admit_paged_turn<B: ChatBackend>(
         eos_id,
         think_end_id,
         think_end_str,
+        think_end_extra_ids,
         config,
         params,
         thinking,
@@ -1116,6 +1142,7 @@ fn chat_turn_core<B: ChatBackend>(
     let eos_id = admitted.eos_id;
     let think_end_id = admitted.think_end_id;
     let think_end_str = admitted.think_end_str;
+    let think_end_extra_ids = admitted.think_end_extra_ids;
     let config = admitted.config;
     let p = admitted.params;
     let thinking = admitted.thinking;
@@ -1234,25 +1261,28 @@ fn chat_turn_core<B: ChatBackend>(
     profiler.set_prompt_tokens(prefill_tokens.len() as u32);
     profiler.snapshot_memory_before();
 
-    let mut reasoning_tracker = ReasoningTracker::from_setup(&thinking, think_end_id);
+    let mut reasoning_tracker =
+        ReasoningTracker::from_setup_multi(&thinking, think_end_id, think_end_extra_ids.clone());
 
     // Stop set + streaming-order knob, resolved ONCE per turn.
     let extra_eos_ids = backend.extra_eos_ids();
     let eos_before_emit = backend.eos_before_emit();
 
-    // Streaming decode state. The detokenizer's skip-special flag is a
-    // family hook (ChatML cores stream `decode_stream(true)`; gemma4
-    // streams `false` so its parser sees the channel/tool-call
-    // markers). Created unconditionally (cheap) so the borrow structure
-    // is identical on both paths; only the streaming branch reads it.
+    // Streaming decode state — one bundle: the incremental detokenizer
+    // (family skip-special hook: ChatML streams `decode_stream(true)`;
+    // gemma4 streams `false` so its parser sees the channel/tool-call
+    // markers), the streamed-text / reasoning cursors the StreamingCtx
+    // borrows, and the per-family emitter. Built only when a sink exists
+    // — the emitter hook must not run on sync turns.
     let stream_skip_special = backend.stream_skip_special_tokens();
-    let mut decode_stream = tokenizer.inner().decode_stream(stream_skip_special);
-    let mut streamed_text_len = 0usize;
-    let mut last_is_reasoning = thinking.enabled;
-    // Per-family chunk emitter. Built once per streaming turn, BEFORE
-    // `begin_decode` takes the long &mut borrow of the backend.
-    let mut emitter: Option<Box<dyn StreamEmitter>> =
-        streaming.as_ref().map(|_| backend.stream_emitter());
+    let mut turn_streaming = streaming.as_ref().map(|_| {
+        TurnStreaming::new(
+            backend,
+            tokenizer.inner(),
+            thinking.enabled,
+            stream_skip_special,
+        )
+    });
     let turn_token_observer = backend.turn_token_observer();
 
     // From prefill onward, every fallible operation runs inside one error
@@ -1294,16 +1324,8 @@ fn chat_turn_core<B: ChatBackend>(
             if let Some(label) = step.profiler_relabel() {
                 profiler.set_label(label);
             }
-            let streaming_ctx = match (streaming.as_ref(), emitter.as_mut()) {
-                (Some(s), Some(em)) => Some(StreamingCtx {
-                    callback: s.sink,
-                    cancelled: s.cancelled,
-                    decode_stream: &mut decode_stream,
-                    tokenizer: tokenizer.inner(),
-                    streamed_text_len: &mut streamed_text_len,
-                    last_is_reasoning: &mut last_is_reasoning,
-                    emitter: em.as_mut(),
-                }),
+            let streaming_ctx = match (streaming.as_ref(), turn_streaming.as_mut()) {
+                (Some(s), Some(ts)) => ts.ctx(Some(s.sink), Some(s.cancelled)),
                 _ => None,
             };
             run_decode_loop(
@@ -1400,7 +1422,7 @@ fn chat_turn_core<B: ChatBackend>(
     };
     let reasoning_tokens = reasoning_tracker.reasoning_token_count();
 
-    if let (Some(s), Some(em)) = (streaming.as_ref(), emitter.as_mut()) {
+    if let (Some(s), Some(ts)) = (streaming.as_ref(), turn_streaming.as_mut()) {
         // Flush residual buffered bytes from the incremental decode
         // stream (multi-token grapheme tails the DecodeStream held
         // back) through the emitter. The default emitter suppresses when
@@ -1414,10 +1436,7 @@ fn chat_turn_core<B: ChatBackend>(
                 tracing::warn!("Failed to decode generated tokens: {}", e);
                 String::new()
             });
-        if full_text.len() > streamed_text_len {
-            let residual = &full_text[streamed_text_len..];
-            em.on_residual(residual, last_is_reasoning, p.include_reasoning, s.sink);
-        }
+        ts.flush_residual(&full_text, p.include_reasoning, s.sink);
     }
 
     // Family finalize hook. Default = the ChatML `finalize_chat_result`
@@ -1429,6 +1448,7 @@ fn chat_turn_core<B: ChatBackend>(
         finish_reason,
         think_end_id,
         think_end_str: think_end_str.as_deref(),
+        think_end_extra_ids: &think_end_extra_ids,
         performance,
         include_reasoning: p.include_reasoning,
         thinking_enabled: thinking.enabled,
@@ -1445,10 +1465,10 @@ fn chat_turn_core<B: ChatBackend>(
     // prefix length from `verify_cache_prefix`.
     result.cached_tokens = cached_prefix_len as u32;
 
-    if let (Some(s), Some(em)) = (streaming.as_ref(), emitter.as_mut()) {
+    if let (Some(s), Some(ts)) = (streaming.as_ref(), turn_streaming.as_mut()) {
         // Terminal done-chunk via the emitter. Family emitters (gemma4)
         // build their own terminal chunk from the finalized result.
-        em.finish(&result, s.sink);
+        ts.emitter.finish(&result, s.sink);
         return Ok(None);
     }
 

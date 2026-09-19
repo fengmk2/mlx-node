@@ -1,5 +1,7 @@
 use napi_derive::napi;
 
+use crate::models::paged_config::PagedCacheConfig;
+
 fn default_true() -> bool {
     true
 }
@@ -223,7 +225,7 @@ impl Lfm2Config {
         explicit: Option<bool>,
         _is_quantized: bool,
     ) -> Option<bool> {
-        Some(explicit.unwrap_or(true))
+        PagedCacheConfig::resolve_use_paged_default(explicit, true)
     }
 
     /// Effective `num_dense_layers`: HF `configuration_lfm2_moe.py` defaults

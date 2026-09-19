@@ -8,31 +8,32 @@ use serde_json::Value;
 use tracing::info;
 
 use crate::array::{DType, MxArray};
-use crate::cold_tier::{resolve_persist_cold, shard_identities_stable, snapshot_shard_identities};
+use crate::cold_tier::{CheckpointLoadGuard, resolve_persist_cold};
 use crate::engine::persistence::{
-    dequant_fp8_weights, load_all_safetensors, prewarm_checkpoint_pages,
+    KeyRule, RenameSpec, apply_rename_spec, cast_f32_tensors_to_bf16, dequant_fp8_weights,
+    load_all_safetensors, prewarm_checkpoint_pages,
 };
 use crate::models::quant_dispatch::{
-    PerLayerMode, PerLayerQuant, default_per_layer_quant, effective_plq_for,
-    ensure_affine_biases_present, ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
+    PerLayerMode, PerLayerQuant, default_per_layer_quant, dense_mlp_is_quantized,
+    dense_mlp_proj_bases, effective_plq_for, ensure_affine_biases_present,
+    ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
     ensure_kquant_storage_resolves_kquant, ensure_plain_fp8_storage_resolves_fp8_e4m3,
-    has_sym8_mode, load_quant_settings_from_disk, resolve_default_mode,
+    has_sym8_mode, load_dense_mlp_variant, load_embedding_affine_or_bf16,
+    load_linear_proj_quantized_or_bf16, load_quant_settings_from_disk, resolve_default_mode,
+};
+use crate::models::quantized_linear::{
+    DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, GATE_QUANT_BITS, GATE_QUANT_GROUP_SIZE,
+    QuantizedLinear, QuantizedSwitchLinear, is_mxfp8_checkpoint, try_build_kquant_quantized_linear,
+    try_build_kquant_quantized_switch_linear, try_build_mxfp4_quantized_linear,
+    try_build_mxfp4_quantized_switch_linear, try_build_mxfp8_quantized_linear,
+    try_build_mxfp8_quantized_switch_linear, try_build_nvfp4_quantized_linear,
+    try_build_nvfp4_quantized_switch_linear, try_build_quantized_linear,
 };
 use crate::models::qwen3_5_moe::persistence::try_build_quantized_switch_linear;
-use crate::models::qwen3_5_moe::quantized_linear::{
-    DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, GATE_QUANT_BITS, GATE_QUANT_GROUP_SIZE,
-    LinearProj, MLPVariant, MXFP4_BITS, MXFP4_GROUP_SIZE, MXFP8_BITS, MXFP8_GROUP_SIZE, NVFP4_BITS,
-    NVFP4_GROUP_SIZE, QuantizedLinear, QuantizedSwitchLinear, is_mxfp8_checkpoint,
-    try_build_kquant_quantized_linear, try_build_kquant_quantized_switch_linear,
-    try_build_mxfp4_quantized_linear, try_build_mxfp4_quantized_switch_linear,
-    try_build_mxfp8_quantized_linear, try_build_mxfp8_quantized_switch_linear,
-    try_build_nvfp4_quantized_linear, try_build_nvfp4_quantized_switch_linear,
-    try_build_quantized_linear, try_build_sym8_quantized_linear,
-};
 use crate::models::qwen3_5_moe::switch_glu::SwitchGLU;
 use crate::tokenizer::Qwen3Tokenizer;
 
-use crate::nn::{Embedding, Linear};
+use crate::nn::Linear;
 
 use super::config::Lfm2Config;
 use super::model::{Lfm2Inner, Lfm2Model};
@@ -152,289 +153,12 @@ fn build_lfm2_gate_ql(
     })
 }
 
-/// Build a NON-MoE `QuantizedLinear` for `base`, dispatching on the resolved
-/// per-layer quant mode. Mirrors `build_lfm2_gate_ql` but for the standalone
-/// non-MoE projections (attention q/k/v/out, conv in/out, dense-MLP gate/up/
-/// down). Supports ALL five modes (affine / mxfp4 / mxfp8 / nvfp4 / sym8) by
-/// routing to the matching qwen3_5 builder; the returned `QuantizedLinear`
-/// threads the correct mode into `mlx_quantized_matmul` at forward time
-/// (sym8 routes its `forward` to the int8 W8A8/W8A16 kernels instead).
-///
-/// `Ok(None)` = the `.weight`/`.scales` group is incomplete (the caller fails
-/// loud); `Err` = the sym8 builder's fail-loud validation tripped (a
-/// malformed sym8 layer must NEVER silently fall back to dense/bf16 — an
-/// int8 weight loaded dense emits garbage; see
-/// `try_build_sym8_quantized_linear`).
-fn build_lfm2_non_moe_ql(
-    params: &HashMap<String, MxArray>,
-    base: &str,
-    per_layer_quant: &HashMap<String, PerLayerQuant>,
-    default_plq: PerLayerQuant,
-) -> Result<Option<QuantizedLinear>> {
-    // Non-MoE bases never take the gate branch of `effective_plq_for` (it keys
-    // on `.mlp.gate` / `.mlp.shared_expert_gate`), so `gate_default = None`.
-    let plq = effective_plq_for(base, per_layer_quant, default_plq, None);
-    // int8 STORAGE with non-sym8 metadata = config drift / stale quantization
-    // metadata — fail loud before dispatch. This also keeps a metadata-skewed
-    // sym8 checkpoint out of the compiled C++ path's affine quant-info
-    // registration (the compiled gate keys on config metadata only).
-    ensure_int8_storage_resolves_sym8(params, base, plq.mode, "lfm2")?;
-    ensure_plain_fp8_storage_resolves_fp8_e4m3(params, base, plq.mode, "lfm2")?;
-    ensure_kquant_storage_resolves_kquant(params, base, plq.mode, "lfm2")?;
-    ensure_affine_biases_present(params, base, plq.mode, "lfm2")?;
-    Ok(match plq.mode {
-        PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, base),
-        PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, base),
-        PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, base),
-        PerLayerMode::Fp8E4m3 => {
-            return Err(Error::from_reason(format!(
-                "lfm2: projection '{base}' resolved to fp8_e4m3, but plain per-output \
-                 E4M3 storage is supported only by Qwen3.5 DGX artifacts"
-            )));
-        }
-        PerLayerMode::Affine => try_build_quantized_linear(params, base, plq.group_size, plq.bits),
-        PerLayerMode::Sym8 => try_build_sym8_quantized_linear(params, base)?,
-        PerLayerMode::Q6K
-        | PerLayerMode::Q4K
-        | PerLayerMode::Q5K
-        | PerLayerMode::Q3K
-        | PerLayerMode::IQ4NL
-        | PerLayerMode::IQ4XS
-        | PerLayerMode::IQ3S => try_build_kquant_quantized_linear(params, base, plq.mode, "lfm2")?,
-    })
-}
-
-/// Load a NON-MoE `LinearProj` either quantized (ANY mode) or plain bf16, keyed
-/// off the presence of `{base}.scales`.
-///
-/// The lfm2 non-MoE module fields are now mode-aware `LinearProj`s (shared with
-/// qwen3_5), so a quantized projection installs a `QuantizedLinear` backend
-/// whose `forward` threads the resolved mode (affine / mxfp4 / mxfp8 / nvfp4)
-/// into `mlx_quantized_matmul`. There is NO dense `get_weight()`
-/// materialization on the forward path — the projection stays packed-only
-/// resident.
-///
-/// mxfp4/mxfp8/nvfp4 groups ship only `.weight` + `.scales` (no affine
-/// `.biases`); affine ships `.weight` + `.scales` + optional `.biases`. The
-/// per-mode builders already encode that (the FP-mode builders pass `None` for
-/// the quant biases). The additive LAYER bias (`.bias`, e.g. lfm2
-/// `conv_bias=true`) is applied separately by the caller via the dedicated
-/// `set_*_proj_bias` helpers, which dispatch across both `LinearProj` arms.
-///
-/// `default_plq` is the top-level default (bits/group_size/mode from
-/// `config.json`'s `quantization` block). `effective_plq_for` applies any
-/// per-layer override for `base`.
-fn load_linear_proj_quantized_or_bf16(
-    proj: &mut LinearProj,
-    params: &HashMap<String, MxArray>,
-    base: &str,
-    per_layer_quant: &HashMap<String, PerLayerQuant>,
-    default_plq: PerLayerQuant,
-) -> Result<()> {
-    if params.contains_key(&format!("{base}.scales")) {
-        // A `.scales` companion marks the tensor quantized. The packed
-        // `.weight` MUST be present; `build_lfm2_non_moe_ql` returns
-        // `Ok(None)` otherwise — fail loud naming the tensor rather than
-        // leave random init (mirrors the MoE branch's fail-loud contract).
-        // The `?` preserves the sym8 builder's own descriptive `Err` (its
-        // validation failures must surface verbatim, not be flattened into
-        // the generic missing-group message).
-        let ql = build_lfm2_non_moe_ql(params, base, per_layer_quant, default_plq)?.ok_or_else(
-            || {
-                Error::from_reason(format!(
-                    "lfm2: quantized non-MoE tensor '{base}' has '.scales' but its packed \
-                     '.weight' could not be resolved (missing weight/scales) — refusing to load \
-                     with random init"
-                ))
-            },
-        )?;
-        proj.set_quantized(ql);
-    } else if let Some(w) = params.get(&format!("{base}.weight")) {
-        // No `.scales` ⇒ dense route. A truncated sym8 group (int8 `.weight`
-        // whose `.scales` was stripped) lands HERE — the dtype guard fails
-        // loud instead of letting int8 bytes reach a dense bf16 matmul.
-        ensure_dense_weight_floating(&format!("{base}.weight"), w)?;
-        proj.set_weight(w, base)?;
-    }
-    Ok(())
-}
-
-/// Load a NON-MoE dense `MLPVariant` (gate/up/down projections) either
-/// quantized (ANY mode) or plain bf16, keyed off the presence of ANY
-/// projection's `.scales` (via the shared `dense_mlp_is_quantized` helper).
-///
-/// Non-MoE quant is PER-TENSOR independent, but a dense MLP's three
-/// projections are co-quantized by `mlx_lm.convert` (all or none), so we key
-/// the variant swap off ANY of the three `{base}.scales` companions (NOT just
-/// `gate_proj.scales` — a checkpoint missing exactly that one sentinel while
-/// carrying packed weights + the other `.scales` must NOT misclassify as bf16)
-/// and then require the whole group via `build_lfm2_non_moe_ql` (fail loud on
-/// any missing half). When
-/// quantized, the `MLPVariant` is swapped in place to `Quantized`, whose
-/// forward runs three `QuantizedLinear::forward` + swiglu with NO dense
-/// `get_weight()` copy. When not, the existing `Standard(MLP)` arm loads its
-/// weights through the eager-dense `Linear` setters (unchanged behavior).
-fn load_dense_mlp_variant(
-    ff: &mut MLPVariant,
-    params: &HashMap<String, MxArray>,
-    prefix: &str,
-    per_layer_quant: &HashMap<String, PerLayerQuant>,
-    default_plq: PerLayerQuant,
-) -> Result<()> {
-    let gate_base = format!("{prefix}.gate_proj");
-    let up_base = format!("{prefix}.up_proj");
-    let down_base = format!("{prefix}.down_proj");
-
-    if dense_mlp_is_quantized(params, prefix) {
-        // Quantized dense MLP: build all three projections and swap the variant
-        // to `Quantized` in place. A missing half on ANY projection fails loud
-        // (validate_mandatory_weights already rejects lone-half groups, but the
-        // builder-level guard catches any skew it cannot see). The first `?`
-        // preserves the sym8 builder's own descriptive `Err`.
-        let gate_proj = build_lfm2_non_moe_ql(params, &gate_base, per_layer_quant, default_plq)?
-            .ok_or_else(|| {
-                Error::from_reason(format!(
-                    "lfm2: quantized dense-MLP projection '{gate_base}' could not be built \
-                     (missing weight/scales)"
-                ))
-            })?;
-        let up_proj = build_lfm2_non_moe_ql(params, &up_base, per_layer_quant, default_plq)?
-            .ok_or_else(|| {
-                Error::from_reason(format!(
-                    "lfm2: quantized dense-MLP projection '{up_base}' could not be built \
-                     (missing weight/scales)"
-                ))
-            })?;
-        let down_proj = build_lfm2_non_moe_ql(params, &down_base, per_layer_quant, default_plq)?
-            .ok_or_else(|| {
-                Error::from_reason(format!(
-                    "lfm2: quantized dense-MLP projection '{down_base}' could not be built \
-                     (missing weight/scales)"
-                ))
-            })?;
-        *ff = MLPVariant::Quantized {
-            gate_proj,
-            up_proj,
-            down_proj,
-        };
-    } else {
-        // Plain bf16 dense MLP. The variant is `Standard(MLP)` (default at
-        // construction); load each projection's weight through the eager-dense
-        // `Linear` setters. lfm2 never calls `finalize_gate_up`, so the E39
-        // stacked fast path stays inert and `set_*_proj_weight` is sufficient.
-        // Each dense load is dtype-guarded: a truncated sym8 group (int8
-        // `.weight`, `.scales` stripped on ALL THREE projections) classifies
-        // as dense and would otherwise smuggle int8 bytes into bf16 matmuls.
-        if let Some(w) = params.get(&format!("{gate_base}.weight")) {
-            ensure_dense_weight_floating(&format!("{gate_base}.weight"), w)?;
-            ff.set_gate_proj_weight(w)?;
-        }
-        if let Some(w) = params.get(&format!("{up_base}.weight")) {
-            ensure_dense_weight_floating(&format!("{up_base}.weight"), w)?;
-            ff.set_up_proj_weight(w)?;
-        }
-        if let Some(w) = params.get(&format!("{down_base}.weight")) {
-            ensure_dense_weight_floating(&format!("{down_base}.weight"), w)?;
-            ff.set_down_proj_weight(w)?;
-        }
-    }
-    Ok(())
-}
-
-/// Map a resolved `PerLayerMode` to the MLX quantization mode string threaded
-/// into `mlx_dequantize` / `mlx_quantized_matmul`. The per-mode group_size /
-/// bits constants are forced by the FP modes (the `.scales` companion encodes
-/// the format); affine carries its own `bits` / `group_size` from the PLQ.
-///
-/// `ctx` names the tensor/prefix for the sym8 rejection: sym8 has no MLX
-/// pack (its int8 weight is consumed by the dedicated W8A8/W8A16 kernels,
-/// never `mlx_quantized_matmul`/`mlx_dequantize`), so the packed-quant
-/// embedding loader that consumes this helper must fail loud rather than
-/// hand "sym8" to MLX. Convert keeps the lfm2 embedding DENSE bf16 under a
-/// sym8 default, so a sym8 arrival here is defense-in-depth against a
-/// malformed checkpoint.
-fn plq_to_packed_params(plq: PerLayerQuant, ctx: &str) -> Result<(i32, i32, &'static str)> {
-    Ok(match plq.mode {
-        PerLayerMode::Affine => (plq.group_size, plq.bits, "affine"),
-        PerLayerMode::Mxfp8 => (MXFP8_GROUP_SIZE, MXFP8_BITS, "mxfp8"),
-        PerLayerMode::Mxfp4 => (MXFP4_GROUP_SIZE, MXFP4_BITS, "mxfp4"),
-        PerLayerMode::Nvfp4 => (NVFP4_GROUP_SIZE, NVFP4_BITS, "nvfp4"),
-        PerLayerMode::Fp8E4m3 => {
-            return Err(Error::from_reason(format!(
-                "lfm2: '{ctx}' resolved to fp8_e4m3, but the packed embedding/quant-info \
-                 path has no plain per-output E4M3 representation"
-            )));
-        }
-        PerLayerMode::Sym8 => {
-            return Err(Error::from_reason(format!(
-                "lfm2: '{ctx}' resolved to sym8 quantization, but this packed-quant path \
-                 (embedding / packed quant-info) has no sym8 dispatch — convert never emits \
-                 sym8 for these tensors (the lfm2 embedding stays dense bf16 under a sym8 \
-                 default), so this checkpoint is malformed; refusing to load"
-            )));
-        }
-        PerLayerMode::Q6K
-        | PerLayerMode::Q4K
-        | PerLayerMode::Q5K
-        | PerLayerMode::Q3K
-        | PerLayerMode::IQ4NL
-        | PerLayerMode::IQ4XS
-        | PerLayerMode::IQ3S => {
-            return Err(Error::from_reason(format!(
-                "lfm2: '{ctx}' resolved to K-quant ({:?}), but the packed embedding / \
-                 quant-info path does not support ggml K-quants — a K-quant GGUF import keeps \
-                 the lfm2 embedding dense bf16, so this checkpoint is malformed; refusing to load",
-                plq.mode
-            )));
-        }
-    })
-}
-
-/// Load a NON-MoE `Embedding` either PACKED-quantized (ANY mode) or plain bf16,
-/// keyed off `{base}.scales`.
-///
-/// The embedding stays PACKED-resident: `nn::Embedding::
-/// load_quantized_packed` retains the packed `.weight`/`.scales`/(`.biases`)
-/// AS-IS — it does NOT pre-dequantize the table — so a fully-quantized lfm2
-/// checkpoint (incl. the embedding) saves the full `vocab × hidden × 2` bytes
-/// a dense table would cost. `forward` gather-then-dequantizes only the looked-
-/// up rows; the tied lm_head logits path calls `Embedding::as_linear` (a
-/// `mlx_quantized_matmul` on the packed tensors), so the dense table is never
-/// materialized.
-///
-/// All four modes are supported (affine + mxfp4/mxfp8/nvfp4): the mode is
-/// resolved via `effective_plq_for` and threaded into the packed backend.
-/// mxfp4/mxfp8/nvfp4 groups ship `.weight` + `.scales` only (no `.biases`);
-/// affine ships `.weight` + `.scales` + optional `.biases`.
-fn load_embedding_affine_or_bf16(
-    embedding: &mut Embedding,
-    params: &HashMap<String, MxArray>,
-    base: &str,
-    per_layer_quant: &HashMap<String, PerLayerQuant>,
-    default_plq: PerLayerQuant,
-) -> Result<()> {
-    if let Some(scales) = params.get(&format!("{base}.scales")) {
-        let weight = params.get(&format!("{base}.weight")).ok_or_else(|| {
-            Error::from_reason(format!(
-                "lfm2: quantized embedding '{base}' has '.scales' but is missing its packed \
-                 '.weight'"
-            ))
-        })?;
-        let plq = effective_plq_for(base, per_layer_quant, default_plq, None);
-        // Rejects sym8 (descriptive Err): the packed embedding backend feeds
-        // `mlx_dequantize`/`mlx_quantized_matmul`, which have no sym8 pack.
-        let (group_size, bits, mode) = plq_to_packed_params(plq, base)?;
-        // mxfp4/mxfp8/nvfp4 carry no quant biases; affine may.
-        let biases = params.get(&format!("{base}.biases"));
-        embedding.load_quantized_packed(weight, scales, biases, group_size, bits, mode)?;
-    } else if let Some(w) = params.get(&format!("{base}.weight")) {
-        // Dense fallback (no `.scales`): a stripped quant group must never
-        // reach the dense lookup / tied-lm_head matmul.
-        ensure_dense_weight_floating(&format!("{base}.weight"), w)?;
-        embedding.load_weight(w)?;
-    }
-    Ok(())
-}
+/// LFM2 family tag for the shared non-MoE loader helpers in
+/// [`crate::models::quant_dispatch`] — keeps error strings naming this
+/// family after the verbatim helper copies were deduplicated. (The kept
+/// lfm2_moe helpers — `build_lfm2_qsl`, `build_lfm2_gate_ql` — inline their
+/// own `"lfm2_moe"` tag.)
+const FAMILY: &str = "lfm2";
 
 /// Load the separate (untied) `lm_head` `Linear` either affine-quantized or
 /// plain bf16, keyed off `{base}.scales`.
@@ -637,6 +361,139 @@ fn parse_config(model_path: &Path) -> Result<Lfm2Config> {
     Ok(config)
 }
 
+/// MLP weight rename: w1 -> gate_proj, w3 -> up_proj, w2 -> down_proj.
+/// Scoped to `feed_forward.*` keys so the rename ALSO catches MoE expert
+/// keys (`feed_forward.experts.{e}.w1.weight` etc.) without touching any
+/// unrelated `w1`/`w2`/`w3` tensors. Mirrors `lfm2_moe.py::sanitize`.
+///
+/// The rename covers ALL affine-quant group suffixes — `.weight`,
+/// `.scales`, AND `.biases` — not just `.weight`. A quantized DENSE
+/// `lfm2.py` checkpoint (whose MLP modules ARE `w1`/`w2`/`w3`, see
+/// `mlx-lm/mlx_lm/models/lfm2.py:189-191`) ships the companions under the
+/// same `w{1,2,3}` names. Renaming only `.weight` would orphan
+/// `feed_forward.w1.{scales,biases}`, leaving the loader unable to find
+/// `gate_proj.scales` and wrongly taking the bf16 path for a packed
+/// weight. The full-suffix rename keeps the whole group together so
+/// `load_dense_mlp_variant` resolves it as quantized.
+///
+/// N/A — per-layer quant OVERRIDE keys never arrive under `w{1,2,3}`:
+/// dense `lfm2.py` has no `quant_predicate` (uniform top-level default),
+/// and `lfm2_moe.py::quant_predicate` only specializes
+/// `feed_forward.gate`. So `per_layer_quant` is keyed by
+/// `feed_forward.gate` / standard proj / embedding names — never
+/// `w{1,2,3}` — and needs no alias normalization.
+static LFM2_FEED_FORWARD_RENAMES: &[KeyRule] = &[
+    KeyRule::ReplaceIfContains {
+        scope: "feed_forward",
+        from: "w1.weight",
+        to: "gate_proj.weight",
+    },
+    KeyRule::ReplaceIfContains {
+        scope: "feed_forward",
+        from: "w1.scales",
+        to: "gate_proj.scales",
+    },
+    KeyRule::ReplaceIfContains {
+        scope: "feed_forward",
+        from: "w1.biases",
+        to: "gate_proj.biases",
+    },
+    KeyRule::ReplaceIfContains {
+        scope: "feed_forward",
+        from: "w2.weight",
+        to: "down_proj.weight",
+    },
+    KeyRule::ReplaceIfContains {
+        scope: "feed_forward",
+        from: "w2.scales",
+        to: "down_proj.scales",
+    },
+    KeyRule::ReplaceIfContains {
+        scope: "feed_forward",
+        from: "w2.biases",
+        to: "down_proj.biases",
+    },
+    KeyRule::ReplaceIfContains {
+        scope: "feed_forward",
+        from: "w3.weight",
+        to: "up_proj.weight",
+    },
+    KeyRule::ReplaceIfContains {
+        scope: "feed_forward",
+        from: "w3.scales",
+        to: "up_proj.scales",
+    },
+    KeyRule::ReplaceIfContains {
+        scope: "feed_forward",
+        from: "w3.biases",
+        to: "up_proj.biases",
+    },
+];
+
+/// Value hook: conv weight transpose — `*.conv.conv.weight` where
+/// shape[-1] > shape[1] gets transposed [out, 1, kernel] -> [out, kernel, 1].
+/// Runs on the post-rename map; the `conv.conv.weight` keys are untouched by
+/// every rename rule, so this is order-equivalent to the original in-loop
+/// transpose.
+fn transpose_depthwise_conv_weights(params: &mut HashMap<String, MxArray>) {
+    for (key, value) in params.iter_mut() {
+        if !key.contains("conv.conv.weight") {
+            continue;
+        }
+        if value.ndim().unwrap_or(0) != 3 {
+            continue;
+        }
+        let dim1 = value.shape_at(1).unwrap_or(0);
+        let dim2 = value.shape_at(2).unwrap_or(0);
+        if dim2 > dim1 {
+            *value = value
+                .transpose(Some(&[0, 2, 1]))
+                .unwrap_or_else(|_| value.clone());
+        }
+    }
+}
+
+/// Value hook: MoE expert stacking — per MoE layer, stack the per-expert
+/// `feed_forward.experts.{e}.{proj}.weight` tensors into a single
+/// `feed_forward.switch_mlp.{proj}.weight` of shape (num_experts, out, in).
+/// Mirrors `lfm2_moe.py::sanitize` (mx.stack over axis 0). FP8 dequant has
+/// already run before sanitize, so experts are bf16 2D tensors here — no
+/// re-quantization. The `contains_key(experts.0)` guard makes this a no-op
+/// for pre-stacked (quantized) checkpoints whose experts already ship as
+/// `switch_mlp.{proj}.{weight,scales}`.
+fn stack_moe_expert_weights(
+    params: &mut HashMap<String, MxArray>,
+    config: &Lfm2Config,
+) -> Result<()> {
+    if !config.is_moe() {
+        return Ok(());
+    }
+    let num_experts = config.num_experts.unwrap_or(0) as usize;
+    let num_dense = config.num_dense_layers_effective() as usize;
+    for l in num_dense..(config.num_hidden_layers as usize) {
+        for proj in ["gate_proj", "up_proj", "down_proj"] {
+            let key0 = format!("layers.{l}.feed_forward.experts.0.{proj}.weight");
+            if params.contains_key(&key0) {
+                let mut arrs = Vec::with_capacity(num_experts);
+                for e in 0..num_experts {
+                    let kk = format!("layers.{l}.feed_forward.experts.{e}.{proj}.weight");
+                    let a = params.remove(&kk).ok_or_else(|| {
+                        Error::from_reason(format!("lfm2_moe: missing expert weight {kk}"))
+                    })?;
+                    arrs.push(a);
+                }
+                let refs: Vec<&MxArray> = arrs.iter().collect();
+                let stacked = MxArray::stack(refs, Some(0))?; // (num_experts, out, in)
+                params.insert(
+                    format!("layers.{l}.feed_forward.switch_mlp.{proj}.weight"),
+                    stacked,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Sanitize HuggingFace weight keys to internal format.
 ///
 /// Handles (lfm2.py:298-306):
@@ -648,118 +505,27 @@ fn sanitize_weights(
     params: &mut HashMap<String, MxArray>,
     config: &Lfm2Config,
 ) -> Result<HashMap<String, MxArray>> {
-    let mut sanitized = HashMap::new();
-
-    let keys: Vec<String> = params.keys().cloned().collect();
-    for key in keys {
-        let value = params.remove(&key).unwrap();
-
-        // 1. Strip `model.` prefix
-        let clean_key = key.strip_prefix("model.").unwrap_or(&key).to_string();
-
-        // Skip lm_head.weight only when tie_embedding is true (weight shared with embed_tokens)
-        if clean_key == "lm_head.weight" && config.tie_embedding {
-            continue;
-        }
-
-        // Skip rotary embeddings (computed at runtime)
-        if clean_key.contains("rotary_emb") {
-            continue;
-        }
-
-        // 2. Conv weight transpose: *.conv.conv.weight where shape[-1] > shape[1]
-        let value = if clean_key.contains("conv.conv.weight") {
-            let ndim = value.ndim().unwrap_or(0);
-            if ndim == 3 {
-                let dim1 = value.shape_at(1).unwrap_or(0);
-                let dim2 = value.shape_at(2).unwrap_or(0);
-                if dim2 > dim1 {
-                    // Transpose from [out, 1, kernel] to [out, kernel, 1] format
-                    value
-                        .transpose(Some(&[0, 2, 1]))
-                        .unwrap_or_else(|_| value.clone())
-                } else {
-                    value
-                }
-            } else {
-                value
-            }
-        } else {
-            value
-        };
-
-        // 3. MLP weight rename: w1 -> gate_proj, w3 -> up_proj, w2 -> down_proj.
-        // Scoped to `feed_forward.*` keys so the rename ALSO catches MoE expert
-        // keys (`feed_forward.experts.{e}.w1.weight` etc.) without touching any
-        // unrelated `w1`/`w2`/`w3` tensors. Mirrors `lfm2_moe.py::sanitize`.
-        //
-        // The rename covers ALL affine-quant group suffixes — `.weight`,
-        // `.scales`, AND `.biases` — not just `.weight`. A quantized DENSE
-        // `lfm2.py` checkpoint (whose MLP modules ARE `w1`/`w2`/`w3`, see
-        // `mlx-lm/mlx_lm/models/lfm2.py:189-191`) ships the companions under the
-        // same `w{1,2,3}` names. Renaming only `.weight` would orphan
-        // `feed_forward.w1.{scales,biases}`, leaving the loader unable to find
-        // `gate_proj.scales` and wrongly taking the bf16 path for a packed
-        // weight. The full-suffix rename keeps the whole group together so
-        // `load_dense_mlp_variant` resolves it as quantized.
-        //
-        // N/A — per-layer quant OVERRIDE keys never arrive under `w{1,2,3}`:
-        // dense `lfm2.py` has no `quant_predicate` (uniform top-level default),
-        // and `lfm2_moe.py::quant_predicate` only specializes
-        // `feed_forward.gate`. So `per_layer_quant` is keyed by
-        // `feed_forward.gate` / standard proj / embedding names — never
-        // `w{1,2,3}` — and needs no alias normalization.
-        let clean_key = if clean_key.contains("feed_forward") {
-            clean_key
-                .replace("w1.weight", "gate_proj.weight")
-                .replace("w1.scales", "gate_proj.scales")
-                .replace("w1.biases", "gate_proj.biases")
-                .replace("w2.weight", "down_proj.weight")
-                .replace("w2.scales", "down_proj.scales")
-                .replace("w2.biases", "down_proj.biases")
-                .replace("w3.weight", "up_proj.weight")
-                .replace("w3.scales", "up_proj.scales")
-                .replace("w3.biases", "up_proj.biases")
-        } else {
-            clean_key
-        };
-
-        sanitized.insert(clean_key, value);
+    // Declarative key rewrite: strip `model.`, drop `lm_head.weight` only
+    // when tie_embedding is true (weight shared with embed_tokens), drop
+    // rotary embeddings (computed at runtime), then the w1/w2/w3 renames —
+    // the original drop order (lm_head before rotary) is preserved.
+    let mut rules: Vec<KeyRule> = Vec::with_capacity(2 + LFM2_FEED_FORWARD_RENAMES.len());
+    if config.tie_embedding {
+        rules.push(KeyRule::DropExact("lm_head.weight"));
     }
+    rules.push(KeyRule::DropContains("rotary_emb"));
+    rules.extend_from_slice(LFM2_FEED_FORWARD_RENAMES);
+    let mut sanitized = apply_rename_spec(
+        std::mem::take(params),
+        &RenameSpec {
+            strip_prefixes: &["model."],
+            rules: &rules,
+            ..Default::default()
+        },
+    )?;
 
-    // MoE expert stacking: per MoE layer, stack the per-expert
-    // `feed_forward.experts.{e}.{proj}.weight` tensors into a single
-    // `feed_forward.switch_mlp.{proj}.weight` of shape (num_experts, out, in).
-    // Mirrors `lfm2_moe.py::sanitize` (mx.stack over axis 0). FP8 dequant has
-    // already run before sanitize, so experts are bf16 2D tensors here — no
-    // re-quantization. The `contains_key(experts.0)` guard makes this a no-op
-    // for pre-stacked (quantized) checkpoints whose experts already ship as
-    // `switch_mlp.{proj}.{weight,scales}`.
-    if config.is_moe() {
-        let num_experts = config.num_experts.unwrap_or(0) as usize;
-        let num_dense = config.num_dense_layers_effective() as usize;
-        for l in num_dense..(config.num_hidden_layers as usize) {
-            for proj in ["gate_proj", "up_proj", "down_proj"] {
-                let key0 = format!("layers.{l}.feed_forward.experts.0.{proj}.weight");
-                if sanitized.contains_key(&key0) {
-                    let mut arrs = Vec::with_capacity(num_experts);
-                    for e in 0..num_experts {
-                        let kk = format!("layers.{l}.feed_forward.experts.{e}.{proj}.weight");
-                        let a = sanitized.remove(&kk).ok_or_else(|| {
-                            Error::from_reason(format!("lfm2_moe: missing expert weight {kk}"))
-                        })?;
-                        arrs.push(a);
-                    }
-                    let refs: Vec<&MxArray> = arrs.iter().collect();
-                    let stacked = MxArray::stack(refs, Some(0))?; // (num_experts, out, in)
-                    sanitized.insert(
-                        format!("layers.{l}.feed_forward.switch_mlp.{proj}.weight"),
-                        stacked,
-                    );
-                }
-            }
-        }
-    }
+    transpose_depthwise_conv_weights(&mut sanitized);
+    stack_moe_expert_weights(&mut sanitized, config)?;
 
     // Cast f32 tensors to bf16 to avoid dtype promotion issues. EXCLUDE
     // `expert_bias` so it stays f32 (matches `lfm2_moe.py::cast_predicate`)
@@ -767,24 +533,7 @@ fn sanitize_weights(
     // bf16 scales). sym8 siblings are identified content-based (Int8 sibling
     // `.weight`) because the quant config is read AFTER sanitize; affine/mxfp
     // `.scales` (packed Uint32 weights) keep today's bf16 cast.
-    let sym8_scales: std::collections::HashSet<String> = sanitized
-        .keys()
-        .filter_map(|k| {
-            let prefix = k.strip_suffix(".scales")?;
-            let w = sanitized.get(&format!("{prefix}.weight"))?;
-            (w.dtype().ok()? == DType::Int8).then(|| k.clone())
-        })
-        .collect();
-    for (k, value) in sanitized.iter_mut() {
-        if k.ends_with(".expert_bias") || sym8_scales.contains(k) {
-            continue;
-        }
-        if value.dtype().is_ok_and(|dt| dt == DType::Float32)
-            && let Ok(casted) = value.astype(DType::BFloat16)
-        {
-            *value = casted;
-        }
-    }
+    cast_f32_tensors_to_bf16(&mut sanitized, |k| k.ends_with(".expert_bias"));
 
     Ok(sanitized)
 }
@@ -817,38 +566,6 @@ fn moe_proj_bases(prefix: &str) -> [String; 4] {
 /// dense-vs-quantized determination.
 fn moe_layer_is_quantized(params: &HashMap<String, MxArray>, prefix: &str) -> bool {
     moe_proj_bases(prefix)
-        .iter()
-        .any(|base| params.contains_key(&format!("{base}.scales")))
-}
-
-/// The three dense-MLP projection bases for a `{prefix}.feed_forward` prefix.
-///
-/// Centralized — like `moe_proj_bases` — so the quant-detection helper and the
-/// validate-path stray-`.scales` rejection scan the identical key set.
-fn dense_mlp_proj_bases(ff_prefix: &str) -> [String; 3] {
-    [
-        format!("{ff_prefix}.gate_proj"),
-        format!("{ff_prefix}.up_proj"),
-        format!("{ff_prefix}.down_proj"),
-    ]
-}
-
-/// Decide whether the DENSE MLP at `{prefix}.feed_forward` is quantized.
-///
-/// A dense MLP is quantized iff ANY of its gate/up/down projections ships a
-/// `.scales` companion tensor — not just `gate_proj.scales`. Keying off the
-/// single `gate_proj.scales` sentinel let a checkpoint that carried
-/// `up_proj.scales` / `down_proj.scales` (plus packed uint32 `.weight`s) but
-/// happened to be missing exactly `gate_proj.scales` misclassify as plain bf16
-/// and silently install packed weights through the dense `Linear` setters,
-/// producing corrupted output instead of failing loud. Mirrors
-/// `moe_layer_is_quantized`.
-///
-/// SHARED between `load_dense_mlp_variant` (the load path) and
-/// `validate_mandatory_weights` so the two can never diverge on the
-/// dense-vs-quantized determination.
-fn dense_mlp_is_quantized(params: &HashMap<String, MxArray>, ff_prefix: &str) -> bool {
-    dense_mlp_proj_bases(ff_prefix)
         .iter()
         .any(|base| params.contains_key(&format!("{base}.scales")))
 }
@@ -894,6 +611,7 @@ fn apply_weights(
         "embed_tokens",
         per_layer_quant,
         default_plq,
+        FAMILY,
     )?;
 
     // Output norm (embedding_norm) — never quantized.
@@ -1070,6 +788,7 @@ fn apply_weights(
                 &format!("{prefix}.feed_forward"),
                 per_layer_quant,
                 default_plq,
+                FAMILY,
             )?;
         }
 
@@ -1086,6 +805,7 @@ fn apply_weights(
                     &format!("{attn_prefix}.q_proj"),
                     per_layer_quant,
                     default_plq,
+                    FAMILY,
                 )?;
                 load_linear_proj_quantized_or_bf16(
                     attn.k_proj_mut(),
@@ -1093,6 +813,7 @@ fn apply_weights(
                     &format!("{attn_prefix}.k_proj"),
                     per_layer_quant,
                     default_plq,
+                    FAMILY,
                 )?;
                 load_linear_proj_quantized_or_bf16(
                     attn.v_proj_mut(),
@@ -1100,6 +821,7 @@ fn apply_weights(
                     &format!("{attn_prefix}.v_proj"),
                     per_layer_quant,
                     default_plq,
+                    FAMILY,
                 )?;
                 load_linear_proj_quantized_or_bf16(
                     attn.out_proj_mut(),
@@ -1107,6 +829,7 @@ fn apply_weights(
                     &format!("{attn_prefix}.out_proj"),
                     per_layer_quant,
                     default_plq,
+                    FAMILY,
                 )?;
                 if let Some(w) = params.get(&format!("{}.q_layernorm.weight", attn_prefix)) {
                     attn.set_q_layernorm_weight(w)?;
@@ -1139,6 +862,7 @@ fn apply_weights(
                     &format!("{conv_prefix}.in_proj"),
                     per_layer_quant,
                     default_plq,
+                    FAMILY,
                 )?;
                 if let Some(w) = params.get(&format!("{}.in_proj.bias", conv_prefix)) {
                     conv.set_in_proj_bias(Some(w))?;
@@ -1149,6 +873,7 @@ fn apply_weights(
                     &format!("{conv_prefix}.out_proj"),
                     per_layer_quant,
                     default_plq,
+                    FAMILY,
                 )?;
                 if let Some(w) = params.get(&format!("{}.out_proj.bias", conv_prefix)) {
                     conv.set_out_proj_bias(Some(w))?;
@@ -1496,11 +1221,7 @@ impl Lfm2Inner {
         let persist_env = std::env::var("MLX_PERSIST_PAGED_CACHE").ok();
         let persist_cold =
             resolve_persist_cold(family, persist_env.as_deref(), config.persist_paged_cache);
-        let shard_snapshot_before_mmap = if persist_cold {
-            snapshot_shard_identities(path)
-        } else {
-            None
-        };
+        let mut checkpoint_load = CheckpointLoadGuard::before_mmap(path, persist_cold);
 
         // Quantization settings (read straight from config.json's
         // `quantization` block). For dense bf16 checkpoints these are the
@@ -1511,11 +1232,7 @@ impl Lfm2Inner {
 
         // Load safetensors
         let mut params = load_all_safetensors(path, false)?;
-        let shard_snapshot_at_mmap = if persist_cold {
-            snapshot_shard_identities(path)
-        } else {
-            None
-        };
+        checkpoint_load.record_mmap();
 
         // WATCHDOG / cold-mmap pre-warm — must precede the FIRST GPU eval of any
         // mmap-backed weight (FP8 dequant in `dequant_fp8_weights`, the tensor
@@ -1594,12 +1311,7 @@ impl Lfm2Inner {
         if persist_cold
             && let Some(context) = inner.build_cold_tier_context(model_path, &weights_resident)
         {
-            let after_fingerprint = snapshot_shard_identities(path);
-            if shard_identities_stable(
-                &shard_snapshot_before_mmap,
-                &shard_snapshot_at_mmap,
-                &after_fingerprint,
-            ) {
+            if checkpoint_load.stable_after_fingerprint() {
                 inner.attach_cold_tier(context, &weights_resident);
             } else {
                 tracing::warn!(
@@ -1691,7 +1403,11 @@ impl Lfm2Model {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::qwen3_5_moe::quantized_linear::{SYM8_BITS, SYM8_GROUP_SIZE, SYM8_MODE};
+    use crate::models::quant_dispatch::{build_non_moe_ql, plq_to_packed_params};
+    use crate::models::quantized_linear::{
+        LinearProj, MXFP8_BITS, MXFP8_GROUP_SIZE, SYM8_BITS, SYM8_GROUP_SIZE, SYM8_MODE,
+    };
+    use crate::nn::Embedding;
 
     /// Build a tiny all-MoE config (num_dense_layers=0) with one conv layer
     /// and one attention layer. `use_block_paged_cache: Some(false)` skips the
@@ -2292,6 +2008,7 @@ mod tests {
             "x_proj",
             &HashMap::new(),
             default_plq,
+            FAMILY,
         )
         .expect("affine quantized load must succeed");
 
@@ -2365,8 +2082,15 @@ mod tests {
             default_per_layer_quant(MXFP8_BITS, MXFP8_GROUP_SIZE, PerLayerMode::Mxfp8),
         );
         let default_plq = default_per_layer_quant(4, 64, PerLayerMode::Affine);
-        load_linear_proj_quantized_or_bf16(&mut proj, &params, "x_proj", &plq_map, default_plq)
-            .expect("mxfp8 quantized load must succeed (no fail-loud)");
+        load_linear_proj_quantized_or_bf16(
+            &mut proj,
+            &params,
+            "x_proj",
+            &plq_map,
+            default_plq,
+            FAMILY,
+        )
+        .expect("mxfp8 quantized load must succeed (no fail-loud)");
 
         let ql = match &proj {
             LinearProj::Quantized(ql) => ql,
@@ -2422,6 +2146,7 @@ mod tests {
             "x_proj",
             &HashMap::new(),
             default_plq,
+            FAMILY,
         )
         .expect("plain bf16 load must succeed");
         assert!(
@@ -2481,6 +2206,7 @@ mod tests {
             "x_proj",
             &HashMap::new(),
             sym8_default_plq(),
+            FAMILY,
         )
         .expect("well-formed sym8 group must load");
         match &proj {
@@ -2510,6 +2236,7 @@ mod tests {
             "x_proj",
             &HashMap::new(),
             sym8_default_plq(),
+            FAMILY,
         )
         .expect_err("sym8 scales without weight must fail loud");
         let msg = format!("{err}");
@@ -2529,6 +2256,7 @@ mod tests {
             "x_proj",
             &HashMap::new(),
             sym8_default_plq(),
+            FAMILY,
         )
         .expect_err("sym8 .biases sidecar must fail loud");
         let msg = format!("{err}");
@@ -2550,6 +2278,7 @@ mod tests {
             "x_proj",
             &HashMap::new(),
             sym8_default_plq(),
+            FAMILY,
         )
         .expect("scales-less bf16 layer under a sym8 default must load dense");
         assert!(matches!(proj, LinearProj::Standard(_)));
@@ -2591,7 +2320,7 @@ mod tests {
     fn packed_embedding_and_quant_info_reject_sym8() {
         // Direct: the packed-params mapper has no sym8 pack (it feeds
         // `mlx_dequantize` / `mlx_quantized_matmul`).
-        let err = plq_to_packed_params(sym8_default_plq(), "embed_tokens")
+        let err = plq_to_packed_params(sym8_default_plq(), "embed_tokens", FAMILY)
             .expect_err("plq_to_packed_params must reject sym8");
         assert!(format!("{err}").contains("sym8"));
 
@@ -2608,6 +2337,7 @@ mod tests {
             "embed_tokens",
             &HashMap::new(),
             sym8_default_plq(),
+            FAMILY,
         )
         .expect_err("sym8 packed embedding must fail loud");
         assert!(format!("{err}").contains("sym8"));
@@ -2631,6 +2361,7 @@ mod tests {
             "x_proj",
             &HashMap::new(),
             sym8_default_plq(),
+            FAMILY,
         )
         .expect_err("int8 weight without .scales must fail loud, not dense-load");
         let msg = format!("{err}");
@@ -2711,7 +2442,7 @@ mod tests {
         let affine_plq = default_per_layer_quant(4, 64, PerLayerMode::Affine);
 
         // Non-MoE seam: through `load_linear_proj_quantized_or_bf16` (the
-        // `.scales`-present arm dispatches `build_lfm2_non_moe_ql`).
+        // `.scales`-present arm dispatches `build_non_moe_ql`).
         let mut p: HashMap<String, MxArray> = HashMap::new();
         synth_sym8_group(&mut p, "x_proj", 8, 32);
         let mut proj = LinearProj::Standard(Linear::new(32, 8, Some(false)).expect("Linear::new"));
@@ -2721,6 +2452,7 @@ mod tests {
             "x_proj",
             &HashMap::new(),
             affine_plq,
+            FAMILY,
         )
         .expect_err("int8 storage resolving affine must fail loud (config drift)");
         let msg = format!("{err}");
@@ -3144,7 +2876,7 @@ mod tests {
                 MxArray::from_float32(&[1.0, 1.0], &[2, 1]).unwrap(),
             ),
         ]);
-        let err = build_lfm2_non_moe_ql(&dense_params, dense_prefix, &HashMap::new(), stale)
+        let err = build_non_moe_ql(&dense_params, dense_prefix, &HashMap::new(), stale, FAMILY)
             .err()
             .expect("stale plain-FP8 LFM QL metadata must reject");
         assert!(
@@ -3152,9 +2884,15 @@ mod tests {
             "{}",
             err.reason
         );
-        let err = build_lfm2_non_moe_ql(&dense_params, dense_prefix, &HashMap::new(), explicit_fp8)
-            .err()
-            .expect("LFM plain-FP8 QL is unsupported");
+        let err = build_non_moe_ql(
+            &dense_params,
+            dense_prefix,
+            &HashMap::new(),
+            explicit_fp8,
+            FAMILY,
+        )
+        .err()
+        .expect("LFM plain-FP8 QL is unsupported");
         assert!(
             err.reason.contains("supported only by Qwen3.5"),
             "{}",

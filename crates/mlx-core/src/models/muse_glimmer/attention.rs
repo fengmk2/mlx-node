@@ -3,7 +3,7 @@ use crate::array::attention::{scaled_dot_product_attention, scaled_dot_product_a
 use crate::array::mask::create_causal_mask;
 use crate::models::gemma4::layer_cache::Gemma4LayerCache;
 use crate::models::gemma4::quantized_linear::LinearProj;
-use crate::nn::{Activations, RoPE};
+use crate::nn::{Activations, RoPE, rms_norm_unscaled};
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
 use crate::transformer::paged_policy::{gather_kv_for_decode_with_fallback, write_kv_chunk};
 use napi::bindgen_prelude::*;
@@ -70,13 +70,6 @@ impl MuseGlimmerAttention {
         })
     }
 
-    fn scaleless_rms_norm(&self, x: &MxArray) -> Result<MxArray> {
-        let handle = unsafe {
-            mlx_sys::mlx_fast_rms_norm(x.as_raw_ptr(), std::ptr::null_mut(), self.qk_norm_eps)
-        };
-        MxArray::from_handle(handle, "muse_glimmer_qk_rms_norm")
-    }
-
     pub fn forward(&self, x: &MxArray, cache: &mut Gemma4LayerCache) -> Result<MxArray> {
         let shape = x.shape()?;
         if shape.len() != 3 {
@@ -101,13 +94,10 @@ impl MuseGlimmerAttention {
                 .forward(x)?
                 .reshape(&[batch, seq_len, self.num_kv_heads, self.head_dim])?;
 
-        let q = self
-            .scaleless_rms_norm(&q)?
+        let q = rms_norm_unscaled(&q, self.qk_norm_eps)?
             .mul_scalar(self.qk_scale_factor)?
             .transpose(Some(&[0, 2, 1, 3]))?;
-        let k = self
-            .scaleless_rms_norm(&k)?
-            .transpose(Some(&[0, 2, 1, 3]))?;
+        let k = rms_norm_unscaled(&k, self.qk_norm_eps)?.transpose(Some(&[0, 2, 1, 3]))?;
         let v = v.transpose(Some(&[0, 2, 1, 3]))?;
         let (q, k) = match self.rope.as_ref() {
             Some(rope) => (
@@ -176,13 +166,10 @@ impl MuseGlimmerAttention {
             .v_proj
             .forward(x)?
             .reshape(&[1, seq_len, self.num_kv_heads, self.head_dim])?;
-        let q = self
-            .scaleless_rms_norm(&q)?
+        let q = rms_norm_unscaled(&q, self.qk_norm_eps)?
             .mul_scalar(self.qk_scale_factor)?
             .transpose(Some(&[0, 2, 1, 3]))?;
-        let k = self
-            .scaleless_rms_norm(&k)?
-            .transpose(Some(&[0, 2, 1, 3]))?;
+        let k = rms_norm_unscaled(&k, self.qk_norm_eps)?.transpose(Some(&[0, 2, 1, 3]))?;
         let v = v.transpose(Some(&[0, 2, 1, 3]))?;
         let (q, k) = match self.rope.as_ref() {
             Some(rope) => (
@@ -191,16 +178,14 @@ impl MuseGlimmerAttention {
             ),
             None => (q, k),
         };
-        let k_paged = k.transpose(Some(&[0, 2, 1, 3]))?.reshape(&[
+        let (k_paged, v_paged) = crate::models::attention_core::paged_kv_layout(
+            &k,
+            &v,
+            /* batch */ 1,
             seq_len,
             self.num_kv_heads,
             self.head_dim,
-        ])?;
-        let v_paged = v.transpose(Some(&[0, 2, 1, 3]))?.reshape(&[
-            seq_len,
-            self.num_kv_heads,
-            self.head_dim,
-        ])?;
+        )?;
         write_kv_chunk(
             adapter,
             paged_idx,
@@ -347,13 +332,10 @@ impl MuseGlimmerAttention {
         let q = q.reshape(&[batch, 1, self.num_heads, self.head_dim])?;
         let k = k.reshape(&[batch, 1, self.num_kv_heads, self.head_dim])?;
         let v = v.reshape(&[batch, 1, self.num_kv_heads, self.head_dim])?;
-        let q = self
-            .scaleless_rms_norm(&q)?
+        let q = rms_norm_unscaled(&q, self.qk_norm_eps)?
             .mul_scalar(self.qk_scale_factor)?
             .transpose(Some(&[0, 2, 1, 3]))?;
-        let k = self
-            .scaleless_rms_norm(&k)?
-            .transpose(Some(&[0, 2, 1, 3]))?;
+        let k = rms_norm_unscaled(&k, self.qk_norm_eps)?.transpose(Some(&[0, 2, 1, 3]))?;
         let v = v.transpose(Some(&[0, 2, 1, 3]))?;
         let (q, k) = match self.rope.as_ref() {
             Some(rope) => (
@@ -464,13 +446,10 @@ impl MuseGlimmerAttention {
         let q = q.reshape(&[batch, 1, self.num_heads, self.head_dim])?;
         let k = k.reshape(&[batch, 1, self.num_kv_heads, self.head_dim])?;
         let v = v.reshape(&[batch, 1, self.num_kv_heads, self.head_dim])?;
-        let q = self
-            .scaleless_rms_norm(&q)?
+        let q = rms_norm_unscaled(&q, self.qk_norm_eps)?
             .mul_scalar(self.qk_scale_factor)?
             .transpose(Some(&[0, 2, 1, 3]))?;
-        let k = self
-            .scaleless_rms_norm(&k)?
-            .transpose(Some(&[0, 2, 1, 3]))?;
+        let k = rms_norm_unscaled(&k, self.qk_norm_eps)?.transpose(Some(&[0, 2, 1, 3]))?;
         let v = v.transpose(Some(&[0, 2, 1, 3]))?;
         let (q, k) = match self.rope.as_ref() {
             Some(rope) => (

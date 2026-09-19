@@ -9,9 +9,9 @@ use napi::bindgen_prelude::*;
 
 use crate::engine::backend::{
     ChunkSink, DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix, PagedSpeculativeArgs,
-    StreamEmitter, ThinkingSetup, TurnOutput, WholeTurnArgs,
+    StreamEmitter, ThinkEndResolution, ThinkingSetup, TurnOutput, WholeTurnArgs,
 };
-use crate::engine::decode::{DecodeLoopArgs, StreamingCtx, run_decode_loop};
+use crate::engine::decode::{DecodeLoopArgs, TurnStreaming, run_decode_loop};
 use crate::engine::finalize::compute_performance_metrics;
 use crate::engine::params::{ChatParams, generated_capacity_hint};
 use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
@@ -123,12 +123,21 @@ pub(crate) fn finish_paged_turn<B: PagedBackend>(
     } else {
         args.prompt_tokens.len() as u32
     };
+    // Per-turn reasoning close token (see `admit_paged_turn`): K2's
+    // effort-dependent `</ifm|think*>` tag resolves through the backend
+    // hook; other families get the tokenizer-global `</think>`.
+    let ThinkEndResolution {
+        think_end_id,
+        think_end_str: think_end_str_owned,
+        think_end_extra_ids,
+    } = backend.think_end_for_turn(args.config, args.tokenizer);
     let mut result = match backend.finalize_turn(FinalizeArgs {
         tokenizer: args.tokenizer,
         generated_tokens: args.generated_tokens,
         finish_reason: args.finish_reason,
-        think_end_id: args.tokenizer.think_end_id(),
-        think_end_str: args.tokenizer.think_end_str(),
+        think_end_id,
+        think_end_str: think_end_str_owned.as_deref(),
+        think_end_extra_ids: &think_end_extra_ids,
         performance,
         include_reasoning: args.params.include_reasoning,
         thinking_enabled: args.thinking.enabled,
@@ -173,7 +182,11 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
     let thinking = args.thinking;
     let is_delta = args.plan.is_delta;
     let is_streaming = args.sink.is_some();
-    let think_end_id = tokenizer.think_end_id();
+    let ThinkEndResolution {
+        think_end_id,
+        think_end_extra_ids,
+        ..
+    } = backend.think_end_for_turn(args.config, &tokenizer);
 
     // Delta turns force `reuse_cache = true` (the engine's delta guards
     // already rejected an explicit `Some(false)`); fresh turns resolve
@@ -246,15 +259,22 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
     profiler.set_prompt_tokens(suffix_len as u32);
     profiler.snapshot_memory_before();
 
-    let mut reasoning_tracker = ReasoningTracker::from_setup(&thinking, think_end_id);
+    let mut reasoning_tracker =
+        ReasoningTracker::from_setup_multi(&thinking, think_end_id, think_end_extra_ids);
     let extra_eos_ids = backend.extra_eos_ids();
     let eos_before_emit = backend.eos_before_emit();
 
     let stream_skip_special = backend.stream_skip_special_tokens();
-    let mut decode_stream = tokenizer.inner().decode_stream(stream_skip_special);
-    let mut streamed_text_len = 0usize;
-    let mut last_is_reasoning = thinking.enabled;
-    let mut emitter: Option<Box<dyn StreamEmitter>> = args.sink.map(|_| backend.stream_emitter());
+    // One streaming bundle — detokenizer + cursors + emitter — built only
+    // when a sink exists so the sync path never runs the emitter hook.
+    let mut turn_streaming = args.sink.map(|_| {
+        TurnStreaming::new(
+            backend,
+            tokenizer.inner(),
+            thinking.enabled,
+            stream_skip_special,
+        )
+    });
     let turn_token_observer = backend.turn_token_observer();
 
     // ---- prefill ----
@@ -330,18 +350,9 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
         crate::engine::plan::DecoderPlan::Autoregressive => false,
     };
     let decode_result: Result<()> = (|| {
-        let streaming_ctx = match (args.sink, args.cancelled, emitter.as_mut()) {
-            (Some(sink), Some(cancelled), Some(em)) => Some(StreamingCtx {
-                callback: sink,
-                cancelled,
-                decode_stream: &mut decode_stream,
-                tokenizer: tokenizer.inner(),
-                streamed_text_len: &mut streamed_text_len,
-                last_is_reasoning: &mut last_is_reasoning,
-                emitter: em.as_mut(),
-            }),
-            _ => None,
-        };
+        let streaming_ctx = turn_streaming
+            .as_mut()
+            .and_then(|ts| ts.ctx(args.sink, args.cancelled));
         if speculative_admitted {
             // The speculative stepper records every emitted token's K/V inside
             // its own forwards and rewinds a mid-cycle stop itself, so neither
@@ -454,10 +465,15 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
             reasoning_tokens: reasoning_tracker.reasoning_token_count(),
             profiler: &profiler,
             stream_skip_special,
-            streamed_text_len,
-            last_is_reasoning,
+            // The epilogue takes scalar copies — the same defaults the
+            // locals had when the (sink-less) sync path never created a
+            // streaming bundle.
+            streamed_text_len: turn_streaming.as_ref().map_or(0, |ts| ts.streamed_text_len),
+            last_is_reasoning: turn_streaming
+                .as_ref()
+                .map_or(thinking.enabled, |ts| ts.last_is_reasoning),
             sink: args.sink,
-            emitter,
+            emitter: turn_streaming.map(|ts| ts.emitter),
         },
     )
 }

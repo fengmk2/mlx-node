@@ -87,7 +87,24 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "macos")]
 use mlx_paged_attn::metal::KvScaleManager;
 use mlx_paged_attn::{
-    BlockAllocator, LayerKVPool, PagedAttentionConfig, PhysicalBlock, SequenceBlockTable,
+    BlockAllocator, LayerKVPool, PagedAttentionConfig, PhysicalBlock, PrefixKeys,
+    SequenceBlockTable,
+};
+
+#[cfg(target_os = "macos")]
+use super::paged_metadata_cache::{
+    MetadataClear, PagedMetadataCache, RaggedPagedInputsCache, RaggedRowIdentity,
+    RequestMetadataCaches,
+};
+
+// The SSD cold-tier machinery (walk, capture outcome/budget, restore ticket,
+// aux-prefix latch helpers) lives in the sibling `cold_tier` module. These
+// re-exports keep `paged_kv_cache_adapter::ColdTierContext` & friends
+// resolving for the model families — zero API change.
+pub(crate) use super::cold_tier::PagedRestoreTicket;
+use super::cold_tier::{self, ColdTierWalk};
+pub use super::cold_tier::{
+    ColdCaptureBudget, ColdCaptureOutcome, ColdCaptureStop, ColdTierContext,
 };
 
 use crate::array::{DType, MxArray};
@@ -244,20 +261,18 @@ impl KvTensorMeta {
     /// production `update_keys_values` path; tests construct `KvTensorMeta`
     /// directly so they don't need the MLX runtime.
     pub(crate) fn from_array(array: &MxArray, label: &str) -> Result<Self, String> {
-        let ndim = array
-            .ndim()
-            .map_err(|e| format!("{label}.ndim() failed: {e}"))?;
-        let mut shape = Vec::with_capacity(ndim as usize);
-        for axis in 0..ndim {
-            let dim = array
-                .shape_at(axis)
-                .map_err(|e| format!("{label}.shape_at({axis}) failed: {e}"))?;
-            shape.push(dim);
-        }
+        let shape = array
+            .shape()
+            .map_err(|e| format!("{label}.shape() failed: {e}"))?
+            .to_vec();
         let dtype = array
             .dtype()
             .map_err(|e| format!("{label}.dtype() failed: {e}"))?;
-        Ok(Self { ndim, shape, dtype })
+        Ok(Self {
+            ndim: shape.len() as u32,
+            shape,
+            dtype,
+        })
     }
 }
 
@@ -517,7 +532,7 @@ pub(crate) fn build_decode_block_ids(table: &SequenceBlockTable) -> Vec<i32> {
 /// table. Normal suffix prefill records exactly through the current chunk; a
 /// cached-prefix replay can have `block_table.num_tokens()` already advanced to
 /// the full cached prefix while each replay chunk attends over a subrange.
-fn build_prefill_block_ids_for_total(
+pub(crate) fn build_prefill_block_ids_for_total(
     table: &SequenceBlockTable,
     required_tokens: u32,
     block_size: u32,
@@ -655,54 +670,6 @@ pub(crate) enum PagedRestorePoll {
     },
 }
 
-pub(crate) struct PagedRestoreTicket {
-    seq_id: SeqId,
-    total_budget: u32,
-    prompt_tokens: Vec<u32>,
-    hot_cached_prefix_len: u32,
-    hot_cached_blocks: usize,
-    reason: PagedTurnPlanReason,
-    job: mlx_paged_attn::ColdRestoreBatchJob,
-    reserved: Option<Vec<Arc<PhysicalBlock>>>,
-    identities: Vec<mlx_paged_attn::RestorePrefixIdentity>,
-    allocator: Arc<Mutex<BlockAllocator>>,
-}
-
-impl PagedRestoreTicket {
-    pub(crate) fn reserved_blocks(&self) -> u32 {
-        self.reserved
-            .as_ref()
-            .map_or(0, |blocks| blocks.len().try_into().unwrap_or(u32::MAX))
-    }
-}
-
-impl Drop for PagedRestoreTicket {
-    fn drop(&mut self) {
-        let Some(blocks) = self.reserved.take() else {
-            return;
-        };
-        let mut allocator = self
-            .allocator
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for block in blocks {
-            allocator.free(block);
-        }
-    }
-}
-
-/// Prefix-cache identity supplied to the shared turn-preparation lifecycle.
-///
-/// The turn lifecycle itself (live continuation, reset, suffix allocation,
-/// and plan reporting) is identical for both variants. Only the cold
-/// prefix-cache lookup differs: text-only callers use one uniform key vector,
-/// while multimodal callers use image-aware keys for each block.
-#[derive(Clone, Copy)]
-enum PreparePrefixKeys<'a> {
-    Uniform(&'a [u64]),
-    PerBlock(&'a [Vec<u64>]),
-}
-
 /// Process-local Metal/MLX memory counters captured once for a prefill chunk.
 ///
 /// `metal_current_allocated_bytes` includes buffers allocated outside MLX's
@@ -773,858 +740,6 @@ pub(crate) struct PagedBlockTelemetry {
     pub allocated_blocks: u32,
 }
 
-/// SSD cold-tier handle for persisting full paged KV blocks across process
-/// restarts. `fingerprint` binds every persisted block to one model + cache
-/// layout identity; any drift (weights, config, pool geometry, dtype) must
-/// produce a different fingerprint so stale blocks can never validate.
-pub struct ColdTierContext {
-    pub manager: std::sync::Arc<mlx_paged_attn::ColdCacheManager>,
-    pub fingerprint: mlx_paged_attn::ColdCacheFingerprint,
-    /// The auxiliary (non-KV) state this family REQUIRES at any boundary it
-    /// resumes from, or `None` when the paged pool already holds every piece
-    /// of per-token state the forward pass carries between turns.
-    ///
-    /// `None` is the dense-`qwen3` control: the restore walk behaves exactly
-    /// as it did before sidecars existed. `Some(policy)` turns the walk into
-    /// vLLM's reconcile-down — the candidate prefix is reduced to the deepest
-    /// boundary a VALIDATED sidecar backs, and a boundary no sidecar backs
-    /// restores nothing rather than handing back attention state whose
-    /// recurrent half never existed.
-    pub sidecar_policy: Option<mlx_paged_attn::ColdSidecarPolicy>,
-}
-
-/// The adapter fields the cold-tier restore and capture walks need, borrowed
-/// as one bundle.
-///
-/// Both walks are shared verbatim between the uniform-`extra_keys` entry points
-/// (`find_cached_prefix*` / `register_full_blocks_for_reuse`) and the per-block
-/// ones (`find_cached_prefix_per_block*` /
-/// `register_full_blocks_for_reuse_per_block`); the ONLY difference is how a
-/// block index maps to its `extra_keys`, which callers supply as a closure. The
-/// uniform side returns the same slice for every index, the per-block side
-/// indexes its per-block vec.
-///
-/// This is a borrowed bundle rather than `&self` methods on the adapter because
-/// the lookup path holds a `&mut` borrow of `self.block_table` across the
-/// restore call; taking `&self` there would conflict, while borrowing the four
-/// disjoint fields below does not.
-struct ColdTierWalk<'a> {
-    cold: &'a ColdTierContext,
-    pool: &'a Arc<LayerKVPool>,
-    allocator: &'a Arc<Mutex<BlockAllocator>>,
-    block_size: u32,
-}
-
-/// Outcome of one cold-tier restore walk.
-///
-/// INVARIANT, and the whole point of this type: when `sidecar` is `Some`, it is
-/// the validated auxiliary state for EXACTLY the boundary the returned `blocks`
-/// end at (hot prefix + `blocks`). The two can never describe different
-/// boundaries — every path that shortens `blocks` also re-derives (or drops)
-/// the sidecar.
-///
-/// `sidecar` is always `None` for a family with no [`ColdSidecarPolicy`].
-struct ColdRestore {
-    blocks: Vec<Arc<PhysicalBlock>>,
-    sidecar: Option<mlx_paged_attn::ColdSidecar>,
-}
-
-struct PendingColdRestore {
-    job: mlx_paged_attn::ColdRestoreBatchJob,
-    reserved: Vec<Arc<PhysicalBlock>>,
-    identities: Vec<mlx_paged_attn::RestorePrefixIdentity>,
-}
-
-impl ColdRestore {
-    /// Restore nothing: the hot hit stands unextended and no state is handed
-    /// back. Every fail-closed exit returns this.
-    fn miss() -> Self {
-        Self {
-            blocks: Vec::new(),
-            sidecar: None,
-        }
-    }
-}
-
-impl ColdTierWalk<'_> {
-    /// Prepare a dense-family cold restore without performing filesystem I/O
-    /// or Metal work on the model thread. The consecutive on-disk chain is
-    /// index-probed first, every destination is reserved next, and only then
-    /// is the background read launched.
-    fn begin_restore_extend<'k>(
-        &self,
-        lookup_tokens: &[u32],
-        hot_cached_tokens: usize,
-        cache_salt: u64,
-        extra_keys_for: impl Fn(usize) -> Option<&'k [u64]>,
-        hot_hashes: impl FnOnce(usize) -> Vec<u64>,
-    ) -> Option<PendingColdRestore> {
-        if self.cold.sidecar_policy.is_some() {
-            return None;
-        }
-        let bs = self.block_size as usize;
-        if bs == 0 {
-            return None;
-        }
-        let mut full_blocks = lookup_tokens.len() / bs;
-        let base = hot_cached_tokens.min(lookup_tokens.len()) / bs;
-        if base >= full_blocks {
-            return None;
-        }
-        let hot = hot_hashes(full_blocks);
-        full_blocks = full_blocks.min(hot.len());
-        if base >= full_blocks {
-            return None;
-        }
-
-        let mut parent_key = None;
-        for index in 0..base {
-            let extra_keys = extra_keys_for(index)?;
-            let tokens = lookup_tokens.get(index * bs..(index + 1) * bs)?;
-            parent_key = Some(mlx_paged_attn::ColdCacheKey::chain(
-                mlx_paged_attn::ColdGroup::Kv,
-                self.cold.fingerprint,
-                parent_key,
-                tokens,
-                extra_keys,
-                cache_salt,
-                index,
-            ));
-        }
-        let limit = self.kv_chain_upper_bound(
-            lookup_tokens,
-            cache_salt,
-            &extra_keys_for,
-            base,
-            full_blocks,
-            parent_key,
-        );
-        if limit <= base {
-            return None;
-        }
-
-        let mut keys = Vec::with_capacity(limit - base);
-        let mut identities = Vec::with_capacity(limit - base);
-        for index in base..limit {
-            let extra_keys = extra_keys_for(index)?;
-            let tokens = lookup_tokens.get(index * bs..(index + 1) * bs)?;
-            let key = mlx_paged_attn::ColdCacheKey::chain(
-                mlx_paged_attn::ColdGroup::Kv,
-                self.cold.fingerprint,
-                parent_key,
-                tokens,
-                extra_keys,
-                cache_salt,
-                index,
-            );
-            keys.push(key);
-            identities.push(mlx_paged_attn::RestorePrefixIdentity {
-                hot_hash: hot[index],
-                tokens: tokens.to_vec(),
-                parent_hot_hash: if index == 0 { 0 } else { hot[index - 1] },
-                extra_keys: extra_keys.to_vec(),
-                cache_salt,
-                block_index: index,
-            });
-            parent_key = Some(key);
-        }
-
-        let mut reserved = Vec::with_capacity(keys.len());
-        {
-            let mut allocator = self
-                .allocator
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for _ in 0..keys.len() {
-                let Some(block) = allocator.allocate() else {
-                    for block in reserved.drain(..) {
-                        allocator.free(block);
-                    }
-                    return None;
-                };
-                reserved.push(block);
-            }
-        }
-        let job =
-            match self
-                .cold
-                .manager
-                .begin_restore_batch(self.pool, keys, self.cold.fingerprint)
-            {
-                Ok(job) => job,
-                Err(_) => {
-                    let mut allocator = self
-                        .allocator
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    for block in reserved {
-                        allocator.free(block);
-                    }
-                    return None;
-                }
-            };
-        Some(PendingColdRestore {
-            job,
-            reserved,
-            identities,
-        })
-    }
-
-    /// SSD cold-tier restore on a hot-cache prefix miss: for each full block
-    /// the in-memory lookup did NOT cover, recompute the persisted chain (the
-    /// capture contract below — parent-linked per block, `cache_salt` mixed
-    /// into block 0 only) and transactionally restore it into a fresh physical
-    /// slot before falling back to prefill. Returns the restored blocks, in
-    /// order, to append to the hot hit.
-    ///
-    /// Fail-open everywhere: the first block that misses on disk, fails
-    /// validation, or cannot be uploaded stops the extension and leaves the hot
-    /// hit untouched. The hot identity each restored block is published under
-    /// comes from `hot_hashes`, so a subsequent lookup on this same allocator
-    /// serves it directly.
-    ///
-    /// `hot_hashes` is invoked at most once, with the full-block count, and
-    /// must return the hot chain hashes for exactly those blocks. A SHORT
-    /// return CAPS the walk: it means the caller could not establish a cache
-    /// identity past that point — for the per-block path, that the per-block
-    /// `extra_keys` vec ran out — and restoring under a guessed identity would
-    /// publish blocks a later lookup could serve for the wrong keys. This is
-    /// the same rule the hot allocator applies when `extra_keys_per_block` runs
-    /// short (`find_longest_cache_hit_per_block` breaks at the first block
-    /// without keys, keeping the blocks before it).
-    ///
-    /// ## Reconcile-down (families with a [`ColdSidecarPolicy`])
-    ///
-    /// Paged KV is only half the state of a hybrid family: GDN recurrent state
-    /// (`qwen3_5`) and sliding-window `RotatingKVCache` state (`gemma4`) live
-    /// OUTSIDE the pool, so a restored KV prefix whose auxiliary state is
-    /// missing describes a model state that never existed. vLLM's rule for the
-    /// same hazard is that each cache group may only REDUCE the candidate
-    /// length (`vllm/v1/core/sched/scheduler.py`,
-    /// `vllm/v1/core/kv_cache_coordinator.py`): "No external tokens back the
-    /// deeper local hit, so its resume boundary would have no valid Mamba
-    /// state. Reconcile to the boundary every group agrees on."
-    ///
-    /// So when a policy is present the walk runs in phases:
-    ///
-    ///  1. probe how far the persisted KV chain reaches (index only, no I/O);
-    ///  2. descend from that ceiling to the deepest boundary a VALIDATED
-    ///     sidecar backs — nothing backed means restore NOTHING, never a
-    ///     "close enough" prefix;
-    ///  3. restore exactly that many blocks;
-    ///  4. if step 3 came up short (a block failed to decode, upload, or
-    ///     publish), reconcile down AGAIN over what actually landed and free
-    ///     the tail, so the returned sidecar always backs exactly the returned
-    ///     prefix.
-    ///
-    /// The floor of every reconcile is the hot hit: this walk can only extend
-    /// it, so it never claims to have reduced a prefix the in-memory cache
-    /// already served.
-    ///
-    /// That leaves one thing this gate deliberately does NOT cover: a HOT hit
-    /// is not gated here. A block that a backed restore published (or that
-    /// phase 4 released — `free` decrefs it to a cache-only entry, it is not
-    /// erased) stays in the allocator's prefix cache and a later lookup in the
-    /// same process can serve it as a hot hit with no sidecar attached. The KV
-    /// is valid; what is missing is the auxiliary half. So a hybrid family must
-    /// still establish its own state for a hot prefix, or restart the turn cold
-    /// via [`PagedKVCacheAdapter::restart_prepared_turn_cold_per_block`]. This
-    /// walk changes only what the SSD tier is allowed to hand back; the hot
-    /// half is covered by the `aux_prefix_unbacked` latch, which turns that
-    /// obligation into a checked one (see its field doc).
-    ///
-    /// With `sidecar_policy: None` every phase above is skipped and the body is
-    /// the pre-sidecar walk verbatim.
-    fn restore_extend<'k>(
-        &self,
-        lookup_tokens: &[u32],
-        hot_cached_tokens: usize,
-        cache_salt: u64,
-        extra_keys_for: impl Fn(usize) -> Option<&'k [u64]>,
-        hot_hashes: impl FnOnce(usize) -> Vec<u64>,
-    ) -> ColdRestore {
-        let bs = self.block_size as usize;
-        // `checked_div` folds the degenerate `block_size == 0` case into a
-        // no-op: both counts become 0, so the extension loop never runs.
-        let mut full_blocks = lookup_tokens.len().checked_div(bs).unwrap_or(0);
-        // Blocks the hot hit already covers. This is the walk's floor — it can
-        // extend the hot hit but never shorten it.
-        let base = hot_cached_tokens
-            .min(lookup_tokens.len())
-            .checked_div(bs)
-            .unwrap_or(0);
-        let mut idx = base;
-        let mut restored: Vec<Arc<PhysicalBlock>> = Vec::new();
-        if idx >= full_blocks {
-            return ColdRestore::miss();
-        }
-
-        let hot = hot_hashes(full_blocks);
-        full_blocks = full_blocks.min(hot.len());
-        if idx >= full_blocks {
-            return ColdRestore::miss();
-        }
-
-        // Rebuild the cold keys of the already-covered leading blocks so the
-        // first restore chains off the correct parent key.
-        let mut parent_key: Option<mlx_paged_attn::ColdCacheKey> = None;
-        for i in 0..idx {
-            let Some(extra_keys) = extra_keys_for(i) else {
-                self.record_decline(
-                    "parent_chain_unavailable",
-                    base,
-                    full_blocks,
-                    full_blocks,
-                    bs,
-                    lookup_tokens.len(),
-                );
-                return ColdRestore::miss();
-            };
-            parent_key = Some(mlx_paged_attn::ColdCacheKey::chain(
-                mlx_paged_attn::ColdGroup::Kv,
-                self.cold.fingerprint,
-                parent_key,
-                &lookup_tokens[i * bs..(i + 1) * bs],
-                extra_keys,
-                cache_salt,
-                i,
-            ));
-        }
-
-        // Phases 1-2: reduce the candidate to a boundary the family's auxiliary
-        // state actually backs, BEFORE any Metal blit or hot-cache publish, so
-        // an unbacked prefix is never materialized in the first place.
-        let mut limit = full_blocks;
-        let mut sidecar = None;
-        if let Some(policy) = self.cold.sidecar_policy.as_ref() {
-            let ceiling = self.kv_chain_upper_bound(
-                lookup_tokens,
-                cache_salt,
-                &extra_keys_for,
-                base,
-                full_blocks,
-                parent_key,
-            );
-            let Some((backed, state)) = self.deepest_backed_boundary(
-                policy,
-                lookup_tokens,
-                cache_salt,
-                &extra_keys_for,
-                base,
-                ceiling,
-            ) else {
-                // The silent zero this whole counter exists for. Both probes
-                // this verdict rests on (`contains` / `contains_in`) are
-                // side-effect free by contract, `load_sidecar` and
-                // `restore_block` are never reached, and the walk returns
-                // above its own trace line — so a refused restore moved no
-                // counter and printed nothing, and the tier reported `0/0`
-                // exactly like a turn that never opened it.
-                self.record_decline(
-                    "no_backed_boundary",
-                    base,
-                    ceiling,
-                    full_blocks,
-                    bs,
-                    lookup_tokens.len(),
-                );
-                return ColdRestore::miss();
-            };
-            limit = backed;
-            sidecar = Some(state);
-        }
-
-        // The restore loop has no budget and deliberately gets none: capping it
-        // would cap REUSE, which is the whole feature. It is timed instead,
-        // because the per-block restore cost is what decides whether reuse pays
-        // at all — a block restored slower than the prefill that would have
-        // recomputed it is a loss no coverage can fix.
-        let restore_started = Instant::now();
-        while idx < limit {
-            let Some(extra_keys) = extra_keys_for(idx) else {
-                break;
-            };
-            let toks = &lookup_tokens[idx * bs..(idx + 1) * bs];
-            let key = mlx_paged_attn::ColdCacheKey::chain(
-                mlx_paged_attn::ColdGroup::Kv,
-                self.cold.fingerprint,
-                parent_key,
-                toks,
-                extra_keys,
-                cache_salt,
-                idx,
-            );
-            let identity = mlx_paged_attn::RestorePrefixIdentity {
-                hot_hash: hot[idx],
-                tokens: toks.to_vec(),
-                parent_hot_hash: if idx == 0 { 0 } else { hot[idx - 1] },
-                extra_keys: extra_keys.to_vec(),
-                cache_salt,
-                block_index: idx,
-            };
-            match self.cold.manager.restore_block(
-                self.pool,
-                self.allocator,
-                key,
-                self.cold.fingerprint,
-                &identity,
-            ) {
-                Some(block) => {
-                    restored.push(block);
-                    parent_key = Some(key);
-                    idx += 1;
-                }
-                None => break,
-            }
-        }
-        if inference_trace_enabled() {
-            let elapsed_ms = restore_started.elapsed().as_secs_f64() * 1000.0;
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] paged cold_restore_walk blocks={} base={} limit={} elapsed_ms={:.3} per_block_ms={:.3}",
-                restored.len(),
-                base,
-                limit,
-                elapsed_ms,
-                if restored.is_empty() {
-                    0.0
-                } else {
-                    elapsed_ms / restored.len() as f64
-                },
-            ));
-        }
-
-        // Phase 4: the restore stopped short of the boundary the sidecar backs
-        // (a block failed to decode, allocate, upload, or publish). The state
-        // in hand is for a prefix we do not have, so reconcile down again over
-        // the blocks that actually landed and release the tail. Fail-closed:
-        // when nothing shorter is backed either, the whole extension is
-        // dropped rather than returned without state.
-        if let Some(policy) = self.cold.sidecar_policy.as_ref()
-            && idx < limit
-        {
-            let keep = match self.deepest_backed_boundary(
-                policy,
-                lookup_tokens,
-                cache_salt,
-                &extra_keys_for,
-                base,
-                idx,
-            ) {
-                Some((backed, state)) => {
-                    sidecar = Some(state);
-                    backed
-                }
-                None => {
-                    sidecar = None;
-                    base
-                }
-            };
-            // `keep >= base` by construction (`deepest_backed_boundary` only
-            // returns counts above its floor), so this can never exceed what
-            // was restored; the clamp keeps a future contract slip a no-op
-            // instead of an underflow panic.
-            let drop_count = (base + restored.len())
-                .saturating_sub(keep)
-                .min(restored.len());
-            if drop_count > 0 {
-                let tail = restored.split_off(restored.len() - drop_count);
-                let mut guard = self
-                    .allocator
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                for block in tail {
-                    guard.free(block);
-                }
-                // Everything this walk restored was handed back to the
-                // allocator, so it extends the hot hit by nothing. Unlike the
-                // refusals above this one has already paid for real `hits` and
-                // `bytes_restored`, which is what makes it the more misleading
-                // of the two: the tier reports blocks restored on a turn that
-                // reuses none of them.
-                if restored.is_empty() {
-                    self.record_decline(
-                        "restore_short_of_boundary",
-                        base,
-                        keep,
-                        limit,
-                        bs,
-                        lookup_tokens.len(),
-                    );
-                }
-            }
-        }
-
-        ColdRestore {
-            blocks: restored,
-            sidecar,
-        }
-    }
-
-    /// Count one restore this walk refused to serve, and trace why.
-    ///
-    /// The counter (`ColdCacheStats::restore_declines`) is what makes a refusal
-    /// exist at all for anything downstream: `hits` and `misses` count per-block
-    /// lookups, a refusal happens instead of those lookups, so before this a
-    /// refused restore was reported as `0 hits / 0 misses` — the same row a
-    /// turn that never touched the tier produces, which reads as "nothing ran"
-    /// rather than "reuse was refused".
-    ///
-    /// The block geometry goes to the trace instead of to counters on purpose.
-    /// A ceiling is a per-walk position, and summing positions across turns
-    /// produces a number with no meaning; what the diagnosis needs is the
-    /// single line where `ceiling` and `full_blocks` sit next to each other —
-    /// a capture that anchors one block past the restore's reach shows up here
-    /// as `ceiling` one short of the boundary it would need, on the turn it
-    /// happened.
-    ///
-    /// `ceiling_tokens` is that comparison already made. It is the DEEPEST
-    /// boundary this walk could name at all — every candidate
-    /// `deepest_backed_boundary` probed was at or below it — and it is directly
-    /// comparable with the `boundary_tokens=` a family's capture trace prints.
-    /// A capture line one block above a decline line's `ceiling_tokens`, for the
-    /// same prompt, IS the aligned-prompt gap: the lookup is capped at
-    /// `prompt_len - 1` (`lookup_tokens`), so a boundary at `prompt_len` has no
-    /// name on this side.
-    fn record_decline(
-        &self,
-        reason: &str,
-        base: usize,
-        ceiling: usize,
-        full_blocks: usize,
-        block_size: usize,
-        lookup_tokens: usize,
-    ) {
-        self.cold.manager.record_restore_decline();
-        if inference_trace_enabled() {
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] paged cold_restore_declined reason={} base={} ceiling={} full_blocks={} block_size={} ceiling_tokens={} lookup_tokens={}",
-                reason,
-                base,
-                ceiling,
-                full_blocks,
-                block_size,
-                ceiling.saturating_mul(block_size),
-                lookup_tokens,
-            ));
-        }
-    }
-
-    /// How far the persisted KV chain reaches past the hot hit, as a block
-    /// count, using the in-memory index only — no file I/O, no decode, and no
-    /// hit/miss accounting (`contains` is explicitly side-effect free).
-    ///
-    /// This is the ceiling the sidecar descent starts from. Without it a
-    /// sidecar recorded at a deep boundary would be selected even when the KV
-    /// blocks under it were evicted, and the walk would blit and publish blocks
-    /// it must then free again. The index can be optimistic (an externally
-    /// deleted file leaves a stale entry), which only means the restore loop
-    /// stops short and phase 4 reconciles — never that an unbacked prefix is
-    /// returned.
-    ///
-    /// `parent_key` must be the KV chain key of block `base - 1` (`None` when
-    /// `base == 0`), i.e. exactly what the leading-block rebuild produced.
-    fn kv_chain_upper_bound<'k>(
-        &self,
-        lookup_tokens: &[u32],
-        cache_salt: u64,
-        extra_keys_for: &impl Fn(usize) -> Option<&'k [u64]>,
-        base: usize,
-        full_blocks: usize,
-        mut parent_key: Option<mlx_paged_attn::ColdCacheKey>,
-    ) -> usize {
-        let bs = self.block_size as usize;
-        let mut end = base;
-        for i in base..full_blocks {
-            let (Some(extra_keys), Some(toks)) =
-                (extra_keys_for(i), lookup_tokens.get(i * bs..(i + 1) * bs))
-            else {
-                break;
-            };
-            let key = mlx_paged_attn::ColdCacheKey::chain(
-                mlx_paged_attn::ColdGroup::Kv,
-                self.cold.fingerprint,
-                parent_key,
-                toks,
-                extra_keys,
-                cache_salt,
-                i,
-            );
-            if !self.cold.manager.contains(&key) {
-                break;
-            }
-            parent_key = Some(key);
-            end = i + 1;
-        }
-        end
-    }
-
-    /// The reconcile-down step: the DEEPEST block count in `(floor, ceiling]`
-    /// whose auxiliary state is on disk and validates against `policy`, with
-    /// that state. `None` means no boundary in range is backed, which callers
-    /// must treat as "restore nothing" — never as "restore anyway".
-    ///
-    /// The sidecar chain is the KV chain recomputed under the sidecar group's
-    /// own domain tag: identical per-block arguments (tokens, `extra_keys`,
-    /// `cache_salt`, block index), different group. That is vLLM's
-    /// `BlockHashWithGroupId` (`vllm/v1/core/kv_cache_utils.py`) — the group is
-    /// part of the key — so a sidecar key can never collide with, or be
-    /// decoded as, a KV block key. Gaps are fine: a boundary that was never
-    /// captured still lets deeper boundaries derive, because the chain is pure
-    /// computation over the prompt, not a walk over what exists on disk.
-    ///
-    /// Each candidate is index-probed before it is loaded, so boundaries that
-    /// were simply never captured cost no I/O and register no miss; a probe
-    /// that says present and then fails to load is a real miss (and, if the
-    /// bytes were readable, a corruption) counted by
-    /// [`mlx_paged_attn::ColdCacheManager::load_sidecar`].
-    fn deepest_backed_boundary<'k>(
-        &self,
-        policy: &mlx_paged_attn::ColdSidecarPolicy,
-        lookup_tokens: &[u32],
-        cache_salt: u64,
-        extra_keys_for: &impl Fn(usize) -> Option<&'k [u64]>,
-        floor: usize,
-        ceiling: usize,
-    ) -> Option<(usize, mlx_paged_attn::ColdSidecar)> {
-        let bs = self.block_size as usize;
-        if bs == 0 || ceiling <= floor {
-            return None;
-        }
-        let mut keys: Vec<mlx_paged_attn::ColdCacheKey> = Vec::with_capacity(ceiling);
-        let mut parent: Option<mlx_paged_attn::ColdCacheKey> = None;
-        for i in 0..ceiling {
-            let (Some(extra_keys), Some(toks)) =
-                (extra_keys_for(i), lookup_tokens.get(i * bs..(i + 1) * bs))
-            else {
-                // No cache identity for block `i`, so the chain — and every
-                // boundary past it — cannot be derived at all.
-                break;
-            };
-            let key = mlx_paged_attn::ColdCacheKey::chain(
-                policy.group(),
-                self.cold.fingerprint,
-                parent,
-                toks,
-                extra_keys,
-                cache_salt,
-                i,
-            );
-            keys.push(key);
-            parent = Some(key);
-        }
-
-        for count in (floor + 1..=keys.len()).rev() {
-            let key = keys[count - 1];
-            if !self.cold.manager.contains_in(&key, policy.group()) {
-                continue;
-            }
-            // A boundary past `u32::MAX` tokens cannot be expressed in the
-            // layout, so it cannot match; shallower candidates still can.
-            let Ok(boundary) = u32::try_from(count.saturating_mul(bs)) else {
-                continue;
-            };
-            if let Some(state) = self.cold.manager.load_sidecar(
-                key,
-                self.cold.fingerprint,
-                &policy.expected_at(boundary),
-            ) {
-                return Some((count, state));
-            }
-        }
-        None
-    }
-
-    /// SSD cold-tier capture, fail-open: a persistence error only means the
-    /// next process recomputes this prefix. Keys follow the hot chain-hash
-    /// contract — parent-linked per block, `cache_salt` mixed into block 0 only
-    /// — so [`Self::restore_extend`] recomputes the identical chain.
-    /// `contains` dedups re-publishes of a chain already on disk without
-    /// touching Metal.
-    ///
-    /// Reports how many leading blocks the persisted chain now covers — every
-    /// block that was already on disk or was accepted by the writer queue, up
-    /// to the first one that was not. A family capturing an auxiliary sidecar
-    /// alongside the chain must not anchor it deeper than this: a sidecar past
-    /// the chain's break can never be selected on restore
-    /// ([`Self::kv_chain_upper_bound`] caps the descent at the chain's reach),
-    /// so writing it would only burn quota.
-    ///
-    /// # What bounds this walk
-    ///
-    /// `budget`, and only `budget`. Until this took a budget the walk was
-    /// bounded by the writer queue refusing a block, which made the per-turn
-    /// capture depth an emergent property of the filesystem rather than a
-    /// policy — `(Q + 1) / (1 - Tc/Tw)` blocks, measured at ~12 on this
-    /// machine — so an 8 K-token prompt needed ~40 turns to persist and the
-    /// restored prefix measured a few percent of the prompt. Waiting a bounded
-    /// time for a queue slot (`capture_and_enqueue_before`) instead of giving
-    /// up on one decouples the depth from `Tw` entirely.
-    ///
-    /// # Why it still breaks rather than skipping
-    ///
-    /// A block that did not land ends the walk, and every deeper block is left
-    /// for a later turn. Skipping it instead would buy nothing on the turn that
-    /// hits it: [`Self::kv_chain_upper_bound`] and [`Self::restore_extend`]
-    /// both stop at the first key that is absent, so the chain's REACH is the
-    /// index of the first hole under either policy. It would only pay from the
-    /// turn after — at the price of a full Metal blit per skipped block, all of
-    /// them on the inference thread, all of them discarded. Under a budget
-    /// there is no cheap refusal left to skip anyway: `Ok(false)` now means the
-    /// deadline expired, which is exactly when the walk should stop.
-    fn capture_chain<'k>(
-        &self,
-        request_tokens: &[u32],
-        blocks_slice: &[Arc<PhysicalBlock>],
-        cache_salt: u64,
-        budget: ColdCaptureBudget,
-        extra_keys_for: impl Fn(usize) -> Option<&'k [u64]>,
-    ) -> ColdCaptureOutcome {
-        let started = Instant::now();
-        let deadline = started + budget.max_walk;
-        let mut outcome = ColdCaptureOutcome::default();
-        let bs = self.block_size as usize;
-        if bs == 0 {
-            return outcome;
-        }
-        let mut parent: Option<mlx_paged_attn::ColdCacheKey> = None;
-        for (i, block) in blocks_slice.iter().enumerate() {
-            // Both lookups are infallible under the callers' own
-            // preconditions; `get` keeps a contract slip a graceful stop
-            // instead of a panic.
-            let (Some(extra_keys), Some(toks)) =
-                (extra_keys_for(i), request_tokens.get(i * bs..(i + 1) * bs))
-            else {
-                break;
-            };
-            let key = mlx_paged_attn::ColdCacheKey::chain(
-                mlx_paged_attn::ColdGroup::Kv,
-                self.cold.fingerprint,
-                parent,
-                toks,
-                extra_keys,
-                cache_salt,
-                i,
-            );
-            if !self.cold.manager.contains(&key) {
-                // Budget checks guard the CAPTURE, not the free `contains`
-                // skip above: re-walking a chain already on disk costs an
-                // in-memory index probe per block and must not consume a
-                // turn's capture depth, or a long persisted prefix would stop
-                // the walk before it reached the first block that needs
-                // writing.
-                if outcome.enqueued >= budget.max_blocks {
-                    outcome.stop = ColdCaptureStop::Budget;
-                    break;
-                }
-                if Instant::now() >= deadline {
-                    outcome.stop = ColdCaptureStop::Deadline;
-                    break;
-                }
-                match self.cold.manager.capture_and_enqueue_before(
-                    self.pool,
-                    block,
-                    key,
-                    self.cold.fingerprint,
-                    toks,
-                    deadline,
-                ) {
-                    Ok(true) => outcome.enqueued += 1,
-                    // The queue stayed full for the rest of the budget: the
-                    // storage device, not the walk, is the bottleneck.
-                    Ok(false) => {
-                        outcome.stop = ColdCaptureStop::Deadline;
-                        break;
-                    }
-                    // A failed blit leaves nothing to chain off. Descendants
-                    // must not be persisted under a missing parent — that is a
-                    // chain hole, and a hole is unrestorable past its index.
-                    Err(_) => {
-                        outcome.stop = ColdCaptureStop::Error;
-                        break;
-                    }
-                }
-            }
-            parent = Some(key);
-            outcome.blocks = i + 1;
-        }
-        outcome.elapsed = started.elapsed();
-        outcome
-    }
-}
-
-/// How much of the prompt one turn's cold-tier capture walk may persist.
-///
-/// Two independent bounds because they answer different failure modes.
-/// `max_blocks` bounds the STEADY state: how fast the persisted chain is
-/// allowed to ratchet up a long prompt, which is a trade of turn tail against
-/// how many turns it takes before a restore covers anything worth having.
-/// `max_walk` bounds the TAIL: it is what stops a stalled storage device, or a
-/// filesystem so fast that the queue never pushes back, from turning a 64 K
-/// first turn into a second of dead time after the last token.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ColdCaptureBudget {
-    pub max_blocks: usize,
-    pub max_walk: Duration,
-}
-
-impl Default for ColdCaptureBudget {
-    /// The process-wide budget, from `MLX_COLD_CAPTURE_BLOCKS_PER_TURN` /
-    /// `MLX_COLD_CAPTURE_BUDGET_MS`.
-    fn default() -> Self {
-        let (max_blocks, max_walk) = crate::cold_tier::cold_capture_budget();
-        Self {
-            max_blocks,
-            max_walk,
-        }
-    }
-}
-
-/// Why [`ColdTierWalk::capture_chain`] stopped.
-///
-/// `End` and `Budget` are the healthy states — the walk ran out of prompt, or
-/// spent its depth. `Deadline` means the writer could not keep up within
-/// `max_walk`, so this turn ratcheted less than it was allowed to; `Error`
-/// means a Metal blit failed. Both of the latter are visible per turn in the
-/// `cold_capture_walk` trace line, and `Deadline` additionally warns.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ColdCaptureStop {
-    /// Walked every full block of the request.
-    #[default]
-    End,
-    /// Spent `max_blocks`.
-    Budget,
-    /// Ran out of `max_walk` waiting on the writer queue.
-    Deadline,
-    /// A capture failed; the chain must stay contiguous, so the walk stopped.
-    Error,
-}
-
-impl ColdCaptureStop {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::End => "end",
-            Self::Budget => "budget",
-            Self::Deadline => "deadline",
-            Self::Error => "error",
-        }
-    }
-}
-
-/// Outcome of one [`ColdTierWalk::capture_chain`].
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ColdCaptureOutcome {
-    /// Leading blocks the persisted chain covers after this walk. Includes
-    /// blocks that were already on disk, so it is the number a sidecar may
-    /// anchor under — NOT the number this turn wrote.
-    pub blocks: usize,
-    /// Blocks this walk actually handed to the writer queue. What the budget
-    /// counts, and what separates "the chain advanced" from "the chain was
-    /// already there".
-    pub enqueued: usize,
-    pub elapsed: Duration,
-    pub stop: ColdCaptureStop,
-}
-
 pub type SeqId = u32;
 
 /// One request-local slice inside a packed ragged scheduler step.
@@ -1657,20 +772,12 @@ pub struct PagedRequestState {
     restored_sidecar: Option<mlx_paged_attn::ColdSidecar>,
     aux_prefix_unbacked: bool,
     cold_capture: ColdCaptureOutcome,
+    /// The attention-metadata caches parked with this request's workspace.
+    /// Swapped wholesale into `PagedMetadataCache::request` on
+    /// re-activation, so a parked request resumes with exactly the
+    /// metadata wave it left.
     #[cfg(target_os = "macos")]
-    prefill_attention_inputs_cache: Option<PrefillPagedAttentionInputsCache>,
-    #[cfg(target_os = "macos")]
-    compact_prefill_inputs_cache: Option<CompactPrefillInputsCache>,
-    #[cfg(target_os = "macos")]
-    varlen_prefill_inputs_cache: Option<VarlenPrefillInputsCache>,
-    #[cfg(target_os = "macos")]
-    decode_attention_inputs_cache: Option<DecodePagedAttentionInputsCache>,
-    #[cfg(target_os = "macos")]
-    write_slot_mapping_cache: Option<WriteSlotMappingCache>,
-    #[cfg(target_os = "macos")]
-    prefill_memory_snapshot_cache: Option<PrefillMemorySnapshotCache>,
-    #[cfg(target_os = "macos")]
-    decode_planning_cache: Option<DecodePlanningCache>,
+    meta: RequestMetadataCaches,
 }
 
 impl PagedRequestState {
@@ -1686,19 +793,7 @@ impl PagedRequestState {
             aux_prefix_unbacked: false,
             cold_capture: ColdCaptureOutcome::default(),
             #[cfg(target_os = "macos")]
-            prefill_attention_inputs_cache: None,
-            #[cfg(target_os = "macos")]
-            compact_prefill_inputs_cache: None,
-            #[cfg(target_os = "macos")]
-            varlen_prefill_inputs_cache: None,
-            #[cfg(target_os = "macos")]
-            decode_attention_inputs_cache: None,
-            #[cfg(target_os = "macos")]
-            write_slot_mapping_cache: None,
-            #[cfg(target_os = "macos")]
-            prefill_memory_snapshot_cache: None,
-            #[cfg(target_os = "macos")]
-            decode_planning_cache: None,
+            meta: RequestMetadataCaches::default(),
         }
     }
 }
@@ -1879,35 +974,29 @@ pub struct PagedKVCacheAdapter {
     /// map holds exactly one `1.0` entry per layer per kind.
     scale_arrays: std::collections::HashMap<(u32, bool, u32), MxArray>,
 
-    /// Cached per-prefill-chunk metadata for the MLX `paged_attention`
-    /// bridge. The metadata is identical for every full-attention layer in a
-    /// chunk, so rebuilding a duplicated block table per layer would make the
-    /// optimized prefill path pay avoidable host allocation/upload cost.
+    /// Shared `[1]` fp32 `1.0` scale array returned by
+    /// [`Self::k_scale_array`] / [`Self::v_scale_array`] when no scale
+    /// manager is installed. The decode write path requests a K and a V
+    /// scale per layer per token, so allocating a fresh constant array at
+    /// each call produced ~2×num_layers node creations per step.
     #[cfg(target_os = "macos")]
-    prefill_attention_inputs_cache: Option<PrefillPagedAttentionInputsCache>,
+    unit_kv_scale_array: MxArray,
 
-    /// Compact one-row prefill metadata shared by the varlen attention and
-    /// graph-native SDPA gather paths. This is invalidated alongside the
-    /// legacy prefill cache whenever the request cursor changes.
+    /// The attention-metadata cache cluster: every array/snapshot/probe
+    /// whose payload is pure dispatch metadata (block tables, seq lens,
+    /// slot mappings, memory snapshots, capability/stripe probes).
+    /// Mutation points invalidate through the single
+    /// [`PagedMetadataCache::invalidate`] funnel; request-scoped entries
+    /// ride `meta.request` through the park/install cycle while the
+    /// packed ragged wave, the D128 stripe plan, and the D512 capability
+    /// stay model-global.
+    ///
+    /// Deliberately NOT inside: `native_pool_arrays` below carries lazy
+    /// graph outputs tied to native-write ordering (a write dependency
+    /// chain, not pure metadata), and `unit_kv_scale_array` is an eager
+    /// constant.
     #[cfg(target_os = "macos")]
-    compact_prefill_inputs_cache: Option<CompactPrefillInputsCache>,
-
-    /// Varlen-specific sequence metadata for the current prefill chunk.
-    #[cfg(target_os = "macos")]
-    varlen_prefill_inputs_cache: Option<VarlenPrefillInputsCache>,
-
-    /// Split-lifetime decode metadata for the MLX `paged_attention` bridge.
-    /// The materialized block table survives token-cursor changes until the
-    /// exact physical block-id sequence changes; `seq_lens` is immutable and
-    /// replaced for each new cursor so older lazy graphs retain their storage.
-    /// Same-token calls from later full-attention layers reuse both arrays.
-    #[cfg(target_os = "macos")]
-    decode_attention_inputs_cache: Option<DecodePagedAttentionInputsCache>,
-
-    /// One immutable one-token batch shared by all layers in this cache group.
-    /// Identity/revision/frontier checks survive owner workspace rotation.
-    #[cfg(target_os = "macos")]
-    ragged_inputs_cache: Option<RaggedPagedInputsCache>,
+    meta: PagedMetadataCache,
 
     /// Per-layer MLX views of the K/V pool that carry native
     /// `paged_kv_write` dependencies. When a native write returns
@@ -1916,33 +1005,6 @@ pub struct PagedKVCacheAdapter {
     /// write-before-read graph edge.
     #[cfg(target_os = "macos")]
     native_pool_arrays: Vec<Option<NativePoolArrays>>,
-
-    /// Cached exact slot mapping for the current write chunk. Gemma4 has five
-    /// global layers that write the same token positions, so this avoids
-    /// rebuilding and re-evaluating identical int64 metadata per layer.
-    #[cfg(target_os = "macos")]
-    write_slot_mapping_cache: Option<WriteSlotMappingCache>,
-
-    /// One process-memory sample per recorded prefill chunk. Every
-    /// full-attention layer in that chunk must make the same routing decision;
-    /// re-running the probes per layer is both wasteful and can produce a
-    /// mixed SDPA/varlen plan as lazy graph allocations change.
-    #[cfg(target_os = "macos")]
-    prefill_memory_snapshot_cache: Option<PrefillMemorySnapshotCache>,
-
-    /// Process-memory sample and failure/report latches for one coarse decode
-    /// context bucket. Unlike the per-token PagedAttention metadata, decode
-    /// routing must remain stable while all logical full-attention consumers
-    /// read the same physical pool. Sampling once per bucket also prevents
-    /// lazy allocations in an early layer from changing later layers' route.
-    #[cfg(target_os = "macos")]
-    decode_planning_cache: Option<DecodePlanningCache>,
-
-    /// Immutable grouped-D512 pipeline/threadgroup capability for this pool's
-    /// geometry. The Metal probe itself is process-cached, but retaining the
-    /// result here removes even the FFI call from every layer/token.
-    #[cfg(target_os = "macos")]
-    grouped_d512_capability_cache: Option<(i32, Result<bool, String>)>,
 
     /// Optional hook invoked once per successful pool grow with the pool's
     /// new total K/V bytes (all layers, both sides). The cache-limit pool
@@ -1959,68 +1021,6 @@ pub struct PagedKVCacheAdapter {
 }
 
 #[cfg(target_os = "macos")]
-struct PrefillPagedAttentionInputsCache {
-    token_count: u32,
-    cached_prefix_len: u32,
-    num_new_tokens: u32,
-    block_count: u32,
-    block_table: MxArray,
-    seq_lens: MxArray,
-}
-
-#[cfg(target_os = "macos")]
-struct CompactPrefillInputsCache {
-    first_block: u32,
-    token_count: u32,
-    required_tokens: u32,
-    block_count: u32,
-    /// One-dimensional physical block IDs, suitable for `take(axis=0)`.
-    block_ids: MxArray,
-}
-
-#[cfg(target_os = "macos")]
-struct VarlenPrefillInputsCache {
-    token_count: u32,
-    cached_prefix_len: u32,
-    query_len: u32,
-    block_count: u32,
-    block_table: MxArray,
-    seq_lens: MxArray,
-    cu_seqlens_q: MxArray,
-}
-
-#[cfg(target_os = "macos")]
-struct DecodePagedAttentionInputsCache {
-    first_block: u32,
-    physical_revision: u64,
-    token_count: u32,
-    block_count: u32,
-    block_table: MxArray,
-    seq_lens: MxArray,
-}
-
-#[cfg(target_os = "macos")]
-struct RaggedRowIdentity {
-    row: PagedRaggedRow,
-    table_identity: u64,
-    physical_revision: u64,
-    token_count: u32,
-}
-
-#[cfg(target_os = "macos")]
-struct RaggedPagedInputsCache {
-    rows: Vec<RaggedRowIdentity>,
-    pool_generation: u64,
-    slot_mapping: MxArray,
-    aliased_slot: Option<i64>,
-    block_tables: MxArray,
-    seq_lens: MxArray,
-    cu_seqlens_q: MxArray,
-    max_context_len: u32,
-    total_queries: u32,
-}
-
-#[cfg(target_os = "macos")]
 struct NativePoolArrays {
     key: MxArray,
     value: MxArray,
@@ -2031,72 +1031,16 @@ struct NativePoolArrays {
     generation: u64,
 }
 
-#[cfg(target_os = "macos")]
-struct WriteSlotMappingCache {
-    token_count: u32,
-    first_logical_position: u32,
-    num_tokens: u32,
-    block_count: usize,
-    first_slot: i64,
-    last_slot: i64,
-    slot_mapping: MxArray,
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Debug, Clone, Copy)]
-struct PrefillMemorySnapshotCache {
-    token_count: u32,
-    snapshot: PagedPrefillMemorySnapshot,
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Debug, Clone, Copy)]
-struct DecodePlanningCache {
-    context_bucket_end: u32,
-    snapshot: PagedPrefillMemorySnapshot,
-    sdpa_failed: bool,
-    reported_route_signature: Option<u64>,
-    fallback_reported: bool,
-}
-
 impl PagedKVCacheAdapter {
-    #[cfg(target_os = "macos")]
-    fn clear_prefill_attention_inputs_cache(&mut self) {
-        self.prefill_attention_inputs_cache = None;
-        self.compact_prefill_inputs_cache = None;
-        self.varlen_prefill_inputs_cache = None;
-        self.prefill_memory_snapshot_cache = None;
-    }
-
-    #[cfg(target_os = "macos")]
-    fn clear_decode_attention_inputs_cache(&mut self) {
-        self.decode_attention_inputs_cache = None;
-    }
-
-    #[cfg(target_os = "macos")]
-    fn clear_decode_planning_cache(&mut self) {
-        self.decode_planning_cache = None;
-    }
-
-    #[cfg(target_os = "macos")]
-    fn clear_attention_inputs_caches(&mut self) {
-        self.clear_prefill_attention_inputs_cache();
-        self.clear_decode_attention_inputs_cache();
-    }
-
+    /// Drop every cached per-layer pool view plus the whole request-scoped
+    /// metadata wave. Pool growth swaps the underlying Metal buffers, so
+    /// both halves must rebuild before the next dispatch.
     #[cfg(target_os = "macos")]
     fn clear_native_graph_state(&mut self) {
         self.native_pool_arrays
             .iter_mut()
             .for_each(|slot| *slot = None);
-        self.clear_active_request_graph_state();
-    }
-
-    #[cfg(target_os = "macos")]
-    fn clear_active_request_graph_state(&mut self) {
-        self.clear_attention_inputs_caches();
-        self.clear_decode_planning_cache();
-        self.write_slot_mapping_cache = None;
+        self.meta.invalidate(MetadataClear::ActiveRequest);
     }
 
     /// Construct a new adapter sharing the given allocator and layer
@@ -2237,6 +1181,9 @@ impl PagedKVCacheAdapter {
         };
         #[cfg(target_os = "macos")]
         let num_layers = layer_kv_pool.num_layers();
+        #[cfg(target_os = "macos")]
+        let unit_kv_scale_array = MxArray::from_float32(&[1.0], &[1])
+            .map_err(|e| format!("unit K/V scale array: {e}"))?;
         Ok(Self {
             allocator,
             layer_kv_pool,
@@ -2262,25 +1209,11 @@ impl PagedKVCacheAdapter {
             scale_manager: None,
             scale_arrays: std::collections::HashMap::new(),
             #[cfg(target_os = "macos")]
-            prefill_attention_inputs_cache: None,
+            unit_kv_scale_array,
             #[cfg(target_os = "macos")]
-            compact_prefill_inputs_cache: None,
-            #[cfg(target_os = "macos")]
-            varlen_prefill_inputs_cache: None,
-            #[cfg(target_os = "macos")]
-            decode_attention_inputs_cache: None,
-            #[cfg(target_os = "macos")]
-            ragged_inputs_cache: None,
+            meta: PagedMetadataCache::default(),
             #[cfg(target_os = "macos")]
             native_pool_arrays: (0..num_layers).map(|_| None).collect(),
-            #[cfg(target_os = "macos")]
-            write_slot_mapping_cache: None,
-            #[cfg(target_os = "macos")]
-            prefill_memory_snapshot_cache: None,
-            #[cfg(target_os = "macos")]
-            decode_planning_cache: None,
-            #[cfg(target_os = "macos")]
-            grouped_d512_capability_cache: None,
             pool_growth_notifier: None,
             #[cfg(test)]
             grow_headroom_probe_override: None,
@@ -2355,43 +1288,6 @@ impl PagedKVCacheAdapter {
         self.cold_capture_budget = budget;
     }
 
-    /// Publish one capture walk's outcome.
-    ///
-    /// The trace line carries the whole ratchet: `enqueued` is what this turn
-    /// added, `blocks` is where the chain now reaches, and `stop` says which
-    /// bound ended it. A `deadline` stop additionally warns, because unlike the
-    /// other three it is not a policy decision — it means the storage device
-    /// could not absorb the turn's budget, so the chain ratcheted slower than
-    /// configured and the next restore covers less than it should.
-    fn trace_cold_capture_walk(
-        entry: &str,
-        outcome: ColdCaptureOutcome,
-        budget: ColdCaptureBudget,
-    ) {
-        if inference_trace_enabled() {
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] paged cold_capture_walk entry={} blocks={} enqueued={} stop={} elapsed_ms={:.3} budget_blocks={} budget_ms={}",
-                entry,
-                outcome.blocks,
-                outcome.enqueued,
-                outcome.stop.as_str(),
-                outcome.elapsed.as_secs_f64() * 1000.0,
-                budget.max_blocks,
-                budget.max_walk.as_millis(),
-            ));
-        }
-        if outcome.stop == ColdCaptureStop::Deadline {
-            tracing::warn!(
-                target: "mlx_core::paged::cold",
-                "cold-tier capture walk hit its {} ms deadline after {} of {} budgeted blocks; \
-                 the persisted prefix will ratchet slower than configured",
-                budget.max_walk.as_millis(),
-                outcome.enqueued,
-                budget.max_blocks,
-            );
-        }
-    }
-
     /// Whether the prefix this request is resuming from has an auxiliary
     /// (out-of-pool) half the adapter cannot vouch for. See
     /// [`Self::confirm_aux_prefix_primed`] and the `aux_prefix_unbacked` field
@@ -2407,23 +1303,18 @@ impl PagedKVCacheAdapter {
     /// means either the family keeps ALL of its cross-token state inside the
     /// paged pool, or the restore walk handed back state that backs exactly the
     /// prefix it returned.
+    ///
+    /// Thin wrapper: the decision logic lives in
+    /// [`cold_tier::aux_prefix_state_missing`]; the fields it consults stay
+    /// adapter-owned because the latch's enforcement points (below, and the
+    /// `record_tokens` / `register_*` / `finalize_*` callers of
+    /// [`Self::ensure_aux_prefix_primed`]) are adapter methods.
     fn aux_prefix_state_missing(&self) -> bool {
-        let Some(cold) = self.cold_tier.as_ref() else {
-            return false;
-        };
-        if cold.sidecar_policy.is_none() {
-            return false;
-        }
-        if self.cached_token_count == 0 {
-            return false;
-        }
-        match self.restored_sidecar.as_ref() {
-            // `restore_extend` reconciles the prefix and the state together, so
-            // this normally holds; re-checking keeps a future contract slip
-            // fail-closed instead of silently resuming on the wrong boundary.
-            Some(sidecar) => sidecar.layout.boundary_tokens != self.cached_token_count,
-            None => true,
-        }
+        cold_tier::aux_prefix_state_missing(
+            self.cold_tier.as_ref(),
+            self.cached_token_count,
+            self.restored_sidecar.as_ref(),
+        )
     }
 
     /// The family acknowledges that it has established the auxiliary
@@ -2447,34 +1338,17 @@ impl PagedKVCacheAdapter {
     /// from, which is exactly the corruption this gate exists to prevent, so it
     /// returns `Err` and leaves the latch set.
     pub fn confirm_aux_prefix_primed(&mut self, primed_tokens: u32) -> Result<(), String> {
-        if !self.aux_prefix_unbacked {
-            return Ok(());
-        }
-        if primed_tokens != self.cached_token_count {
-            return Err(format!(
-                "confirm_aux_prefix_primed: family primed {primed_tokens} tokens of auxiliary \
-                 state but the request resumes from a {} token cached prefix. The out-of-pool \
-                 state must cover exactly the reused prefix.",
-                self.cached_token_count
-            ));
-        }
-        self.aux_prefix_unbacked = false;
-        Ok(())
+        cold_tier::confirm_aux_prefix_primed(
+            &mut self.aux_prefix_unbacked,
+            self.cached_token_count,
+            primed_tokens,
+        )
     }
 
     /// Fail closed on any operation that would build on — or publish — a
     /// cached prefix whose auxiliary half nobody has established.
     fn ensure_aux_prefix_primed(&self, op: &str) -> Result<(), String> {
-        if !self.aux_prefix_unbacked {
-            return Ok(());
-        }
-        Err(format!(
-            "{op}: this request resumed from a {} token cached K/V prefix whose out-of-pool \
-             state (GDN recurrent / sliding-window) was not restored with it, and the model \
-             never called confirm_aux_prefix_primed. Continuing would attend over K/V that no \
-             recurrent state matches. Prime the prefix (or restart the turn cold) first.",
-            self.cached_token_count
-        ))
+        cold_tier::ensure_aux_prefix_primed(self.aux_prefix_unbacked, self.cached_token_count, op)
     }
 
     fn bind_request_cache_salt(&mut self, cache_salt: u64, op: &str) -> Result<(), String> {
@@ -2524,19 +1398,7 @@ impl PagedKVCacheAdapter {
             aux_prefix_unbacked: std::mem::take(&mut self.aux_prefix_unbacked),
             cold_capture: std::mem::take(&mut self.cold_capture),
             #[cfg(target_os = "macos")]
-            prefill_attention_inputs_cache: self.prefill_attention_inputs_cache.take(),
-            #[cfg(target_os = "macos")]
-            compact_prefill_inputs_cache: self.compact_prefill_inputs_cache.take(),
-            #[cfg(target_os = "macos")]
-            varlen_prefill_inputs_cache: self.varlen_prefill_inputs_cache.take(),
-            #[cfg(target_os = "macos")]
-            decode_attention_inputs_cache: self.decode_attention_inputs_cache.take(),
-            #[cfg(target_os = "macos")]
-            write_slot_mapping_cache: self.write_slot_mapping_cache.take(),
-            #[cfg(target_os = "macos")]
-            prefill_memory_snapshot_cache: self.prefill_memory_snapshot_cache.take(),
-            #[cfg(target_os = "macos")]
-            decode_planning_cache: self.decode_planning_cache.take(),
+            meta: self.meta.take_request(),
         })
     }
 
@@ -2552,15 +1414,7 @@ impl PagedKVCacheAdapter {
         self.aux_prefix_unbacked = state.aux_prefix_unbacked;
         self.cold_capture = state.cold_capture;
         #[cfg(target_os = "macos")]
-        {
-            self.prefill_attention_inputs_cache = state.prefill_attention_inputs_cache;
-            self.compact_prefill_inputs_cache = state.compact_prefill_inputs_cache;
-            self.varlen_prefill_inputs_cache = state.varlen_prefill_inputs_cache;
-            self.decode_attention_inputs_cache = state.decode_attention_inputs_cache;
-            self.write_slot_mapping_cache = state.write_slot_mapping_cache;
-            self.prefill_memory_snapshot_cache = state.prefill_memory_snapshot_cache;
-            self.decode_planning_cache = state.decode_planning_cache;
-        }
+        self.meta.install_request(state.meta);
         self.active_seq = Some(seq_id);
     }
 
@@ -2698,7 +1552,7 @@ impl PagedKVCacheAdapter {
             prompt_tokens,
             total_budget,
             reuse_cache,
-            PreparePrefixKeys::Uniform(extra_keys),
+            PrefixKeys::Uniform(extra_keys),
             cache_salt,
             skip_lookup,
             None,
@@ -2729,7 +1583,7 @@ impl PagedKVCacheAdapter {
             prompt_tokens,
             total_budget,
             reuse_cache,
-            PreparePrefixKeys::Uniform(extra_keys),
+            PrefixKeys::Uniform(extra_keys),
             cache_salt,
             skip_lookup,
             Some(max_cache_hit_tokens),
@@ -2787,7 +1641,7 @@ impl PagedKVCacheAdapter {
                 prompt_tokens,
                 total_budget,
                 reuse_cache,
-                PreparePrefixKeys::Uniform(extra_keys),
+                PrefixKeys::Uniform(extra_keys),
                 cache_salt,
                 skip_lookup,
                 Some(max_cache_hit_tokens),
@@ -3027,7 +1881,7 @@ impl PagedKVCacheAdapter {
             prompt_tokens,
             total_budget,
             reuse_cache,
-            PreparePrefixKeys::PerBlock(extra_keys_per_block),
+            PrefixKeys::PerBlock(extra_keys_per_block),
             cache_salt,
             skip_lookup,
             Some(max_cache_hit_tokens),
@@ -3056,7 +1910,7 @@ impl PagedKVCacheAdapter {
             prompt_tokens,
             total_budget,
             /* reuse_cache */ false,
-            PreparePrefixKeys::PerBlock(extra_keys_per_block),
+            PrefixKeys::PerBlock(extra_keys_per_block),
             cache_salt,
             /* skip_lookup */ true,
             /* max_cache_hit_tokens */ Some(0),
@@ -3070,7 +1924,7 @@ impl PagedKVCacheAdapter {
         prompt_tokens: &[u32],
         total_budget: u32,
         reuse_cache: bool,
-        prefix_keys: PreparePrefixKeys<'_>,
+        prefix_keys: PrefixKeys<'_>,
         cache_salt: u64,
         skip_lookup: bool,
         max_cache_hit_tokens: Option<u32>,
@@ -3106,7 +1960,7 @@ impl PagedKVCacheAdapter {
         prompt_tokens: &[u32],
         total_budget: u32,
         reuse_cache: bool,
-        prefix_keys: PreparePrefixKeys<'_>,
+        prefix_keys: PrefixKeys<'_>,
         cache_salt: u64,
         skip_lookup: bool,
         max_cache_hit_tokens: Option<u32>,
@@ -3193,36 +2047,26 @@ impl PagedKVCacheAdapter {
     fn find_cached_prefix_for_prepare(
         &mut self,
         prompt_tokens: &[u32],
-        prefix_keys: PreparePrefixKeys<'_>,
+        prefix_keys: PrefixKeys<'_>,
         cache_salt: u64,
         skip_lookup: bool,
         max_cache_hit_tokens: Option<u32>,
     ) -> Result<CachedPrefix, String> {
-        match prefix_keys {
-            PreparePrefixKeys::Uniform(extra_keys) => self.find_cached_prefix_inner(
-                prompt_tokens,
-                extra_keys,
-                cache_salt,
-                skip_lookup,
-                max_cache_hit_tokens,
-                true,
-            ),
-            PreparePrefixKeys::PerBlock(extra_keys_per_block) => self
-                .find_cached_prefix_per_block_inner(
-                    prompt_tokens,
-                    extra_keys_per_block,
-                    cache_salt,
-                    skip_lookup,
-                    max_cache_hit_tokens,
-                ),
-        }
+        self.find_cached_prefix_with_keys_inner(
+            prompt_tokens,
+            prefix_keys,
+            cache_salt,
+            skip_lookup,
+            max_cache_hit_tokens,
+            true,
+        )
     }
 
     /// Look up the longest cached prefix matching `prompt_tokens` and
     /// populate the request's block_table with those blocks. Returns the
     /// cached prefix length so the caller knows where prefill must start.
     ///
-    /// Calls `BlockAllocator::find_longest_cache_hit` which increments
+    /// Calls `BlockAllocator::find_longest_cache_hit_with_keys` which increments
     /// refcount on matched blocks. The adapter takes ownership (`Arc` clones)
     /// so subsequent `release_request()` correctly decrements.
     ///
@@ -3339,6 +2183,29 @@ impl PagedKVCacheAdapter {
         max_cache_hit_tokens: Option<u32>,
         restore_cold: bool,
     ) -> Result<CachedPrefix, String> {
+        self.find_cached_prefix_with_keys_inner(
+            prompt_tokens,
+            PrefixKeys::Uniform(extra_keys),
+            cache_salt,
+            skip_lookup,
+            max_cache_hit_tokens,
+            restore_cold,
+        )
+    }
+
+    fn find_cached_prefix_with_keys_inner(
+        &mut self,
+        prompt_tokens: &[u32],
+        keys: PrefixKeys<'_>,
+        cache_salt: u64,
+        skip_lookup: bool,
+        max_cache_hit_tokens: Option<u32>,
+        restore_cold: bool,
+    ) -> Result<CachedPrefix, String> {
+        let op = match keys {
+            PrefixKeys::Uniform(_) => "find_cached_prefix",
+            PrefixKeys::PerBlock(_) => "find_cached_prefix_per_block",
+        };
         // Reject re-entrant calls BEFORE touching the allocator. The flag
         // tracks lookup-already-ran regardless of hit/miss outcome, so a
         // miss-then-call sequence is rejected too — block_table.num_blocks()
@@ -3347,11 +2214,11 @@ impl PagedKVCacheAdapter {
         // turn the second lookup into a hit that grafts cached blocks into
         // a request whose miss path already started).
         if self.prefix_lookup_done {
-            return Err("find_cached_prefix already called on this request. \
-                 Call reset_for_new_request() to start a new request."
-                .to_string());
+            return Err(format!(
+                "{op} already called on this request. Call reset_for_new_request() to start a new request."
+            ));
         }
-        self.bind_request_cache_salt(cache_salt, "find_cached_prefix")?;
+        self.bind_request_cache_salt(cache_salt, op)?;
         // Consume the command-reset one-shot on every processed lookup
         // (including the forced-miss `skip_lookup` path below), so exactly the
         // immediately-following request is suppressed.
@@ -3359,7 +2226,7 @@ impl PagedKVCacheAdapter {
         let block_table = self
             .block_table
             .as_mut()
-            .ok_or_else(|| "find_cached_prefix called before reset_for_new_request".to_string())?;
+            .ok_or_else(|| format!("{op} called before reset_for_new_request"))?;
 
         // vLLM `skip_reading_prefix_cache` short-circuit. Behaves as a
         // forced 0-block cache miss: same post-conditions as a real
@@ -3393,11 +2260,12 @@ impl PagedKVCacheAdapter {
                 .allocator
                 .lock()
                 .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
-            guard.find_longest_cache_hit(lookup_tokens, self.block_size, extra_keys, cache_salt)
+            guard.find_longest_cache_hit_with_keys(lookup_tokens, self.block_size, keys, cache_salt)
         };
 
         // Extend the hot hit with SSD-persisted blocks (see
-        // [`ColdTierWalk::restore_extend`]).
+        // [`ColdTierWalk::restore_extend`]). A short per-block key list caps
+        // both walks at the first block without a cache identity.
         //
         // Skipped for one lookup after a command reset (`suppress_cold_restore`)
         // so the just-purged prefix is re-prefilled cold rather than restored.
@@ -3416,12 +2284,11 @@ impl PagedKVCacheAdapter {
                 lookup_tokens,
                 cached_tokens,
                 cache_salt,
-                |_| Some(extra_keys),
+                |i| keys.get(i),
                 |full_blocks| {
-                    mlx_paged_attn::chain_hashes(
+                    keys.chain_hashes(
                         &lookup_tokens[..full_blocks * block_size as usize],
                         block_size,
-                        extra_keys,
                         cache_salt,
                     )
                 },
@@ -3554,117 +2421,14 @@ impl PagedKVCacheAdapter {
         skip_lookup: bool,
         max_cache_hit_tokens: Option<u32>,
     ) -> Result<CachedPrefix, String> {
-        if self.prefix_lookup_done {
-            return Err(
-                "find_cached_prefix_per_block already called on this request. \
-                 Call reset_for_new_request() to start a new request."
-                    .to_string(),
-            );
-        }
-        self.bind_request_cache_salt(cache_salt, "find_cached_prefix_per_block")?;
-        // Consume the command-reset one-shot on every processed lookup
-        // (including the forced-miss `skip_lookup` path below), exactly as the
-        // uniform entry point does. Leaving it armed here would let a
-        // suppression armed by `release_request_and_purge_prefix_cache` survive
-        // a per-block lookup and later land on an unrelated uniform lookup.
-        let suppress_cold_restore = std::mem::take(&mut self.suppress_cold_restore_once);
-        let block_table = self.block_table.as_mut().ok_or_else(|| {
-            "find_cached_prefix_per_block called before reset_for_new_request".to_string()
-        })?;
-
-        // vLLM `skip_reading_prefix_cache` short-circuit; see
-        // `find_cached_prefix` for the full rationale. Same 0-block-miss
-        // post-conditions; same read-side-only contract.
-        if skip_lookup {
-            self.cached_token_count = 0;
-            self.request_tokens.clear();
-            block_table.set_num_tokens(0);
-            self.prefix_lookup_done = true;
-            return Ok(CachedPrefix {
-                blocks: Vec::new(),
-                cached_token_count: 0,
-            });
-        }
-
-        let lookup_len = max_cache_hit_tokens
-            .map(|max_tokens| {
-                usize::try_from(max_tokens)
-                    .unwrap_or(usize::MAX)
-                    .min(prompt_tokens.len())
-            })
-            .unwrap_or(prompt_tokens.len());
-        let lookup_tokens = &prompt_tokens[..lookup_len];
-
-        let (mut blocks, mut cached_tokens) = {
-            let mut guard = self
-                .allocator
-                .lock()
-                .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
-            guard.find_longest_cache_hit_per_block(
-                lookup_tokens,
-                self.block_size,
-                extra_keys_per_block,
-                cache_salt,
-            )
-        };
-
-        // Extend the hot hit with SSD-persisted blocks (see
-        // [`ColdTierWalk::restore_extend`]). The chain hashes come from the
-        // PER-BLOCK walk so a restored block is published under exactly the
-        // identity `find_longest_cache_hit_per_block` will look it up by;
-        // `chain_hashes_per_block` truncates when `extra_keys_per_block` runs
-        // short, which caps the restore at the covered blocks — the same
-        // break-at-the-first-block-without-keys rule the hot walk applies.
-        if !suppress_cold_restore && let Some(cold) = self.cold_tier.as_ref() {
-            let block_size = self.block_size;
-            let walk = ColdTierWalk {
-                cold,
-                pool: &self.layer_kv_pool,
-                allocator: &self.allocator,
-                block_size,
-            };
-            let restored = walk.restore_extend(
-                lookup_tokens,
-                cached_tokens,
-                cache_salt,
-                |i| extra_keys_per_block.get(i).map(Vec::as_slice),
-                |full_blocks| {
-                    mlx_paged_attn::chain_hashes_per_block(
-                        &lookup_tokens[..full_blocks * block_size as usize],
-                        block_size,
-                        extra_keys_per_block,
-                        cache_salt,
-                    )
-                },
-            );
-            cached_tokens += restored.blocks.len() * block_size as usize;
-            blocks.extend(restored.blocks);
-            // Backs exactly `cached_tokens` — the walk reduced the prefix and
-            // the state together.
-            self.restored_sidecar = restored.sidecar;
-        }
-
-        for block in &blocks {
-            block_table.add_block(Arc::clone(block));
-        }
-
-        let cached_token_count = cached_tokens.min(lookup_len) as u32;
-        self.cached_token_count = cached_token_count;
-
-        self.request_tokens.clear();
-        let cached_token_count_us = cached_tokens.min(prompt_tokens.len());
-        self.request_tokens
-            .extend_from_slice(&prompt_tokens[..cached_token_count_us]);
-        block_table.set_num_tokens(self.request_tokens.len() as u32);
-
-        self.prefix_lookup_done = true;
-        // Same obligation as the uniform entry point — and this is the path
-        // `qwen3_5` / `qwen3_5_moe` / `gemma4` use exclusively.
-        self.aux_prefix_unbacked = self.aux_prefix_state_missing();
-        Ok(CachedPrefix {
-            blocks,
-            cached_token_count,
-        })
+        self.find_cached_prefix_with_keys_inner(
+            prompt_tokens,
+            PrefixKeys::PerBlock(extra_keys_per_block),
+            cache_salt,
+            skip_lookup,
+            max_cache_hit_tokens,
+            true,
+        )
     }
 
     /// Allocate enough new blocks to hold `total_tokens` tokens beyond
@@ -4242,7 +3006,7 @@ impl PagedKVCacheAdapter {
         }
         drop(guard);
         #[cfg(target_os = "macos")]
-        self.clear_attention_inputs_caches();
+        self.meta.invalidate(MetadataClear::AttentionInputs);
         Ok(released_count)
     }
 
@@ -4425,7 +3189,7 @@ impl PagedKVCacheAdapter {
         self.request_tokens.extend_from_slice(tokens);
         block_table.set_num_tokens(new_total);
         #[cfg(target_os = "macos")]
-        self.clear_prefill_attention_inputs_cache();
+        self.meta.invalidate(MetadataClear::PrefillInputs);
         Ok(())
     }
 
@@ -4448,6 +3212,48 @@ impl PagedKVCacheAdapter {
     ) -> Result<(), String> {
         self.activate_request(seq_id)?;
         self.record_tokens(tokens)
+    }
+
+    /// Record a not-yet-drained decode token as a placeholder so the
+    /// submit-ahead decode arm can build this step's forward BEFORE the
+    /// sampled id reaches the host. Routes through
+    /// [`Self::record_tokens`] so lazy block growth, the aux-prefix prime
+    /// check, and block-table accounting all run identically — only the
+    /// stored id differs. `u32::MAX` is the sentinel: it can never be a
+    /// valid token id, and the record-first contract means the KV write
+    /// slot derives from the recorded token COUNT, never the id value.
+    ///
+    /// The placeholder must be resolved before any reader consumes
+    /// `request_tokens` VALUES: [`Self::patch_last_recorded_token`] writes
+    /// the real id once the drain lands, [`Self::rollback_last_tokens`]
+    /// drops the record on a terminal step. Mid-decode readers (write-slot
+    /// derivation, `seq_lens`) consult `len()` only.
+    pub fn record_placeholder_token(&mut self) -> Result<(), String> {
+        self.record_tokens(&[u32::MAX])
+    }
+
+    /// Patch the most recently recorded token in place. Pair for
+    /// [`Self::record_placeholder_token`]: the submit-ahead decode arm
+    /// records `u32::MAX` before the sampled id is drained, then writes
+    /// the real id here once the host read lands. Callers MUST patch (or
+    /// roll back) before any prefix-hash / finalize path reads
+    /// `request_tokens` values — mid-decode readers use `len()` only.
+    ///
+    /// Errors if the active request has no recorded tokens, or if the
+    /// tail record is NOT the placeholder sentinel — a mispaired call
+    /// (double-commit, patch after a real `record_tokens`) must fail
+    /// loud rather than clobber a real id that feeds `continue_turn`'s
+    /// `starts_with` and prefix hashing.
+    pub fn patch_last_recorded_token(&mut self, token: u32) -> Result<(), String> {
+        let last = self
+            .request_tokens
+            .last_mut()
+            .ok_or_else(|| "patch_last_recorded_token: no recorded tokens to patch".to_string())?;
+        if *last != u32::MAX {
+            return Err("patch_last_recorded_token: tail is not a placeholder record".to_string());
+        }
+        *last = token;
+        Ok(())
     }
 
     /// Roll back the most recent `n` tokens from `request_tokens` and
@@ -4484,7 +3290,7 @@ impl PagedKVCacheAdapter {
         self.request_tokens.truncate(new_len as usize);
         block_table.set_num_tokens(new_len);
         #[cfg(target_os = "macos")]
-        self.clear_prefill_attention_inputs_cache();
+        self.meta.invalidate(MetadataClear::PrefillInputs);
         Ok(())
     }
 
@@ -4496,6 +3302,26 @@ impl PagedKVCacheAdapter {
     pub fn rollback_last_tokens_for(&mut self, seq_id: SeqId, n: u32) -> Result<(), String> {
         self.activate_request(seq_id)?;
         self.rollback_last_tokens(n)
+    }
+
+    /// Atomically record one decode token for each scheduled row.
+    ///
+    /// Snapshots each row's logical position BEFORE recording (the value
+    /// families use as `planned_rows`), then records every row's token.
+    /// On any failure, rolls back the already-recorded rows in reverse
+    /// order and returns the original error — callers see all-or-nothing.
+    /// Rejects duplicate seq_ids: each row must be a distinct sequence.
+    pub fn record_tokens_batched(
+        &mut self,
+        rows: &[(SeqId, u32)],
+    ) -> Result<Vec<(SeqId, u32)>, String> {
+        // Record every row's token BEFORE the forward (record-first
+        // contract); roll back recorded rows on failure so a partial
+        // record set never skews the pool. Rollback failures compose with
+        // the original error: the scheduler's allocation-blocked probe
+        // reads the original "could not reserve" text, which a bare
+        // rollback error would drop.
+        crate::transformer::paged_policy::record_decode_wave(self, rows, "record_tokens_batched")
     }
 
     /// Build the slot mapping for a contiguous chunk of tokens starting
@@ -4629,46 +3455,31 @@ impl PagedKVCacheAdapter {
         num_tokens: u32,
     ) -> Result<(MxArray, i64, i64), String> {
         let token_count = self.request_tokens.len() as u32;
-        let block_count = self.num_allocated_blocks();
-        if let Some(cache) = self.write_slot_mapping_cache.as_ref()
-            && cache.token_count == token_count
-            && cache.first_logical_position == first_logical_position
-            && cache.num_tokens == num_tokens
-            && cache.block_count == block_count
-        {
-            return Ok((
-                cache.slot_mapping.clone(),
-                cache.first_slot,
-                cache.last_slot,
-            ));
-        }
-
-        let slot_mapping = self.build_slot_mapping(first_logical_position, num_tokens)?;
-        let first_slot = slot_mapping.first().copied().unwrap_or(-1);
-        let last_slot = slot_mapping.last().copied().unwrap_or(-1);
-        let slot_mapping_arr = MxArray::from_int64(&slot_mapping, &[num_tokens as i64])
-            .map_err(|e| format!("update_keys_values_native slot_mapping: {e}"))?;
-        MxArray::eval_arrays(&[&slot_mapping_arr])
-            .map_err(|e| format!("update_keys_values_native slot_mapping eval: {e}"))?;
-
-        self.write_slot_mapping_cache = Some(WriteSlotMappingCache {
+        // Revision is O(1) and tracks every physical mutation of the
+        // block table; a raw block-count scan was O(blocks) per call and
+        // could alias across same-size relayouts.
+        let physical_revision = self
+            .block_table
+            .as_ref()
+            .map(|table| table.physical_revision())
+            .unwrap_or(0);
+        if let Some(hit) = self.meta.write_slot_mapping(
             token_count,
             first_logical_position,
             num_tokens,
-            block_count,
-            first_slot,
-            last_slot,
-            slot_mapping: slot_mapping_arr,
-        });
-        let cache = self
-            .write_slot_mapping_cache
-            .as_ref()
-            .expect("write_slot_mapping_cache was just populated");
-        Ok((
-            cache.slot_mapping.clone(),
-            cache.first_slot,
-            cache.last_slot,
-        ))
+            physical_revision,
+        ) {
+            return Ok(hit);
+        }
+
+        let slot_mapping = self.build_slot_mapping(first_logical_position, num_tokens)?;
+        self.meta.store_write_slot_mapping(
+            token_count,
+            first_logical_position,
+            num_tokens,
+            physical_revision,
+            slot_mapping,
+        )
     }
 
     #[cfg(target_os = "macos")]
@@ -5186,7 +3997,7 @@ impl PagedKVCacheAdapter {
         // preparation and command-buffer resource pattern until traced.
         let slot_mapping = if rows.iter().all(|row| row.query_len == 1) {
             self.ensure_ragged_inputs(rows)?;
-            let cache = self.ragged_inputs_cache.as_ref().unwrap();
+            let cache = self.meta.ragged_inputs_cache.as_ref().unwrap();
             if let Some(slot) = cache.aliased_slot {
                 return Err(format!(
                     "ragged KV write aliases physical slot {slot} across query rows"
@@ -5352,136 +4163,17 @@ impl PagedKVCacheAdapter {
     /// request, so the block table contains exactly that sequence and
     /// `seq_lens[0]` is the recorded count relative to the first retained block.
     /// Sliding groups omit whole blocks before their live window.
+    ///
+    /// The cache and its compute live in [`PagedMetadataCache`]; this
+    /// wrapper only gathers the adapter-side inputs.
     #[cfg(target_os = "macos")]
     fn decode_attention_inputs(&mut self) -> Result<(MxArray, MxArray, u32), String> {
-        let block_table = self.block_table.as_ref().ok_or_else(|| {
-            "gather_kv_for_decode_graph called before reset_for_new_request".to_string()
-        })?;
-        let recorded = block_table.num_tokens();
-        if recorded == 0 {
-            return Err("gather_kv_for_decode_graph called before any tokens recorded".to_string());
-        }
-        // Rebase only dispatch metadata. Cache ownership and RoPE positions
-        // stay absolute; the kernel sees at most window + block_size - 1
-        // positions and applies its existing lower mask to the partial page.
-        let first_block = if self.sliding_window == 0 {
-            0
-        } else {
-            recorded.saturating_sub(self.sliding_window) / self.block_size
-        };
-        let visible_tokens = recorded - first_block * self.block_size;
-        let recorded_i32 = i32::try_from(visible_tokens).map_err(|_| {
-            format!("gather_kv_for_decode_graph: recorded token count {recorded} exceeds i32::MAX")
-        })?;
-        let physical_revision = block_table.physical_revision();
-        let block_count = u32::try_from(
-            block_table
-                .num_blocks()
-                .saturating_sub(first_block as usize),
+        self.meta.decode_attention_inputs(
+            self.block_table.as_ref(),
+            self.sliding_window,
+            self.block_size,
+            self.layer_kv_pool.num_blocks(),
         )
-        .map_err(|_| {
-            format!(
-                "gather_kv_for_decode_graph: too many blocks for i32 shape: {}",
-                block_table.num_blocks()
-            )
-        })?;
-        if block_count == 0 {
-            return Err(
-                "gather_kv_for_decode_graph: active request has no allocated blocks".to_string(),
-            );
-        }
-
-        // Every later full-attention layer in this token observes the same
-        // cursor and exact physical table. A populated cache proves the arrays
-        // already passed content validation and synchronous materialization, so
-        // return before rebuilding/scanning the O(blocks) host vector.
-        if let Some(cache) = self.decode_attention_inputs_cache.as_ref()
-            && cache.token_count == recorded
-            && cache.physical_revision == physical_revision
-            && cache.block_count == block_count
-            && cache.first_block == first_block
-        {
-            return Ok((
-                cache.block_table.clone(),
-                cache.seq_lens.clone(),
-                cache.block_count,
-            ));
-        }
-
-        let max_seq_len = block_count
-            .checked_mul(self.block_size)
-            .ok_or_else(|| "gather_kv_for_decode_graph: max seq len overflow".to_string())?;
-        if visible_tokens > max_seq_len {
-            return Err(format!(
-                "gather_kv_for_decode_graph: recorded token count {recorded} exceeds \
-                 block table capacity {block_count} * {} = {max_seq_len}",
-                self.block_size
-            ));
-        }
-
-        // Cursor advancement normally leaves the physical table unchanged for
-        // `block_size - 1` steps. Reuse its immutable materialized MxArray in
-        // that case; otherwise rebuild and validate the exact ID sequence.
-        let cached_block_table = self
-            .decode_attention_inputs_cache
-            .as_ref()
-            .filter(|cache| {
-                cache.physical_revision == physical_revision
-                    && cache.block_count == block_count
-                    && cache.first_block == first_block
-            })
-            .map(|cache| cache.block_table.clone());
-        let (block_table_arr, rebuilt_block_table) = match cached_block_table {
-            Some(block_table_arr) => (block_table_arr, false),
-            None => {
-                let block_ids: Vec<i32> = block_table.blocks()[first_block as usize..]
-                    .iter()
-                    .map(|block| block.block_id as i32)
-                    .collect();
-                debug_assert_eq!(block_ids.len(), block_count as usize);
-                let pool_block_count = self.layer_kv_pool.num_blocks();
-                for (idx, &block_id) in block_ids.iter().enumerate() {
-                    if block_id < 0 || block_id as u32 >= pool_block_count {
-                        return Err(format!(
-                            "gather_kv_for_decode_graph: block_table[{idx}]={block_id} out of \
-                             range for pool block count {pool_block_count}"
-                        ));
-                    }
-                }
-                let array = MxArray::from_int32(&block_ids, &[1, block_count as i64])
-                    .map_err(|e| format!("gather_kv_for_decode_graph block_table: {e}"))?;
-                (array, true)
-            }
-        };
-        let seq_lens_arr = MxArray::from_int32(&[recorded_i32], &[1])
-            .map_err(|e| format!("gather_kv_for_decode_graph seq_lens: {e}"))?;
-        if rebuilt_block_table {
-            MxArray::eval_arrays(&[&block_table_arr, &seq_lens_arr])
-                .map_err(|e| format!("gather_kv_for_decode_graph metadata eval: {e}"))?;
-        } else {
-            // Never mutate the old scalar array in place: already-scheduled
-            // lazy attention graphs may still retain it as their context lens.
-            MxArray::eval_arrays(&[&seq_lens_arr])
-                .map_err(|e| format!("gather_kv_for_decode_graph seq_lens eval: {e}"))?;
-        }
-
-        self.decode_attention_inputs_cache = Some(DecodePagedAttentionInputsCache {
-            first_block,
-            physical_revision,
-            token_count: recorded,
-            block_count,
-            block_table: block_table_arr,
-            seq_lens: seq_lens_arr,
-        });
-        let cache = self
-            .decode_attention_inputs_cache
-            .as_ref()
-            .expect("decode_attention_inputs_cache was just populated");
-        Ok((
-            cache.block_table.clone(),
-            cache.seq_lens.clone(),
-            cache.block_count,
-        ))
     }
 
     /// Materialize decode metadata for multiple logical requests.
@@ -5511,7 +4203,7 @@ impl PagedKVCacheAdapter {
             })
             .collect::<Result<Vec<_>, String>>()?;
         self.ensure_ragged_inputs(&rows)?;
-        let cache = self.ragged_inputs_cache.as_ref().unwrap();
+        let cache = self.meta.ragged_inputs_cache.as_ref().unwrap();
         Ok((
             cache.block_tables.clone(),
             cache.seq_lens.clone(),
@@ -5627,7 +4319,7 @@ impl PagedKVCacheAdapter {
     ) -> Result<(MxArray, MxArray, MxArray, u32, u32), String> {
         if rows.iter().all(|row| row.query_len == 1) {
             self.ensure_ragged_inputs(rows)?;
-            let cache = self.ragged_inputs_cache.as_ref().unwrap();
+            let cache = self.meta.ragged_inputs_cache.as_ref().unwrap();
             return Ok((
                 cache.block_tables.clone(),
                 cache.seq_lens.clone(),
@@ -5678,30 +4370,16 @@ impl PagedKVCacheAdapter {
         if rows.is_empty() {
             return Err("ragged metadata requires at least one row".into());
         }
-        if let Some(cache) = self.ragged_inputs_cache.as_ref()
-            && cache.pool_generation == self.layer_kv_pool.generation()
-            && cache.rows.len() == rows.len()
-            && cache.rows.iter().zip(rows).all(|(cached, row)| {
-                let table = if self.active_seq == Some(row.seq_id) {
-                    self.block_table.as_ref()
-                } else {
-                    self.requests
-                        .get(&row.seq_id)
-                        .map(|state| &state.block_table)
-                };
-                cached.row == *row
-                    && table.is_some_and(|table| {
-                        cached.table_identity == table.metadata_identity()
-                            && cached.physical_revision == table.physical_revision()
-                            && cached.token_count == table.num_tokens()
-                    })
+        if let Some(cache) = self.meta.ragged_inputs_cache.as_ref()
+            && cache.matches(rows, self.layer_kv_pool.generation(), |seq_id| {
+                self.block_table_for(seq_id)
             })
         {
             return Ok(());
         }
         // Invalidate before rebuilding so a failed preparation cannot leave a
         // partially matching wave available to a later dispatch.
-        self.ragged_inputs_cache = None;
+        self.meta.invalidate(MetadataClear::RaggedInputs);
         let mut seen = HashSet::with_capacity(rows.len());
         let mut identities = Vec::with_capacity(rows.len());
         let mut slots = Vec::new();
@@ -5753,7 +4431,7 @@ impl PagedKVCacheAdapter {
         let cu_seqlens_q = MxArray::from_int32(&cumulative, &[cumulative.len() as i64])
             .map_err(|error| error.to_string())?;
         MxArray::eval_arrays(&[&slot_mapping, &cu_seqlens_q]).map_err(|error| error.to_string())?;
-        self.ragged_inputs_cache = Some(RaggedPagedInputsCache {
+        self.meta.ragged_inputs_cache = Some(RaggedPagedInputsCache {
             rows: identities,
             pool_generation: self.layer_kv_pool.generation(),
             slot_mapping,
@@ -5811,6 +4489,25 @@ impl PagedKVCacheAdapter {
             PagedDecodeRouteHint::Auto,
             0,
         )
+    }
+
+    /// Resolve the grouped-D128 stripe plan for a `ForceD128` decode that
+    /// carried no explicit count: the shared context table clamped by the
+    /// live device/memory ceiling. 0 means "unavailable" — the C++ dispatch
+    /// requires nonzero planned stripes for D128, so it keeps generic V2.
+    #[cfg(target_os = "macos")]
+    fn resolve_grouped_d128_stripes(
+        &self,
+        route_hint: PagedDecodeRouteHint,
+        grouped_stripes: u32,
+        max_context_len: u32,
+    ) -> u32 {
+        if route_hint == PagedDecodeRouteHint::ForceD128 && grouped_stripes == 0 {
+            self.meta
+                .resolve_d128_stripe_plan(max_context_len, self.layer_kv_pool.num_layers() as u32)
+        } else {
+            grouped_stripes
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -5880,6 +4577,8 @@ impl PagedKVCacheAdapter {
 
         let (block_tables, seq_lens, max_context_len) =
             self.decode_attention_inputs_batched(seq_ids)?;
+        let grouped_stripes =
+            self.resolve_grouped_d128_stripes(route_hint, grouped_stripes, max_context_len);
         let k_pool = self.key_pool_array(layer_idx)?;
         let v_pool = self.value_pool_array(layer_idx)?;
         let k_scale = self.k_scale_array(layer_idx)?;
@@ -6128,6 +4827,11 @@ impl PagedKVCacheAdapter {
         }
 
         let (block_table, seq_lens, block_count) = self.decode_attention_inputs()?;
+        let grouped_stripes = self.resolve_grouped_d128_stripes(
+            route_hint,
+            grouped_stripes,
+            self.current_token_count(),
+        );
         let k_pool = self.key_pool_array(layer_idx)?;
         let v_pool = self.value_pool_array(layer_idx)?;
         let k_scale = self.k_scale_array(layer_idx)?;
@@ -6338,184 +5042,49 @@ impl PagedKVCacheAdapter {
     }
 
     /// Build and cache a compact one-dimensional physical block-ID array for
-    /// the first `required_tokens` logical positions of the active request.
-    /// Both graph-native prefill paths consume this representation: varlen
-    /// attention reshapes it to one block-table row, while SDPA gathering uses
-    /// it directly as the `take(axis=0)` index vector.
-    #[cfg(target_os = "macos")]
-    fn compact_prefill_block_ids(
-        &mut self,
-        required_tokens: u32,
-    ) -> Result<(MxArray, u32), String> {
-        self.compact_prefill_block_ids_from(required_tokens, 0)
-    }
-
+    /// `required_tokens` logical positions of the active request, starting at
+    /// `first_block`. Both graph-native prefill paths consume this
+    /// representation: varlen attention reshapes it to one block-table row,
+    /// while SDPA gathering uses it directly as the `take(axis=0)` index
+    /// vector.
+    ///
+    /// The cache and its compute live in [`PagedMetadataCache`]; this
+    /// wrapper only gathers the adapter-side inputs.
     #[cfg(target_os = "macos")]
     fn compact_prefill_block_ids_from(
         &mut self,
         required_tokens: u32,
         first_block: u32,
     ) -> Result<(MxArray, u32), String> {
-        if required_tokens == 0 {
-            return Err("compact prefill block IDs require at least one token".to_string());
-        }
-        if required_tokens > i32::MAX as u32 {
-            return Err(format!(
-                "compact prefill required token count {required_tokens} exceeds i32::MAX"
-            ));
-        }
-        let block_table = self.block_table.as_ref().ok_or_else(|| {
-            "compact prefill block IDs requested before reset_for_new_request".to_string()
-        })?;
-        let recorded = block_table.num_tokens();
-        if recorded < required_tokens {
-            return Err(format!(
-                "compact prefill: recorded token count {recorded} is less than required \
-                 token count {required_tokens}; call record_tokens first"
-            ));
-        }
-
-        if let Some(cache) = self.compact_prefill_inputs_cache.as_ref()
-            && cache.token_count == recorded
-            && cache.required_tokens == required_tokens
-            && cache.first_block == first_block
-        {
-            return Ok((cache.block_ids.clone(), cache.block_count));
-        }
-
-        let end_block = required_tokens.div_ceil(self.block_size) as usize;
-        let blocks = block_table
-            .blocks()
-            .get(first_block as usize..end_block)
-            .ok_or_else(|| "compact prefill: block range exceeds recorded capacity".to_string())?;
-        let block_ids: Vec<i32> = blocks.iter().map(|block| block.block_id as i32).collect();
-        if block_ids.is_empty() {
-            return Err("compact prefill: active request has no allocated blocks".to_string());
-        }
-        let block_count = u32::try_from(block_ids.len()).map_err(|_| {
-            format!(
-                "compact prefill: too many blocks for i32 shape: {}",
-                block_ids.len()
-            )
-        })?;
-        let pool_block_count = self.layer_kv_pool.num_blocks();
-        for (idx, &block_id) in block_ids.iter().enumerate() {
-            if block_id < 0 || block_id as u32 >= pool_block_count {
-                return Err(format!(
-                    "compact prefill: block_table[{idx}]={block_id} out of range for \
-                     pool block count {pool_block_count}"
-                ));
-            }
-        }
-        let capacity = block_count
-            .checked_mul(self.block_size)
-            .ok_or_else(|| "compact prefill block capacity overflow".to_string())?;
-        if required_tokens.saturating_sub(first_block * self.block_size) > capacity {
-            return Err(format!(
-                "compact prefill: required token count {required_tokens} exceeds block \
-                 table capacity {block_count} * {} = {capacity}",
-                self.block_size
-            ));
-        }
-
-        let block_ids_arr = MxArray::from_int32(&block_ids, &[block_count as i64])
-            .map_err(|e| format!("compact prefill block IDs: {e}"))?;
-        MxArray::eval_arrays(&[&block_ids_arr])
-            .map_err(|e| format!("compact prefill block ID eval: {e}"))?;
-        self.compact_prefill_inputs_cache = Some(CompactPrefillInputsCache {
-            first_block,
-            token_count: recorded,
+        self.meta.compact_prefill_block_ids(
+            self.block_table.as_ref(),
             required_tokens,
-            block_count,
-            block_ids: block_ids_arr,
-        });
-        let cache = self
-            .compact_prefill_inputs_cache
-            .as_ref()
-            .expect("compact_prefill_inputs_cache was just populated");
-        Ok((cache.block_ids.clone(), cache.block_count))
+            first_block,
+            self.block_size,
+            self.layer_kv_pool.num_blocks(),
+        )
     }
 
     /// Build the compact metadata for a single continuing prefill sequence.
     /// The block table has shape `[1, block_count]`, `seq_lens` contains the
     /// complete context length after the chunk, and `cu_seqlens_q=[0,q_len]`
     /// assigns every query row to that one sequence.
+    ///
+    /// The cache and its compute live in [`PagedMetadataCache`]; this
+    /// wrapper only gathers the adapter-side inputs.
     #[cfg(target_os = "macos")]
     fn varlen_prefill_attention_inputs(
         &mut self,
         cached_prefix_len: u32,
         query_len: u32,
     ) -> Result<(MxArray, MxArray, MxArray, u32, u32), String> {
-        if query_len == 0 {
-            return Err("varlen prefill requires query_len > 0".to_string());
-        }
-        let total_context = cached_prefix_len
-            .checked_add(query_len)
-            .ok_or_else(|| "varlen prefill total context overflow".to_string())?;
-        if total_context > i32::MAX as u32 || query_len > i32::MAX as u32 {
-            return Err(format!(
-                "varlen prefill metadata exceeds int32 range \
-                 (query_len={query_len}, total_context={total_context})"
-            ));
-        }
-        let recorded = self
-            .block_table
-            .as_ref()
-            .ok_or_else(|| "varlen prefill requested before reset_for_new_request".to_string())?
-            .num_tokens();
-        if recorded < total_context {
-            return Err(format!(
-                "varlen prefill: recorded token count {recorded} is less than \
-                 cached_prefix_len + query_len ({cached_prefix_len} + {query_len} = \
-                 {total_context}); call record_tokens for the whole chunk first"
-            ));
-        }
-
-        if let Some(cache) = self.varlen_prefill_inputs_cache.as_ref()
-            && cache.token_count == recorded
-            && cache.cached_prefix_len == cached_prefix_len
-            && cache.query_len == query_len
-        {
-            return Ok((
-                cache.block_table.clone(),
-                cache.seq_lens.clone(),
-                cache.cu_seqlens_q.clone(),
-                cache.block_count,
-                total_context,
-            ));
-        }
-
-        let (block_ids, block_count) = self.compact_prefill_block_ids(total_context)?;
-        let block_table = block_ids
-            .reshape(&[1, block_count as i64])
-            .map_err(|e| format!("varlen prefill block_table reshape: {e}"))?;
-        let seq_lens = MxArray::from_int32(&[total_context as i32], &[1])
-            .map_err(|e| format!("varlen prefill seq_lens: {e}"))?;
-        let cu_seqlens_q = MxArray::from_int32(&[0, query_len as i32], &[2])
-            .map_err(|e| format!("varlen prefill cu_seqlens_q: {e}"))?;
-        MxArray::eval_arrays(&[&block_table, &seq_lens, &cu_seqlens_q])
-            .map_err(|e| format!("varlen prefill metadata eval: {e}"))?;
-
-        self.varlen_prefill_inputs_cache = Some(VarlenPrefillInputsCache {
-            token_count: recorded,
+        self.meta.varlen_prefill_attention_inputs(
+            self.block_table.as_ref(),
             cached_prefix_len,
             query_len,
-            block_count,
-            block_table,
-            seq_lens,
-            cu_seqlens_q,
-        });
-        let cache = self
-            .varlen_prefill_inputs_cache
-            .as_ref()
-            .expect("varlen_prefill_inputs_cache was just populated");
-        Ok((
-            cache.block_table.clone(),
-            cache.seq_lens.clone(),
-            cache.cu_seqlens_q.clone(),
-            cache.block_count,
-            total_context,
-        ))
+            self.block_size,
+            self.layer_kv_pool.num_blocks(),
+        )
     }
 
     /// Graph-native compact paged attention for a multi-token prefill suffix.
@@ -7043,125 +5612,21 @@ impl PagedKVCacheAdapter {
             .map_err(|e| format!("gather_kv_for_prefill_chunk: failed to wrap output array: {e}"))
     }
 
+    /// The cache and its compute live in [`PagedMetadataCache`]; this
+    /// wrapper only gathers the adapter-side inputs.
     #[cfg(target_os = "macos")]
     fn prefill_attention_inputs(
         &mut self,
         cached_prefix_len: u32,
         num_new_tokens: u32,
     ) -> Result<(MxArray, MxArray, u32), String> {
-        let block_table = self.block_table.as_ref().ok_or_else(|| {
-            "gather_kv_for_prefill_chunk called before reset_for_new_request".to_string()
-        })?;
-        let recorded = block_table.num_tokens();
-        let expected_total = cached_prefix_len
-            .checked_add(num_new_tokens)
-            .ok_or_else(|| "gather_kv_for_prefill_chunk: token count overflow".to_string())?;
-        if recorded < expected_total {
-            return Err(format!(
-                "gather_kv_for_prefill_chunk: recorded token count {recorded} is less than \
-                 cached_prefix_len + num_new_tokens ({cached_prefix_len} + {num_new_tokens} = \
-                 {expected_total}); call record_tokens for the whole chunk first"
-            ));
-        }
-
-        if let Some(cache) = self.prefill_attention_inputs_cache.as_ref()
-            && cache.token_count == recorded
-            && cache.cached_prefix_len == cached_prefix_len
-            && cache.num_new_tokens == num_new_tokens
-        {
-            return Ok((
-                cache.block_table.clone(),
-                cache.seq_lens.clone(),
-                cache.block_count,
-            ));
-        }
-
-        let block_ids =
-            build_prefill_block_ids_for_total(block_table, expected_total, self.block_size)
-                .map_err(|e| format!("gather_kv_for_prefill_chunk: {e}"))?;
-        if block_ids.is_empty() {
-            return Err(
-                "gather_kv_for_prefill_chunk: active request has no allocated blocks".to_string(),
-            );
-        }
-        let block_count = u32::try_from(block_ids.len()).map_err(|_| {
-            format!(
-                "gather_kv_for_prefill_chunk: too many blocks for i32 shape: {}",
-                block_ids.len()
-            )
-        })?;
-        let pool_block_count = self.layer_kv_pool.num_blocks();
-        for (idx, &block_id) in block_ids.iter().enumerate() {
-            if block_id < 0 || block_id as u32 >= pool_block_count {
-                return Err(format!(
-                    "gather_kv_for_prefill_chunk: block_table[{idx}]={block_id} out of \
-                     range for pool block count {pool_block_count}"
-                ));
-            }
-        }
-        let max_seq_len = block_count
-            .checked_mul(self.block_size)
-            .ok_or_else(|| "gather_kv_for_prefill_chunk: max seq len overflow".to_string())?;
-        if expected_total > max_seq_len {
-            return Err(format!(
-                "gather_kv_for_prefill_chunk: expected total tokens {expected_total} exceeds \
-                 block table capacity {block_count} * {} = {max_seq_len}",
-                self.block_size
-            ));
-        }
-        if recorded > expected_total && inference_trace_enabled() {
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] paged_kv prefill_attention_inputs_prefix_replay recorded_tokens={} required_tokens={} cached_prefix={} num_new_tokens={} block_count={}",
-                recorded, expected_total, cached_prefix_len, num_new_tokens, block_count
-            ));
-        }
-
-        let num_new_usize = num_new_tokens as usize;
-        let block_count_usize = block_count as usize;
-        let mut duplicated_blocks = Vec::with_capacity(num_new_usize * block_count_usize);
-        for _ in 0..num_new_tokens {
-            duplicated_blocks.extend_from_slice(&block_ids);
-        }
-
-        let mut seq_lens = Vec::with_capacity(num_new_usize);
-        for i in 0..num_new_tokens {
-            let seq_len = cached_prefix_len
-                .checked_add(i + 1)
-                .ok_or_else(|| "gather_kv_for_prefill_chunk: seq_len overflow".to_string())?;
-            seq_lens.push(seq_len as i32);
-        }
-
-        let block_table_arr = MxArray::from_int32(
-            &duplicated_blocks,
-            &[num_new_tokens as i64, block_count as i64],
-        )
-        .map_err(|e| format!("gather_kv_for_prefill_chunk block_table: {e}"))?;
-        let seq_lens_arr = MxArray::from_int32(&seq_lens, &[num_new_tokens as i64])
-            .map_err(|e| format!("gather_kv_for_prefill_chunk seq_lens: {e}"))?;
-        // Keep the metadata MxArrays cached for the whole prefill chunk. The
-        // FFI bridge consumes these exact arrays; it must not wrap them in lazy
-        // metadata copies before `PagedAttention::eval_gpu` performs host-side
-        // bounds checks.
-        MxArray::eval_arrays(&[&block_table_arr, &seq_lens_arr])
-            .map_err(|e| format!("gather_kv_for_prefill_chunk metadata eval: {e}"))?;
-
-        self.prefill_attention_inputs_cache = Some(PrefillPagedAttentionInputsCache {
-            token_count: recorded,
+        self.meta.prefill_attention_inputs(
+            self.block_table.as_ref(),
             cached_prefix_len,
             num_new_tokens,
-            block_count,
-            block_table: block_table_arr,
-            seq_lens: seq_lens_arr,
-        });
-        let cache = self
-            .prefill_attention_inputs_cache
-            .as_ref()
-            .expect("prefill_attention_inputs_cache was just populated");
-        Ok((
-            cache.block_table.clone(),
-            cache.seq_lens.clone(),
-            cache.block_count,
-        ))
+            self.block_size,
+            self.layer_kv_pool.num_blocks(),
+        )
     }
 
     /// Non-macOS stub.
@@ -7714,11 +6179,38 @@ impl PagedKVCacheAdapter {
         cache_salt: u64,
         capture_cold: bool,
     ) -> Result<u32, String> {
-        self.bind_request_cache_salt(cache_salt, "register_full_blocks_for_reuse")?;
+        self.register_full_blocks_for_reuse_with_keys_inner(
+            PrefixKeys::Uniform(extra_keys),
+            cache_salt,
+            capture_cold,
+        )
+    }
+
+    fn register_full_blocks_for_reuse_with_keys_inner(
+        &mut self,
+        keys: PrefixKeys<'_>,
+        cache_salt: u64,
+        capture_cold: bool,
+    ) -> Result<u32, String> {
+        let (op, cache_op, trace_label, invariant_suffix) = match keys {
+            PrefixKeys::Uniform(_) => (
+                "register_full_blocks_for_reuse",
+                "cache_full_blocks",
+                "uniform",
+                " See find_cached_prefix doc.",
+            ),
+            PrefixKeys::PerBlock(_) => (
+                "register_full_blocks_for_reuse_per_block",
+                "cache_full_blocks_per_block",
+                "per_block",
+                "",
+            ),
+        };
+        self.bind_request_cache_salt(cache_salt, op)?;
         // Never publish blocks computed on top of a prefix whose out-of-pool
         // half nobody established — that would hand the same unsound resume
         // point to every later request.
-        self.ensure_aux_prefix_primed("register_full_blocks_for_reuse")?;
+        self.ensure_aux_prefix_primed(op)?;
         // Idempotent: subsequent calls within the same request are no-ops.
         if self.already_registered {
             return Ok(0);
@@ -7727,9 +6219,10 @@ impl PagedKVCacheAdapter {
         #[cfg(target_os = "macos")]
         self.eval_pending_pool_writes()?;
 
-        let block_table = self.block_table.as_ref().ok_or_else(|| {
-            "register_full_blocks_for_reuse called before reset_for_new_request".to_string()
-        })?;
+        let block_table = self
+            .block_table
+            .as_ref()
+            .ok_or_else(|| format!("{op} called before reset_for_new_request"))?;
 
         // Belt-and-suspenders invariant check: `request_tokens` must hold
         // EVERY token in the request (cached prefix + suffix), not just
@@ -7743,10 +6236,8 @@ impl PagedKVCacheAdapter {
         let expected_tokens = block_table.num_tokens() as usize;
         if self.request_tokens.len() != expected_tokens {
             return Err(format!(
-                "register_full_blocks_for_reuse invariant violation: \
-                 request_tokens.len() == {} but block_table.num_tokens() == {}. \
-                 The caller must record_tokens() all tokens (cached prefix + new suffix) \
-                 before registering. See find_cached_prefix doc.",
+                "{op} invariant violation: request_tokens.len() == {} but block_table.num_tokens() == {}. \
+                 The caller must record_tokens() all tokens (cached prefix + new suffix) before registering.{invariant_suffix}",
                 self.request_tokens.len(),
                 expected_tokens,
             ));
@@ -7772,20 +6263,33 @@ impl PagedKVCacheAdapter {
             return Ok(0);
         }
 
+        if let PrefixKeys::PerBlock(extra_keys_per_block) = keys
+            && extra_keys_per_block.len() < actual_blocks_to_register
+        {
+            return Err(format!(
+                "register_full_blocks_for_reuse_per_block: extra_keys_per_block has {} \
+                 entries but {} blocks need registration. The caller must size the per-\
+                 block vec to the registered-block count (typically the result of \
+                 compute_per_block_image_extra_keys with num_blocks=block_table.num_blocks()).",
+                extra_keys_per_block.len(),
+                actual_blocks_to_register,
+            ));
+        }
+
         let mut guard = self
             .allocator
             .lock()
             .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
 
         let registered = guard
-            .cache_full_blocks(
+            .cache_full_blocks_with_keys(
                 &self.request_tokens[..actual_blocks_to_register * block_size_us],
                 blocks_slice,
                 self.block_size,
-                extra_keys,
+                keys,
                 cache_salt,
             )
-            .map_err(|e| format!("cache_full_blocks failed: {e}"))?;
+            .map_err(|e| format!("{cache_op} failed: {e}"))?;
 
         // Release the shared allocator before the cold-tier capture below:
         // `capture_and_enqueue` blits every layer's block bytes off Metal,
@@ -7808,9 +6312,9 @@ impl PagedKVCacheAdapter {
                 blocks_slice,
                 cache_salt,
                 self.cold_capture_budget,
-                |_| Some(extra_keys),
+                |i| keys.get(i),
             );
-            Self::trace_cold_capture_walk("uniform", outcome, self.cold_capture_budget);
+            cold_tier::trace_cold_capture_walk(trace_label, outcome, self.cold_capture_budget);
             self.cold_capture = outcome;
         }
 
@@ -7873,103 +6377,11 @@ impl PagedKVCacheAdapter {
         extra_keys_per_block: &[Vec<u64>],
         cache_salt: u64,
     ) -> Result<u32, String> {
-        self.bind_request_cache_salt(cache_salt, "register_full_blocks_for_reuse_per_block")?;
-        self.ensure_aux_prefix_primed("register_full_blocks_for_reuse_per_block")?;
-        if self.already_registered {
-            return Ok(0);
-        }
-        #[cfg(target_os = "macos")]
-        self.eval_pending_pool_writes()?;
-
-        let block_table = self.block_table.as_ref().ok_or_else(|| {
-            "register_full_blocks_for_reuse_per_block called before reset_for_new_request"
-                .to_string()
-        })?;
-
-        let expected_tokens = block_table.num_tokens() as usize;
-        if self.request_tokens.len() != expected_tokens {
-            return Err(format!(
-                "register_full_blocks_for_reuse_per_block invariant violation: \
-                 request_tokens.len() == {} but block_table.num_tokens() == {}. \
-                 The caller must record_tokens() all tokens (cached prefix + new suffix) \
-                 before registering.",
-                self.request_tokens.len(),
-                expected_tokens,
-            ));
-        }
-
-        let block_size_us = self.block_size as usize;
-        if block_size_us == 0 {
-            return Err("block_size must be > 0".to_string());
-        }
-        let num_full_blocks = self.request_tokens.len() / block_size_us;
-        if num_full_blocks == 0 {
-            return Ok(0);
-        }
-
-        let blocks_slice = &block_table.blocks()[..num_full_blocks.min(block_table.num_blocks())];
-        let actual_blocks_to_register = blocks_slice.len();
-        if actual_blocks_to_register == 0 {
-            return Ok(0);
-        }
-
-        if extra_keys_per_block.len() < actual_blocks_to_register {
-            return Err(format!(
-                "register_full_blocks_for_reuse_per_block: extra_keys_per_block has {} \
-                 entries but {} blocks need registration. The caller must size the per-\
-                 block vec to the registered-block count (typically the result of \
-                 compute_per_block_image_extra_keys with num_blocks=block_table.num_blocks()).",
-                extra_keys_per_block.len(),
-                actual_blocks_to_register,
-            ));
-        }
-
-        let mut guard = self
-            .allocator
-            .lock()
-            .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
-
-        let registered = guard
-            .cache_full_blocks_per_block(
-                &self.request_tokens[..actual_blocks_to_register * block_size_us],
-                blocks_slice,
-                self.block_size,
-                &extra_keys_per_block[..actual_blocks_to_register],
-                cache_salt,
-            )
-            .map_err(|e| format!("cache_full_blocks_per_block failed: {e}"))?;
-
-        // Release the shared allocator before the cold-tier capture below:
-        // `capture_and_enqueue` blits every layer's block bytes off Metal, and
-        // holding the lock across that would serialize other requests. The
-        // blocks stay pinned by this request's own references until
-        // `release_request`, so dropping the lock cannot race an eviction.
-        drop(guard);
-
-        // Persist the same chain to the SSD cold tier (see
-        // [`ColdTierWalk::capture_chain`]). The `extra_keys_per_block.len()`
-        // check above already guarantees a per-block entry for every block
-        // handed to the walk.
-        if let Some(cold) = self.cold_tier.as_ref() {
-            let outcome = ColdTierWalk {
-                cold,
-                pool: &self.layer_kv_pool,
-                allocator: &self.allocator,
-                block_size: self.block_size,
-            }
-            .capture_chain(
-                &self.request_tokens,
-                blocks_slice,
-                cache_salt,
-                self.cold_capture_budget,
-                |i| extra_keys_per_block.get(i).map(Vec::as_slice),
-            );
-            Self::trace_cold_capture_walk("per_block", outcome, self.cold_capture_budget);
-            self.cold_capture = outcome;
-        }
-
-        self.already_registered = true;
-        Ok(registered as u32)
+        self.register_full_blocks_for_reuse_with_keys_inner(
+            PrefixKeys::PerBlock(extra_keys_per_block),
+            cache_salt,
+            true,
+        )
     }
 
     /// Release this request's block references. Decrefs every block in
@@ -7990,7 +6402,7 @@ impl PagedKVCacheAdapter {
             // partially failed lifecycle transition. Never let graph arrays or
             // request-shaped metadata outlive the request table they describe.
             #[cfg(target_os = "macos")]
-            self.clear_active_request_graph_state();
+            self.meta.invalidate(MetadataClear::ActiveRequest);
             return Ok(0);
         };
 
@@ -8012,7 +6424,7 @@ impl PagedKVCacheAdapter {
             Ok(guard) => guard,
             Err(error) => {
                 #[cfg(target_os = "macos")]
-                self.clear_active_request_graph_state();
+                self.meta.invalidate(MetadataClear::ActiveRequest);
                 return Err(format!("BlockAllocator mutex poisoned: {error}"));
             }
         };
@@ -8034,8 +6446,8 @@ impl PagedKVCacheAdapter {
         self.cold_capture = ColdCaptureOutcome::default();
         #[cfg(target_os = "macos")]
         {
-            self.prefill_attention_inputs_cache = None;
-            self.clear_active_request_graph_state();
+            self.meta.request.prefill_attention_inputs_cache = None;
+            self.meta.invalidate(MetadataClear::ActiveRequest);
         }
         // Defense-in-depth: clear the registration flag so a subsequent
         // reset_for_new_request → register flow on this adapter works
@@ -8058,7 +6470,7 @@ impl PagedKVCacheAdapter {
     pub fn release_all_requests(&mut self) -> Result<u32, String> {
         #[cfg(target_os = "macos")]
         {
-            self.ragged_inputs_cache = None;
+            self.meta.invalidate(MetadataClear::RaggedInputs);
         }
         let mut released = 0u32;
         if self.active_seq.is_some() {
@@ -8188,7 +6600,7 @@ impl PagedKVCacheAdapter {
         // a duplicate finalize after an error path doesn't double-register).
         if self.already_registered {
             #[cfg(target_os = "macos")]
-            self.clear_attention_inputs_caches();
+            self.meta.invalidate(MetadataClear::AttentionInputs);
             return Ok(0);
         }
         // Reuse `register_full_blocks_for_reuse`'s implementation for the
@@ -8196,7 +6608,7 @@ impl PagedKVCacheAdapter {
         // `release_request` after it.
         let result = self.register_full_blocks_for_reuse(extra_keys, cache_salt);
         #[cfg(target_os = "macos")]
-        self.clear_attention_inputs_caches();
+        self.meta.invalidate(MetadataClear::AttentionInputs);
         result
     }
 
@@ -8230,13 +6642,13 @@ impl PagedKVCacheAdapter {
         self.ensure_aux_prefix_primed("finalize_turn_keep_live_per_block")?;
         if self.already_registered {
             #[cfg(target_os = "macos")]
-            self.clear_attention_inputs_caches();
+            self.meta.invalidate(MetadataClear::AttentionInputs);
             return Ok(0);
         }
         let result =
             self.register_full_blocks_for_reuse_per_block(extra_keys_per_block, cache_salt);
         #[cfg(target_os = "macos")]
-        self.clear_attention_inputs_caches();
+        self.meta.invalidate(MetadataClear::AttentionInputs);
         result
     }
 
@@ -8333,7 +6745,7 @@ impl PagedKVCacheAdapter {
             self.aux_prefix_unbacked = false;
             self.restored_sidecar = None;
             #[cfg(target_os = "macos")]
-            self.clear_active_request_graph_state();
+            self.meta.invalidate(MetadataClear::ActiveRequest);
             return Ok((prior_token_count, 0));
         }
 
@@ -8401,8 +6813,8 @@ impl PagedKVCacheAdapter {
         self.restored_sidecar = None;
         #[cfg(target_os = "macos")]
         {
-            self.clear_attention_inputs_caches();
-            self.clear_decode_planning_cache();
+            self.meta.invalidate(MetadataClear::AttentionInputs);
+            self.meta.invalidate(MetadataClear::DecodePlanning);
         }
 
         Ok((prior_token_count, newly_allocated))
@@ -8435,7 +6847,7 @@ impl PagedKVCacheAdapter {
         self.already_registered = true;
         self.prefix_lookup_done = true;
         #[cfg(target_os = "macos")]
-        self.clear_active_request_graph_state();
+        self.meta.invalidate(MetadataClear::ActiveRequest);
         Ok(())
     }
 
@@ -8537,26 +6949,10 @@ impl PagedKVCacheAdapter {
 
         #[cfg(target_os = "macos")]
         {
-            if let Some((cached_heads, cached_result)) = self.grouped_d512_capability_cache.as_ref()
-                && *cached_heads == num_query_heads
-            {
-                return cached_result.clone();
-            }
-            let result = unsafe {
-                mlx_sys::mlx_paged_grouped_d512_capability(
-                    num_query_heads,
-                    self.layer_kv_pool.config().num_kv_heads as i32,
-                )
-            };
-            let result = match result {
-                1 => Ok(true),
-                0 => Ok(false),
-                other => Err(format!(
-                    "grouped D512 capability probe failed with status {other}"
-                )),
-            };
-            self.grouped_d512_capability_cache = Some((num_query_heads, result.clone()));
-            result
+            self.meta.grouped_d512_capability(
+                num_query_heads,
+                self.layer_kv_pool.config().num_kv_heads as i32,
+            )
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -8596,19 +6992,11 @@ impl PagedKVCacheAdapter {
     ) -> PagedPrefillMemorySnapshot {
         #[cfg(target_os = "macos")]
         {
-            if let Some(cached) = self.decode_planning_cache
-                && cached.context_bucket_end == context_bucket_end
-            {
-                return cached.snapshot;
+            if let Some(snapshot) = self.meta.decode_planning_snapshot(context_bucket_end) {
+                return snapshot;
             }
             let snapshot = Self::probe_prefill_memory_snapshot(self);
-            self.decode_planning_cache = Some(DecodePlanningCache {
-                context_bucket_end,
-                snapshot,
-                sdpa_failed: false,
-                reported_route_signature: None,
-                fallback_reported: false,
-            });
+            self.meta.init_decode_planning(context_bucket_end, snapshot);
             snapshot
         }
 
@@ -8623,9 +7011,7 @@ impl PagedKVCacheAdapter {
     pub fn decode_sdpa_failed(&self, context_bucket_end: u32) -> bool {
         #[cfg(target_os = "macos")]
         {
-            self.decode_planning_cache.is_some_and(|cached| {
-                cached.context_bucket_end == context_bucket_end && cached.sdpa_failed
-            })
+            self.meta.decode_sdpa_failed(context_bucket_end)
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -8638,12 +7024,7 @@ impl PagedKVCacheAdapter {
     /// Latch an SDPA construction/gather failure for the rest of this bucket.
     pub fn mark_decode_sdpa_failed(&mut self, context_bucket_end: u32) {
         #[cfg(target_os = "macos")]
-        if let Some(cached) = self.decode_planning_cache.as_mut()
-            && cached.context_bucket_end == context_bucket_end
-        {
-            cached.sdpa_failed = true;
-            cached.reported_route_signature = None;
-        }
+        self.meta.mark_decode_sdpa_failed(context_bucket_end);
 
         #[cfg(not(target_os = "macos"))]
         let _ = context_bucket_end;
@@ -8653,17 +7034,8 @@ impl PagedKVCacheAdapter {
     pub fn should_report_decode_route(&mut self, context_bucket_end: u32, signature: u64) -> bool {
         #[cfg(target_os = "macos")]
         {
-            let Some(cached) = self.decode_planning_cache.as_mut() else {
-                return true;
-            };
-            if cached.context_bucket_end != context_bucket_end {
-                return true;
-            }
-            if cached.reported_route_signature == Some(signature) {
-                return false;
-            }
-            cached.reported_route_signature = Some(signature);
-            true
+            self.meta
+                .should_report_decode_route(context_bucket_end, signature)
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -8677,14 +7049,7 @@ impl PagedKVCacheAdapter {
     pub fn should_report_decode_fallback(&mut self, context_bucket_end: u32) -> bool {
         #[cfg(target_os = "macos")]
         {
-            let Some(cached) = self.decode_planning_cache.as_mut() else {
-                return true;
-            };
-            if cached.context_bucket_end != context_bucket_end || cached.fallback_reported {
-                return false;
-            }
-            cached.fallback_reported = true;
-            true
+            self.meta.should_report_decode_fallback(context_bucket_end)
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -8700,62 +7065,19 @@ impl PagedKVCacheAdapter {
         probe: impl FnOnce(&Self) -> PagedPrefillMemorySnapshot,
     ) -> PagedPrefillMemorySnapshot {
         let token_count = self.current_token_count();
-        if let Some(cached) = self.prefill_memory_snapshot_cache
-            && cached.token_count == token_count
-        {
-            return cached.snapshot;
+        if let Some(snapshot) = self.meta.prefill_memory_snapshot(token_count) {
+            return snapshot;
         }
 
         let snapshot = probe(self);
-        self.prefill_memory_snapshot_cache = Some(PrefillMemorySnapshotCache {
-            token_count,
-            snapshot,
-        });
+        self.meta
+            .store_prefill_memory_snapshot(token_count, snapshot);
         snapshot
     }
 
     #[cfg(target_os = "macos")]
     fn probe_prefill_memory_snapshot(&self) -> PagedPrefillMemorySnapshot {
-        let mut active = 0u64;
-        let mut cached = 0u64;
-        let mut limit = 0u64;
-        let allocator_ok = unsafe {
-            mlx_sys::mlx_get_active_memory(&mut active) == 0
-                && mlx_sys::mlx_get_cache_memory(&mut cached) == 0
-                && mlx_sys::mlx_get_memory_limit(&mut limit) == 0
-                && limit > 0
-        };
-
-        let metal = mlx_paged_attn::metal::MetalState::get()
-            .ok()
-            .map(|state| {
-                (
-                    state.device.recommended_max_working_set_size(),
-                    state.device.current_allocated_size(),
-                )
-            })
-            .filter(|(recommended, _)| *recommended > 0);
-        let pool_cfg = self.layer_kv_pool.config();
-        let paged_pool_allocated_bytes = mlx_paged_attn::profile::bytes_per_block(
-            self.layer_kv_pool.num_layers() as u32,
-            pool_cfg.num_kv_heads,
-            pool_cfg.head_size,
-            pool_cfg.block_size,
-            self.layer_kv_pool.cache_dtype(),
-        )
-        .ok()
-        .map(|bytes_per_block| {
-            bytes_per_block.saturating_mul(self.layer_kv_pool.num_blocks() as u64)
-        });
-
-        PagedPrefillMemorySnapshot {
-            allocator_active_bytes: allocator_ok.then_some(active),
-            allocator_cached_bytes: allocator_ok.then_some(cached),
-            allocator_limit_bytes: allocator_ok.then_some(limit),
-            metal_recommended_working_set_bytes: metal.map(|(recommended, _)| recommended),
-            metal_current_allocated_bytes: metal.map(|(_, current)| current),
-            paged_pool_allocated_bytes,
-        }
+        super::paged_metadata_cache::probe_prefill_memory_snapshot(&self.layer_kv_pool)
     }
 
     pub fn cached_token_count(&self) -> u32 {
@@ -9041,6 +7363,10 @@ impl PagedKVCacheAdapter {
     /// (`fp8_value = fp32_value * 1.0`) while leaving the production wiring
     /// point in place for future FP8 enablement.
     pub fn k_scale_array(&mut self, layer_idx: u32) -> Result<MxArray, String> {
+        #[cfg(target_os = "macos")]
+        if self.scale_manager.is_none() {
+            return Ok(self.unit_kv_scale_array.clone());
+        }
         let scale = self.lookup_k_scale(layer_idx)?;
         self.cached_scale_array(layer_idx, true, scale)
     }
@@ -9048,6 +7374,10 @@ impl PagedKVCacheAdapter {
     /// Return a `[1]` fp32 V scale MxArray for `layer_idx`. See
     /// [`Self::k_scale_array`] for the FP8 contract.
     pub fn v_scale_array(&mut self, layer_idx: u32) -> Result<MxArray, String> {
+        #[cfg(target_os = "macos")]
+        if self.scale_manager.is_none() {
+            return Ok(self.unit_kv_scale_array.clone());
+        }
         let scale = self.lookup_v_scale(layer_idx)?;
         self.cached_scale_array(layer_idx, false, scale)
     }
@@ -9727,6 +8057,56 @@ mod tests {
             )
             .expect("sliding adapter ctor must succeed"),
         )
+    }
+
+    /// Submit-ahead decode primitives: `record_placeholder_token` grows
+    /// the cursor/block table exactly like a real record (the write slot
+    /// is count-derived, the sentinel value is never consulted),
+    /// `patch_last_recorded_token` commits the real id in place, and a
+    /// terminal `rollback_last_tokens(1)` removes the placeholder
+    /// wholesale — net zero logical state.
+    #[test]
+    fn placeholder_token_record_patch_and_rollback() {
+        let Some(mut adapter) = maybe_adapter(new_allocator(8, 8), 8) else {
+            return;
+        };
+        adapter.reset_for_new_request(1).unwrap();
+        adapter.record_tokens(&[10, 11, 12]).unwrap();
+        let block_ids_before = adapter.block_table().unwrap().block_ids();
+
+        // Placeholder advances the cursor + table like a real record.
+        adapter.record_placeholder_token().unwrap();
+        assert_eq!(adapter.current_token_count(), 4);
+        assert_eq!(adapter.request_tokens(), &[10, 11, 12, u32::MAX]);
+        assert_eq!(adapter.block_table().unwrap().num_tokens(), 4);
+
+        // Commit patches the sentinel in place; the cursor does not move.
+        adapter.patch_last_recorded_token(42).unwrap();
+        assert_eq!(adapter.request_tokens(), &[10, 11, 12, 42]);
+        assert_eq!(adapter.current_token_count(), 4);
+        assert_eq!(adapter.block_table().unwrap().num_tokens(), 4);
+
+        // A terminal-step rollback drops a fresh placeholder wholesale —
+        // the loop's ordering is commit-then-rollback: net zero.
+        adapter.record_placeholder_token().unwrap();
+        assert_eq!(adapter.current_token_count(), 5);
+        adapter.patch_last_recorded_token(99).unwrap();
+        adapter.rollback_last_tokens(1).unwrap();
+        assert_eq!(adapter.request_tokens(), &[10, 11, 12, 42]);
+        assert_eq!(adapter.current_token_count(), 4);
+        assert_eq!(adapter.block_table().unwrap().num_tokens(), 4);
+        assert_eq!(adapter.block_table().unwrap().block_ids(), block_ids_before);
+
+        // Patching with nothing recorded is an error, not a panic.
+        adapter.reset_for_new_request(2).unwrap();
+        assert!(adapter.patch_last_recorded_token(7).is_err());
+
+        // A mispaired commit — patching on top of a REAL record — must
+        // also error rather than clobber an id that feeds
+        // `continue_turn`'s `starts_with` and prefix hashing.
+        adapter.record_tokens(&[5, 6]).unwrap();
+        assert!(adapter.patch_last_recorded_token(7).is_err());
+        assert_eq!(adapter.request_tokens(), &[5, 6]);
     }
 
     #[test]
@@ -12427,6 +10807,8 @@ mod tests {
             .decode_attention_inputs()
             .expect("populate decode metadata");
         let stale = adapter
+            .meta
+            .request
             .decode_attention_inputs_cache
             .take()
             .expect("decode cache populated");
@@ -12434,10 +10816,10 @@ mod tests {
         assert_eq!(adapter.release_request().unwrap(), 1);
         // Recreate the historical bad state: no request table, but a stale
         // graph metadata cache survived a prior failed cleanup.
-        adapter.decode_attention_inputs_cache = Some(stale);
+        adapter.meta.request.decode_attention_inputs_cache = Some(stale);
         assert_eq!(adapter.release_request().unwrap(), 0);
         assert!(
-            adapter.decode_attention_inputs_cache.is_none(),
+            adapter.meta.request.decode_attention_inputs_cache.is_none(),
             "idempotent release must repair stale request-shaped metadata"
         );
     }
@@ -12478,7 +10860,7 @@ mod tests {
         );
         assert_eq!(adapter.request_tokens(), &[1, 2, 3, 4]);
         assert!(
-            adapter.decode_attention_inputs_cache.is_none(),
+            adapter.meta.request.decode_attention_inputs_cache.is_none(),
             "failed release must still clear graph-native metadata"
         );
     }
@@ -12687,6 +11069,89 @@ mod tests {
         assert_eq!(adapter.block_table_for(2).unwrap().block_ids(), b_ids);
     }
 
+    /// `record_tokens_batched` snapshots every row's pre-record cursor, then
+    /// advances each request exactly one token — the batched-decode
+    /// `planned_rows` contract the model families consume.
+    #[test]
+    fn record_tokens_batched_returns_prerecord_positions_and_advances() {
+        let Some(mut adapter) = maybe_adapter(new_allocator(16, 4), 4) else {
+            eprintln!(
+                "skipping record_tokens_batched_returns_prerecord_positions_and_advances: Metal unavailable"
+            );
+            return;
+        };
+        adapter.begin_request(1).unwrap();
+        adapter.allocate_suffix_blocks_for(1, 4).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
+        adapter.begin_request(2).unwrap();
+        adapter.allocate_suffix_blocks_for(2, 8).unwrap();
+        adapter.record_tokens(&[5, 6, 7, 8, 9, 10, 11, 12]).unwrap();
+
+        let planned = adapter
+            .record_tokens_batched(&[(1, 100), (2, 200)])
+            .unwrap();
+        assert_eq!(planned, vec![(1, 4), (2, 8)]);
+        assert_eq!(adapter.current_token_count_for(1), Some(5));
+        assert_eq!(adapter.current_token_count_for(2), Some(9));
+        assert_eq!(adapter.request_tokens_for(1).unwrap().last(), Some(&100));
+        assert_eq!(adapter.request_tokens_for(2).unwrap().last(), Some(&200));
+    }
+
+    /// A duplicated seq_id is rejected during the snapshot pass, before ANY
+    /// row's token is recorded.
+    #[test]
+    fn record_tokens_batched_rejects_duplicate_sequence() {
+        let Some(mut adapter) = maybe_adapter(new_allocator(16, 4), 4) else {
+            eprintln!(
+                "skipping record_tokens_batched_rejects_duplicate_sequence: Metal unavailable"
+            );
+            return;
+        };
+        adapter.begin_request(1).unwrap();
+        adapter.allocate_suffix_blocks_for(1, 4).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
+
+        let error = adapter
+            .record_tokens_batched(&[(1, 100), (1, 200)])
+            .expect_err("a duplicated seq_id must be rejected");
+        assert!(error.contains("duplicate sequence 1"), "got: {error}");
+        assert_eq!(adapter.current_token_count_for(1), Some(4));
+        assert_eq!(adapter.request_tokens_for(1).unwrap(), &[1, 2, 3, 4]);
+    }
+
+    /// A mid-batch record failure unwinds the already-recorded rows
+    /// newest-first, leaving every request exactly where the wave started.
+    /// Five-block pool: three 1-block rows leave two free blocks, so rows 1
+    /// and 2 cross a block boundary successfully and row 3 exhausts the
+    /// allocator — exercising the reverse-order rollback of both rows.
+    #[test]
+    fn record_tokens_batched_rolls_back_prior_rows_on_failure() {
+        let Some(mut adapter) = maybe_adapter(new_allocator(5, 4), 4) else {
+            eprintln!(
+                "skipping record_tokens_batched_rolls_back_prior_rows_on_failure: Metal unavailable"
+            );
+            return;
+        };
+        for seq_id in [1, 2, 3] {
+            adapter.begin_request(seq_id).unwrap();
+            adapter.allocate_suffix_blocks_for(seq_id, 4).unwrap();
+            adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
+        }
+
+        let error = adapter
+            .record_tokens_batched(&[(1, 100), (2, 200), (3, 300)])
+            .expect_err("row 3's record must fail on allocator exhaustion");
+        assert!(
+            error.contains("failed to record sequence 3"),
+            "got: {error}"
+        );
+        for seq_id in [1, 2, 3] {
+            assert_eq!(adapter.current_token_count_for(seq_id), Some(4));
+            assert_eq!(adapter.request_tokens_for(seq_id).unwrap(), &[1, 2, 3, 4]);
+            assert_eq!(adapter.block_table_for(seq_id).unwrap().num_tokens(), 4);
+        }
+    }
+
     #[test]
     fn prepare_failure_and_divergence_release_only_the_selected_request() {
         let Some(mut adapter) = maybe_adapter(new_allocator(16, 4), 4) else {
@@ -12794,7 +11259,7 @@ mod tests {
             let started = Instant::now();
             for _ in 0..1000 {
                 if rebuild {
-                    adapter.ragged_inputs_cache = None;
+                    adapter.meta.ragged_inputs_cache = None;
                 }
                 black_box(adapter.ragged_attention_inputs(&rows).unwrap());
             }
@@ -12823,6 +11288,7 @@ mod tests {
             .update_keys_values_native_batched(0, &values, &values, &[(1, 3), (2, 3)])
             .unwrap();
         let slots = adapter
+            .meta
             .ragged_inputs_cache
             .as_ref()
             .unwrap()
@@ -12835,6 +11301,7 @@ mod tests {
         assert_eq!(
             slots.as_raw_ptr(),
             adapter
+                .meta
                 .ragged_inputs_cache
                 .as_ref()
                 .unwrap()
@@ -12892,6 +11359,7 @@ mod tests {
         ];
         let (tables, lens, cumulative, _, _) = adapter.ragged_attention_inputs(&rows).unwrap();
         let slots = adapter
+            .meta
             .ragged_inputs_cache
             .as_ref()
             .unwrap()
@@ -12906,6 +11374,7 @@ mod tests {
         assert_eq!(
             slots.as_raw_ptr(),
             adapter
+                .meta
                 .ragged_inputs_cache
                 .as_ref()
                 .unwrap()
@@ -12928,6 +11397,7 @@ mod tests {
         assert_eq!(replaced.item_at_int32(1).unwrap(), replacement_id as i32);
         assert_eq!(
             adapter
+                .meta
                 .ragged_inputs_cache
                 .as_ref()
                 .unwrap()
@@ -13068,6 +11538,8 @@ mod tests {
         let a_revision = adapter.block_table().unwrap().physical_revision();
         assert_eq!(
             adapter
+                .meta
+                .request
                 .decode_attention_inputs_cache
                 .as_ref()
                 .unwrap()
@@ -13087,6 +11559,8 @@ mod tests {
         adapter.decode_attention_inputs().unwrap();
         assert_eq!(
             adapter
+                .meta
+                .request
                 .decode_attention_inputs_cache
                 .as_ref()
                 .unwrap()
@@ -13117,7 +11591,12 @@ mod tests {
         // newer token cursor or materialized block table.
         adapter.activate_request(1).unwrap();
         let (_, _, a_block_count) = adapter.decode_attention_inputs().unwrap();
-        let a_cache = adapter.decode_attention_inputs_cache.as_ref().unwrap();
+        let a_cache = adapter
+            .meta
+            .request
+            .decode_attention_inputs_cache
+            .as_ref()
+            .unwrap();
         assert_eq!(a_cache.token_count, 4);
         assert_eq!(a_cache.physical_revision, a_revision);
         assert_eq!(a_cache.block_count, a_block_count);
@@ -14425,7 +12904,7 @@ mod tests {
         let (first_request_table, _, _) = adapter.decode_attention_inputs().unwrap();
         adapter.register_full_blocks_for_reuse(&[], 0).unwrap();
         adapter.release_request().unwrap();
-        assert!(adapter.decode_attention_inputs_cache.is_none());
+        assert!(adapter.meta.request.decode_attention_inputs_cache.is_none());
 
         adapter.reset_for_new_request(1).unwrap();
         let prefix = adapter
@@ -15984,6 +14463,136 @@ mod tests {
         }
     }
 
+    /// K2-Horizon geometry (32q/8kv, head_size 128, GQA 4) opts into the
+    /// grouped striped kernel via `ForceD128`. Both the generic V2 route and
+    /// the grouped route (adapter-resolved stripes) must match an
+    /// independent FP64 softmax reference; the grouped output must also
+    /// differ bitwise from generic, proving the dispatch actually left the
+    /// generic path (stripe partitioning changes accumulation order).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn k2_geometry_grouped_d128_matches_dense_reference() {
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return;
+        }
+        const N: u32 = 2579;
+        const HQ: usize = 32;
+        const HKV: usize = 8;
+        const D: usize = 128;
+        let data = |len: usize, stride: usize, period: usize| {
+            (0..len)
+                .map(|i| ((i * stride % period) as f32 - (period / 2) as f32) / 64.0)
+                .collect::<Vec<_>>()
+        };
+        // These binary fractions are exactly representable in BF16.
+        let k_data = data(N as usize * HKV * D, 13, 113);
+        let v_data = data(N as usize * HKV * D, 17, 127);
+        let k = MxArray::from_float32(&k_data, &[N as i64, HKV as i64, D as i64])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let v = MxArray::from_float32(&v_data, &[N as i64, HKV as i64, D as i64])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let scale = 1.0 / (D as f32).sqrt();
+        let config = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 16,
+            num_kv_heads: HKV as u32,
+            head_size: D as u32,
+            num_layers: 1,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(8192),
+            max_batch_size: Some(1),
+        };
+        let pool = Arc::new(
+            mlx_paged_attn::LayerKVPool::new(
+                config,
+                512,
+                512,
+                mlx_paged_attn::metal::MetalDtype::BFloat16,
+            )
+            .unwrap(),
+        );
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(512, 512, 16)));
+        let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 16).unwrap();
+        adapter.reset_for_new_request(7).unwrap();
+        adapter.record_tokens(&(0..N).collect::<Vec<_>>()).unwrap();
+        adapter.update_keys_values(0, &k, &v, 0).unwrap();
+
+        let q_data = data(HQ * D, 19, 109);
+        let q = MxArray::from_float32(&q_data, &[1, HQ as i64, D as i64])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+
+        // Generic route (Auto cannot select grouped for K2's shape) and the
+        // opt-in grouped route with adapter-resolved stripes.
+        let generic = adapter
+            .gather_kv_for_decode_graph_batched(0, &q, &[7], scale, 0.0)
+            .unwrap()
+            .to_float32()
+            .unwrap()
+            .to_vec();
+        let grouped = adapter
+            .gather_kv_for_decode_graph_batched_with_plan(
+                0,
+                &q,
+                &[7],
+                scale,
+                0.0,
+                PagedDecodeRouteHint::ForceD128,
+                0,
+            )
+            .unwrap()
+            .to_float32()
+            .unwrap()
+            .to_vec();
+
+        // FP64 softmax reference over the full [0, N) window.
+        for head in 0..HQ {
+            let kv_head = head / (HQ / HKV);
+            let q_base = head * D;
+            let scores: Vec<f64> = (0..N as usize)
+                .map(|pos| {
+                    let k_base = (pos * HKV + kv_head) * D;
+                    (0..D)
+                        .map(|d| f64::from(q_data[q_base + d]) * f64::from(k_data[k_base + d]))
+                        .sum::<f64>()
+                        * f64::from(scale)
+                })
+                .collect();
+            let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let probs: Vec<f64> = scores.iter().map(|x| (x - max).exp()).collect();
+            let total: f64 = probs.iter().sum();
+            for d in 0..D {
+                let expected = probs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| p * f64::from(v_data[(i * HKV + kv_head) * D + d]))
+                    .sum::<f64>()
+                    / total;
+                for (route, output) in [("generic", &generic), ("grouped", &grouped)] {
+                    let got = f64::from(output[q_base + d]);
+                    assert!(
+                        got.is_finite() && (got - expected).abs() < 0.003,
+                        "route={route} head={head} d={d}: {got} != {expected}"
+                    );
+                }
+            }
+        }
+
+        // Route evidence: grouped stripe partitioning rounds differently.
+        let identical = generic.iter().zip(&grouped).all(|(a, b)| a == b);
+        assert!(
+            !identical,
+            "ForceD128 output is bit-identical to generic V2; the grouped \
+             kernel did not run"
+        );
+        assert_eq!(adapter.current_token_count(), N);
+    }
+
     /// The first verifier query must retain its whole window, even when a
     /// later query or another owner starts on a different physical page.
     #[cfg(target_os = "macos")]
@@ -16647,6 +15256,99 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_k2_bf16_prefill_gather_matches_host_with_lazy_suffix() {
+        const TOKENS: usize = 33;
+        const HEADS: usize = 8;
+        const DIM: usize = 128;
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 16,
+            num_kv_heads: HEADS as u32,
+            head_size: DIM as u32,
+            num_layers: 1,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(64),
+            max_batch_size: Some(1),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg,
+            4,
+            4,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(pool) => Arc::new(pool),
+            Err(error) => {
+                eprintln!("skipping K2 BF16 prefill gather: {error}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 4, 16)));
+        let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 16).unwrap();
+        adapter.reset_for_new_request(11).unwrap();
+        adapter.allocate_suffix_blocks(TOKENS as u32).unwrap();
+        let token_ids: Vec<u32> = (0..TOKENS as u32).collect();
+        let key_at = |token: usize, head: usize, dim: usize| {
+            ((token * 17 + head * 3 + dim % 7) % 64) as f32 / 8.0
+        };
+        let value_at = |token: usize, head: usize, dim: usize| {
+            ((token * 7 + head * 13 + dim) % 61) as f32 / 8.0
+        };
+        for (start, end) in [(0usize, 17usize), (17, TOKENS)] {
+            adapter.record_tokens(&token_ids[start..end]).unwrap();
+            let mut keys = Vec::new();
+            let mut values = Vec::new();
+            for token in start..end {
+                for head in 0..HEADS {
+                    for dim in 0..DIM {
+                        keys.push(key_at(token, head, dim));
+                        values.push(value_at(token, head, dim));
+                    }
+                }
+            }
+            let shape = [(end - start) as i64, HEADS as i64, DIM as i64];
+            let keys = MxArray::from_float32(&keys, &shape)
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+            let values = MxArray::from_float32(&values, &shape)
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+            adapter
+                .update_keys_values_native(0, &keys, &values, start as u32)
+                .unwrap();
+        }
+        let (graph_k, graph_v) = adapter
+            .gather_kv_for_prefill_sdpa(0, TOKENS as u32)
+            .unwrap();
+        for array in [&graph_k, &graph_v] {
+            assert_eq!(
+                array.shape().unwrap().as_ref(),
+                &[1, HEADS as i64, TOKENS as i64, DIM as i64]
+            );
+            assert_eq!(array.dtype().unwrap(), DType::BFloat16);
+        }
+        let graph_k = graph_k.to_float32().unwrap();
+        let graph_v = graph_v.to_float32().unwrap();
+        let (host_k, host_v) = adapter.read_kv_range(0, 0, TOKENS as u32).unwrap();
+        let host_k = host_k.to_float32().unwrap();
+        let host_v = host_v.to_float32().unwrap();
+        assert_eq!(graph_k.as_ref(), host_k.as_ref());
+        assert_eq!(graph_v.as_ref(), host_v.as_ref());
+        for head in 0..HEADS {
+            for token in 0..TOKENS {
+                for dim in 0..DIM {
+                    let index = (head * TOKENS + token) * DIM + dim;
+                    assert_eq!(graph_k[index], key_at(token, head, dim));
+                    assert_eq!(graph_v[index], value_at(token, head, dim));
+                }
+            }
+        }
+        assert_eq!(adapter.current_token_count(), TOKENS as u32);
     }
 
     #[cfg(target_os = "macos")]

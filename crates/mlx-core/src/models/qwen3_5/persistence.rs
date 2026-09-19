@@ -11,7 +11,8 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
-use crate::cold_tier::{resolve_persist_cold, shard_identities_stable, snapshot_shard_identities};
+use crate::cold_tier::{CheckpointLoadGuard, resolve_persist_cold};
+use crate::models::paged_config::PagedCacheConfig;
 use crate::models::quant_dispatch::{
     PlainFp8Residency, default_per_layer_quant, defer_plain_fp8_materialization, effective_plq_for,
     ensure_affine_biases_present, ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
@@ -25,7 +26,8 @@ use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use crate::utils::safetensors::load_safetensors_lazy;
 
 use crate::engine::persistence::{
-    dequant_fp8_weights, get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
+    KeyRule, RenameSpec, WRAPPER_STRIP_PREFIXES, apply_rename_spec, dequant_fp8_weights,
+    get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
     prewarm_checkpoint_pages_with, strip_qwen35_vision_weight_prefix,
 };
 
@@ -33,7 +35,7 @@ use super::config::Qwen3_5Config;
 use super::decoder_layer::AttentionType;
 use super::model::Qwen35FamilyCommand;
 use super::model::{Qwen3_5Model, Qwen35Inner, Qwen35SchedulerState};
-use super::quantized_linear::{
+use crate::models::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, LinearProj, MLPVariant, PerLayerMode,
     PerLayerQuant, is_mxfp8_checkpoint, is_quantized_checkpoint,
     try_build_fp8_e4m3_quantized_linear, try_build_kquant_quantized_linear,
@@ -223,6 +225,129 @@ pub(crate) fn merge_split_projections(
     Ok(())
 }
 
+/// Raw-key drops — visual-encoder weights (for VL models). RAW-scoped because
+/// the `model.visual`/`visual_encoder` check ran on the pre-strip name in the
+/// original drain loop. Shared with `qwen3_5_moe`.
+pub(crate) static QWEN35_RAW_DROPS: &[KeyRule] = &[
+    KeyRule::DropContains("model.visual"),
+    KeyRule::DropContains("visual_encoder"),
+];
+
+/// Post-strip renames shared with qwen3_5_moe: `embed_tokens.*` →
+/// `embedding.*` (prefix swap — the original was a `strip_prefix` rebuild,
+/// not a substring replace) and `norm.weight` → `final_norm.weight`.
+pub(crate) static QWEN35_KEY_RENAMES: &[KeyRule] = &[
+    KeyRule::RenamePrefix {
+        from: "embed_tokens.",
+        to: "embedding.",
+    },
+    KeyRule::RenameExact {
+        from: "norm.weight",
+        to: "final_norm.weight",
+    },
+];
+
+/// Norm suffixes eligible for the LM-body +1.0 shift.
+/// NOTE: `.linear_attn.norm.weight` is intentionally NOT included here.
+/// It's stored as f32 with final values (e.g. ~0.87), not as shifted weights.
+/// Matches mlx-lm, mlx-vlm, and MoE persistence behavior.
+const QWEN35_NORM_SUFFIXES: [&str; 5] = [
+    ".input_layernorm.weight",
+    ".post_attention_layernorm.weight",
+    "final_norm.weight",
+    ".q_norm.weight",
+    ".k_norm.weight",
+];
+
+/// Value hook: conv1d axis fix (HF stores [channels, 1, kernel_size], we need
+/// [channels, kernel_size, 1] for depthwise conv) plus the +1.0 norm
+/// corrections — `needs_norm_fix` gates the LM-body shift and
+/// `mtp_norms_need_shift` the independently probed MTP-norm shift. Runs on
+/// the post-rename map; key order is unchanged.
+fn apply_sanitized_value_transforms(
+    result: &mut HashMap<String, MxArray>,
+    needs_norm_fix: bool,
+    mtp_norms_need_shift: bool,
+) -> Result<()> {
+    for (name, value) in result.iter_mut() {
+        // `mtp.*` keys bypass the LM-body `will_shift` path. MTP norms
+        // instead get a separate, independently probed +1.0 correction —
+        // see `mtp_norms_need_shift`.
+        let is_mtp_weight = name.starts_with("mtp.");
+
+        if name.contains("conv1d.weight") {
+            let shape = value.shape()?;
+            if shape.len() == 3 && shape[2] != 1 {
+                *value = value.transpose(Some(&[0, 2, 1]))?;
+            }
+        }
+
+        // Apply norm +1.0 fix for unsanitized LM-body weights. MTP norms are
+        // excluded here (`!is_mtp_weight`) and corrected separately below.
+        let is_norm_suffix = QWEN35_NORM_SUFFIXES.iter().any(|sfx| name.ends_with(sfx));
+        let will_shift = needs_norm_fix && !is_mtp_weight && is_norm_suffix;
+        // MTP norm keys: the four shared norm suffixes plus the MTP-only
+        // `mtp.norm.weight` and the two pre-fc norms, none of which are
+        // covered by `norm_suffixes` / the `norm.weight`→`final_norm.weight`
+        // rename.
+        let is_mtp_norm = is_mtp_weight
+            && (name == "mtp.norm.weight"
+                || name.ends_with(".pre_fc_norm_hidden.weight")
+                || name.ends_with(".pre_fc_norm_embedding.weight")
+                || is_norm_suffix);
+        // Capture pre-shift mean for the first layer's norms so the
+        // log shows whether the source was already sanitized (mean
+        // ≈ 1.0 → DOUBLE-shift hazard) vs unsanitized (mean ≈ 0.0,
+        // expected). Only sampled for the first occurrence per norm
+        // suffix to bound the cost — sample if the norm is on layer 0.
+        let sample_log = will_shift && name.contains("layers.0");
+        let pre_mean_opt: Option<f32> = if sample_log {
+            // Cast to f32 before reading the scalar mean — bf16/f16
+            // backends would otherwise need a dtype-specific reader.
+            value
+                .astype(DType::Float32)
+                .and_then(|a| a.mean(None, None))
+                .and_then(|m| {
+                    m.eval();
+                    m.item_at_float32(0)
+                })
+                .ok()
+        } else {
+            None
+        };
+        if will_shift && value.ndim()? == 1 {
+            let one = MxArray::scalar_float(1.0)?.astype(value.dtype()?)?;
+            *value = value.add(&one)?;
+        }
+        // Independent MTP-norm correction (see `mtp_norms_need_shift`).
+        // Mutually exclusive with `will_shift`, which requires `!is_mtp_weight`.
+        if mtp_norms_need_shift && is_mtp_norm && value.ndim()? == 1 {
+            let one = MxArray::scalar_float(1.0)?.astype(value.dtype()?)?;
+            *value = value.add(&one)?;
+            info!(
+                "Qwen3.5 sanitize_weights: SHIFTING +1 to MTP norm '{}'",
+                name,
+            );
+        }
+        if sample_log {
+            let post_mean_opt: Option<f32> = value
+                .astype(DType::Float32)
+                .and_then(|a| a.mean(None, None))
+                .and_then(|m| {
+                    m.eval();
+                    m.item_at_float32(0)
+                })
+                .ok();
+            info!(
+                "Qwen3.5 sanitize_weights: SHIFTING +1 to norm '{}' \
+                 (is_mtp_weight={} is_norm={}) pre_mean={:?} post_mean={:?}",
+                name, is_mtp_weight, is_norm_suffix, pre_mean_opt, post_mean_opt,
+            );
+        }
+    }
+    Ok(())
+}
+
 /// 5. Norm weight +1.0 adjustment (when unsanitized weights detected)
 /// 6. Remove MTP (multi-token prediction) weights
 /// 7. FP8 E4M3 dequantization (weight + weight_scale_inv → bf16)
@@ -232,8 +357,6 @@ fn sanitize_weights(
     config: &Qwen3_5Config,
     per_layer_quant: &HashMap<String, PerLayerQuant>,
 ) -> Result<HashMap<String, MxArray>> {
-    let mut result: HashMap<String, MxArray> = HashMap::new();
-
     let has_mtp_weights = params.keys().any(|k| k.contains("mtp."));
     let has_unsanitized_conv1d = params.iter().any(|(name, array)| {
         if !name.contains("conv1d.weight") {
@@ -316,17 +439,6 @@ fn sanitize_weights(
         crate::array::memory::synchronize_and_clear_cache();
     }
 
-    let norm_suffixes = [
-        ".input_layernorm.weight",
-        ".post_attention_layernorm.weight",
-        "final_norm.weight",
-        ".q_norm.weight",
-        ".k_norm.weight",
-        // NOTE: .linear_attn.norm.weight is intentionally NOT included here.
-        // It's stored as f32 with final values (e.g. ~0.87), not as shifted weights.
-        // Matches mlx-lm, mlx-vlm, and MoE persistence behavior.
-    ];
-
     // Probe whether MTP norm weights are in raw-HF form and need a +1.0
     // shift. This is INDEPENDENT of `needs_norm_fix` above: `mlx convert`
     // historically skipped the +1.0 shift for every `mtp.*` key, so a
@@ -338,7 +450,7 @@ fn sanitize_weights(
     // A probe failure conservatively defaults to "no shift" (no panic,
     // no double-shift hazard).
     let mtp_norms_need_shift = if has_mtp_weights {
-        // Probe by suffix, not exact key: this runs BEFORE the drain loop
+        // Probe by suffix, not exact key: this runs BEFORE the rename spec
         // strips `model.` / `language_model.` prefixes, so a checkpoint
         // with prefixed MTP keys (e.g. `model.mtp.layers.0...`) must still
         // be matched. No non-MTP tensor ends with this suffix.
@@ -366,125 +478,28 @@ fn sanitize_weights(
         false
     };
 
-    for (name, array) in params.drain() {
-        // Skip visual encoder weights (for VL models)
-        if name.contains("model.visual") || name.contains("visual_encoder") {
-            continue;
-        }
-
-        // Strip prefixes (VL models use model.language_model.*, text-only use model.*).
-        // After this, MTP keys land under `mtp.*`, e.g. `mtp.layers.0.input_layernorm.weight`.
-        // Shared longest-first chain so raw VLM-wrapped `model.language_model.model.mtp.*`
-        // keys are not silently dropped — see `mtp_drafter::strip_wrapper_prefix`.
-        let name = crate::models::mtp_drafter::strip_wrapper_prefix(&name).to_string();
-
-        // `mtp.*` keys bypass the lm_head/embed_tokens renames below and the
-        // LM-body `will_shift` path. MTP norms instead get a separate,
-        // independently probed +1.0 correction — see `mtp_norms_need_shift`.
-        let is_mtp_weight = name.starts_with("mtp.");
-
-        // Rename special keys (including quantization metadata .scales/.biases)
-        let name = if let Some(suffix) = name.strip_prefix("embed_tokens.") {
-            format!("embedding.{}", suffix)
-        } else if name == "norm.weight" {
-            "final_norm.weight".to_string()
-        } else {
-            name
-        };
-
-        // Remove lm_head when tie_word_embeddings is set
-        if config.tie_word_embeddings && name.starts_with("lm_head.") {
-            continue;
-        }
-
-        // Fix conv1d weight axis: HF stores [channels, 1, kernel_size],
-        // we need [channels, kernel_size, 1] for depthwise conv
-        let array = if name.contains("conv1d.weight") {
-            let shape = array.shape()?;
-            if shape.len() == 3 && shape[2] != 1 {
-                array.transpose(Some(&[0, 2, 1]))?
-            } else {
-                array
-            }
-        } else {
-            array
-        };
-
-        // Apply norm +1.0 fix for unsanitized LM-body weights. MTP norms are
-        // excluded here (`!is_mtp_weight`) and corrected separately below.
-        let is_norm_suffix = norm_suffixes.iter().any(|sfx| name.ends_with(sfx));
-        let will_shift = needs_norm_fix && !is_mtp_weight && is_norm_suffix;
-        // MTP norm keys: the four shared norm suffixes plus the MTP-only
-        // `mtp.norm.weight` and the two pre-fc norms, none of which are
-        // covered by `norm_suffixes` / the `norm.weight`→`final_norm.weight`
-        // rename.
-        let is_mtp_norm = is_mtp_weight
-            && (name == "mtp.norm.weight"
-                || name.ends_with(".pre_fc_norm_hidden.weight")
-                || name.ends_with(".pre_fc_norm_embedding.weight")
-                || is_norm_suffix);
-        // Capture pre-shift mean for the first layer's norms so the
-        // log shows whether the source was already sanitized (mean
-        // ≈ 1.0 → DOUBLE-shift hazard) vs unsanitized (mean ≈ 0.0,
-        // expected). Only sampled for the first occurrence per norm
-        // suffix to bound the cost — sample if the norm is on layer 0.
-        let sample_log = will_shift && name.contains("layers.0");
-        let pre_mean_opt: Option<f32> = if sample_log {
-            // Cast to f32 before reading the scalar mean — bf16/f16
-            // backends would otherwise need a dtype-specific reader.
-            array
-                .astype(DType::Float32)
-                .and_then(|a| a.mean(None, None))
-                .and_then(|m| {
-                    m.eval();
-                    m.item_at_float32(0)
-                })
-                .ok()
-        } else {
-            None
-        };
-        let array = if will_shift {
-            let ndim = array.ndim()?;
-            if ndim == 1 {
-                let one = MxArray::scalar_float(1.0)?.astype(array.dtype()?)?;
-                array.add(&one)?
-            } else {
-                array
-            }
-        } else {
-            array
-        };
-        // Independent MTP-norm correction (see `mtp_norms_need_shift`).
-        // Mutually exclusive with `will_shift`, which requires `!is_mtp_weight`.
-        let array = if mtp_norms_need_shift && is_mtp_norm && array.ndim()? == 1 {
-            let one = MxArray::scalar_float(1.0)?.astype(array.dtype()?)?;
-            let shifted = array.add(&one)?;
-            info!(
-                "Qwen3.5 sanitize_weights: SHIFTING +1 to MTP norm '{}'",
-                name,
-            );
-            shifted
-        } else {
-            array
-        };
-        if sample_log {
-            let post_mean_opt: Option<f32> = array
-                .astype(DType::Float32)
-                .and_then(|a| a.mean(None, None))
-                .and_then(|m| {
-                    m.eval();
-                    m.item_at_float32(0)
-                })
-                .ok();
-            info!(
-                "Qwen3.5 sanitize_weights: SHIFTING +1 to norm '{}' \
-                 (is_mtp_weight={} is_norm={}) pre_mean={:?} post_mean={:?}",
-                name, is_mtp_weight, is_norm_suffix, pre_mean_opt, post_mean_opt,
-            );
-        }
-
-        result.insert(name, array);
+    // Declarative key rewrite — drop visual-encoder weights (for VL models),
+    // strip the wrapper prefixes (VL models use `model.language_model.*`,
+    // text-only use `model.*`; the shared longest-first chain keeps raw
+    // VLM-wrapped `model.language_model.model.mtp.*` keys alive — see
+    // `mtp_drafter::strip_wrapper_prefix`), then apply the
+    // embed_tokens/norm renames and the tied `lm_head.*` drop.
+    let mut rules: Vec<KeyRule> = Vec::with_capacity(3);
+    rules.extend_from_slice(QWEN35_KEY_RENAMES);
+    if config.tie_word_embeddings {
+        rules.push(KeyRule::DropPrefix("lm_head."));
     }
+    let mut result = apply_rename_spec(
+        params,
+        &RenameSpec {
+            raw_rules: QWEN35_RAW_DROPS,
+            strip_prefixes: WRAPPER_STRIP_PREFIXES,
+            rules: &rules,
+            ..Default::default()
+        },
+    )?;
+
+    apply_sanitized_value_transforms(&mut result, needs_norm_fix, mtp_norms_need_shift)?;
 
     merge_split_projections(&mut result, per_layer_quant)?;
 
@@ -1265,7 +1280,7 @@ fn apply_weights_inner_with_residency(
 
     let try_build_ql = |params: &HashMap<String, MxArray>,
                         prefix: &str|
-     -> Result<Option<super::quantized_linear::QuantizedLinear>> {
+     -> Result<Option<crate::models::quantized_linear::QuantizedLinear>> {
         // Per-layer override lookup. For merged GDN projections (in_proj_qkvz,
         // in_proj_ba) the source overrides may live under the split keys; if
         // the two sides disagree we pick the higher-precision combination:
@@ -1992,11 +2007,7 @@ pub async fn load_with_thread(
                     persist_env.as_deref(),
                     config.persist_paged_cache,
                 );
-                let shard_snapshot_before_mmap = if persist_cold {
-                    snapshot_shard_identities(path)
-                } else {
-                    None
-                };
+                let mut checkpoint_load = CheckpointLoadGuard::before_mmap(path, persist_cold);
 
                 // Load all weights. MTPLX-compatible artifacts can store the MTP
                 // module in an external sidecar (usually `mtp.safetensors`) instead
@@ -2009,11 +2020,7 @@ pub async fn load_with_thread(
                 // with the after-fingerprint snapshot below it brackets the WHOLE
                 // load-to-fingerprint span so a mid-load model-directory swap can
                 // never bind the OLD weights to a NEW revision's fingerprint.
-                let shard_snapshot_at_mmap = if persist_cold {
-                    snapshot_shard_identities(path)
-                } else {
-                    None
-                };
+                checkpoint_load.record_mmap();
 
                 // WATCHDOG / cold-mmap pre-warm — must precede the FIRST GPU eval
                 // of any mmap-backed weight (FP8 dequant in `sanitize_weights`,
@@ -2316,12 +2323,7 @@ pub async fn load_with_thread(
                 if persist_cold
                     && let Some(ctx) = inner.build_cold_tier_context(&model_path, &weights_resident)
                 {
-                    let after_fingerprint = snapshot_shard_identities(path);
-                    if shard_identities_stable(
-                        &shard_snapshot_before_mmap,
-                        &shard_snapshot_at_mmap,
-                        &after_fingerprint,
-                    ) {
+                    if checkpoint_load.stable_after_fingerprint() {
                         inner.attach_cold_tier(ctx, &weights_resident);
                     } else {
                         warn!(
@@ -2439,6 +2441,7 @@ pub async fn load_with_thread(
 /// Parse Qwen3.5 dense config from JSON.
 fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
     let text_cfg = raw.get("text_config");
+    let paged = PagedCacheConfig::from_raw_json(raw);
 
     let gi = |keys: &[&str], default: i32| get_config_i32(raw, text_cfg, keys, default);
     let gf = |keys: &[&str], default: f64| get_config_f64(raw, text_cfg, keys, default);
@@ -2544,25 +2547,16 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
         // made the constructor treat a ~4K-token benchmark fallback as a user
         // override and bypass full-context sizing. Small MTP benchmark pools
         // remain available by setting `paged_cache_memory_mb` explicitly.
-        paged_cache_memory_mb: raw
-            .get("paged_cache_memory_mb")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32),
-        paged_cache_initial_memory_mb: raw
-            .get("paged_cache_initial_memory_mb")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32),
-        paged_block_size: raw
-            .get("paged_block_size")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32),
+        paged_cache_memory_mb: paged.paged_cache_memory_mb,
+        paged_cache_initial_memory_mb: paged.paged_cache_initial_memory_mb,
+        paged_block_size: paged.paged_block_size,
         // Block-paged attention is the production default for Qwen3.5. The
         // explicit config bit and MLX_QWEN35_PAGED_OVERRIDE remain useful for
         // deliberate flat-path diagnostics; sym8 is forced flat later because
         // that storage format is not structurally compatible with the paged
         // compiled core.
         use_block_paged_cache: {
-            let explicit = raw.get("use_block_paged_cache").and_then(|v| v.as_bool());
+            let explicit = paged.use_block_paged_cache;
             let env_override = std::env::var("MLX_QWEN35_PAGED_OVERRIDE").ok();
             let resolved = crate::models::qwen3_5::config::resolve_qwen35_paged_default(
                 explicit,
@@ -2577,7 +2571,7 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
         // unless explicitly present as a bool (the agent overlay / a config
         // override). `MLX_PERSIST_PAGED_CACHE` supplies the env default at load
         // (`resolve_persist_cold`), so this stays a strict tri-state read.
-        persist_paged_cache: raw.get("persist_paged_cache").and_then(|v| v.as_bool()),
+        persist_paged_cache: paged.persist_paged_cache,
         n_mtp_layers: gi(&["mtp_num_hidden_layers", "num_nextn_predict_layers"], 0),
         qwen35_gguf_gdn_layout: raw
             .get("qwen35_gguf_gdn_layout")
@@ -2634,6 +2628,47 @@ pub fn create_random_qwen35_checkpoint<'env>(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn paged_config_reads_root_options_without_losing_absence() {
+        let mut raw = json!({
+            "text_config": {
+                "hidden_size": 64,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 2,
+                "intermediate_size": 128,
+                "num_experts": 2,
+                "paged_cache_memory_mb": 999,
+                "paged_cache_initial_memory_mb": 999,
+                "paged_block_size": 999,
+                "persist_paged_cache": true
+            }
+        });
+        let absent = parse_config(&raw).unwrap();
+        assert_eq!(absent.paged_cache_memory_mb, None);
+        assert_eq!(absent.paged_cache_initial_memory_mb, None);
+        assert_eq!(absent.paged_block_size, None);
+        assert_eq!(absent.persist_paged_cache, None);
+        raw["paged_cache_memory_mb"] = json!(4294967360_u64);
+        raw["paged_cache_initial_memory_mb"] = json!(16);
+        raw["paged_block_size"] = json!(-1);
+        raw["pagedBlockSize"] = json!(32);
+        raw["use_block_paged_cache"] = json!(false);
+        raw["persist_paged_cache"] = json!(false);
+        let config = parse_config(&raw).unwrap();
+        assert_eq!(config.paged_cache_memory_mb, Some(64));
+        assert_eq!(config.paged_cache_initial_memory_mb, Some(16));
+        assert_eq!(config.paged_block_size, None);
+        assert_eq!(config.persist_paged_cache, Some(false));
+        let env_override = std::env::var("MLX_QWEN35_PAGED_OVERRIDE").ok();
+        assert_eq!(
+            config.use_block_paged_cache,
+            crate::models::qwen3_5::config::resolve_qwen35_paged_default(
+                Some(false),
+                env_override.as_deref()
+            )
+        );
+    }
 
     fn packed_projection(rows: i64, weight_cols: i64) -> (MxArray, MxArray, MxArray) {
         (
@@ -3514,7 +3549,7 @@ mod tests {
     /// on `inner`.
     #[test]
     fn dense_lm_head_installs_mode_aware_linearproj() {
-        use super::super::quantized_linear::{
+        use crate::models::quantized_linear::{
             FP8_E4M3_BITS, FP8_E4M3_GROUP_SIZE, FP8_E4M3_MODE, LinearProj, MXFP8_BITS,
             MXFP8_GROUP_SIZE, MXFP8_MODE,
         };
@@ -3767,7 +3802,7 @@ mod tests {
     /// this observes `Some(2.0)` (RED); post-fix `None` (GREEN).
     #[test]
     fn mxfp8_non_site_lm_head_drops_input_amax_dense_loader() {
-        use super::super::quantized_linear::{LinearProj, MXFP8_BITS, MXFP8_GROUP_SIZE};
+        use crate::models::quantized_linear::{LinearProj, MXFP8_BITS, MXFP8_GROUP_SIZE};
         let label = "mxfp8_non_site_lm_head_drops_input_amax_dense_loader";
 
         let untied_cfg = Qwen3_5Config {
@@ -3860,7 +3895,7 @@ mod tests {
     /// full-attention layer (`full_attention_interval = 4`, `(i + 1) % 4 == 0`).
     #[test]
     fn mxfp8_attention_q_proj_threads_input_amax_dense_loader() {
-        use super::super::quantized_linear::{MXFP8_BITS, MXFP8_GROUP_SIZE};
+        use crate::models::quantized_linear::{MXFP8_BITS, MXFP8_GROUP_SIZE};
         const AMAX: f32 = 37.5;
         let label = "mxfp8_attention_q_proj_threads_input_amax_dense_loader";
 

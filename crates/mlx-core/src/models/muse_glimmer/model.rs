@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -9,23 +9,28 @@ use napi_derive::napi;
 use crate::array::MxArray;
 use crate::engine::ThinkingPolicy;
 use crate::engine::backend::{
-    ChatBackend, ChunkSink, DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix, ResetScope,
-    SaveStateArgs, StreamEmitter, TurnOutput, TurnSetup, TurnTokenObserver, WholeTurnArgs,
+    ChatBackend, ChunkSink, DecodeStep, FinalizeArgs, PagedBackend, ResetScope, SaveStateArgs,
+    StreamEmitter, TurnOutput, TurnSetup, TurnTokenObserver, WholeTurnArgs,
 };
 #[cfg(test)]
 use crate::engine::cmd::ChatCmd;
+use crate::engine::paged_epilogue::{
+    FinalTokenPolicy, SimplePagedPrefix, reconcile_paged_surplus, save_paged_token_history,
+};
+use crate::engine::paged_stepper::{EvalPolicy, PagedStepModel, PagedStepper};
 use crate::engine::params::ChatParams;
 use crate::engine::plan::{
     ExecutionPlan, MediaPlan, PagedAttentionPlan, SpeculativeKind, SpeculativePlan,
 };
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
 use crate::model_thread::ModelThread;
+use crate::models::forward as fwd;
 use crate::models::gemma4::dspark::DsparkTap;
 use crate::models::gemma4::layer_cache::Gemma4LayerCache;
 use crate::models::gemma4::model::Gemma4KVCacheCoordinator;
 use crate::models::gemma4::quantized_linear::LinearProj;
-use crate::nn::{Embedding, RMSNorm};
-use crate::stream::{Stream, StreamContext};
+use crate::nn::{Embedding, RMSNorm, rms_norm_unscaled};
+use crate::stream::Stream;
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::tools::ToolCallResult;
 use crate::transformer::LayerKVCacheRoute;
@@ -763,17 +768,6 @@ impl MuseGlimmerInner {
             .map_or(Ok(0), |paged| paged.coordinator.release_request_all(seq_id))
     }
 
-    fn scaleless_rms_norm(&self, x: &MxArray) -> Result<MxArray> {
-        let handle = unsafe {
-            mlx_sys::mlx_fast_rms_norm(
-                x.as_raw_ptr(),
-                std::ptr::null_mut(),
-                self.config.text_config.rms_norm_eps,
-            )
-        };
-        MxArray::from_handle(handle, "muse_glimmer_embedding_norm")
-    }
-
     fn project_logits(&self, hidden: &MxArray, last_only: bool) -> Result<MxArray> {
         let hidden = if last_only {
             let seq_len = hidden.shape_at(1)?;
@@ -782,13 +776,12 @@ impl MuseGlimmerInner {
             hidden.clone()
         };
         let normed = self.final_norm.forward(&hidden)?;
-        let logits = match self.lm_head.as_ref() {
-            Some(lm_head) => lm_head.forward(&normed)?,
-            None => self.embed_tokens.as_linear(&normed)?,
-        }
-        .mul_scalar(self.config.text_config.output_multiplier as f64)?;
-        let cap = self.config.text_config.final_logit_softcapping as f64;
-        logits.div_scalar(cap)?.tanh()?.mul_scalar(cap)
+        let logits = fwd::project_logits(&normed, self.lm_head.as_ref(), &self.embed_tokens)?;
+        fwd::shape_logits(
+            &logits,
+            Some(self.config.text_config.output_multiplier as f64),
+            Some(self.config.text_config.final_logit_softcapping as f64),
+        )
     }
 
     /// Target forward with optional post-layer hidden taps for DFlash.
@@ -798,14 +791,20 @@ impl MuseGlimmerInner {
         tap_layers: &[usize],
         last_only: bool,
     ) -> Result<(MxArray, Vec<MxArray>)> {
-        let mut h = self.scaleless_rms_norm(&self.embed_tokens.forward(input_ids)?)?;
         let mut taps = Vec::with_capacity(tap_layers.len());
-        for (index, layer) in self.layers.iter().enumerate() {
-            h = layer.forward(&h, &mut self.caches[index])?;
-            if tap_layers.contains(&index) {
-                taps.push(h.clone());
-            }
-        }
+        let h = fwd::forward_pre_norm_with(
+            input_ids,
+            |ids| {
+                rms_norm_unscaled(
+                    &self.embed_tokens.forward(ids)?,
+                    self.config.text_config.rms_norm_eps,
+                )
+            },
+            &mut self.layers,
+            &mut self.caches,
+            |layer, h, caches, i| layer.forward(h, &mut caches[i]),
+            Some((tap_layers, &mut taps)),
+        )?;
 
         let logits = self.project_logits(&h, last_only)?;
         Ok((logits, taps))
@@ -825,28 +824,19 @@ impl MuseGlimmerInner {
     }
 
     fn chunked_prefill(&mut self, prompt: &MxArray, stream: Stream) -> Result<MxArray> {
-        let total = prompt.shape_at(1)?;
-        let mut offset = 0;
-        while total - offset > PREFILL_STEP_SIZE {
-            if self
-                .turn_cancel
-                .as_ref()
-                .is_some_and(|flag| flag.load(Ordering::Relaxed))
-            {
-                return Err(Error::from_reason("prefill cancelled"));
-            }
-            let chunk = prompt.slice_axis(1, offset, offset + PREFILL_STEP_SIZE)?;
-            {
-                let _stream = StreamContext::new(stream);
-                let _ = self.forward(&chunk)?;
-            }
-            self.eval_caches()?;
-            crate::array::clear_cache();
-            offset += PREFILL_STEP_SIZE;
-        }
-        let remaining = prompt.slice_axis(1, offset, total)?;
-        let _stream = StreamContext::new(stream);
-        self.forward(&remaining)
+        fwd::chunked_prefill(
+            self,
+            prompt,
+            stream,
+            PREFILL_STEP_SIZE,
+            // muse_glimmer's flat prefill polls only the looped-chunk
+            // boundaries — it never gained the final-remainder poll the
+            // other families added.
+            false,
+            |inner: &MuseGlimmerInner| inner.turn_cancel.as_deref(),
+            |inner, chunk, _is_final| inner.forward(chunk),
+            |inner| fwd::eval_caches_and_clear(&inner.caches),
+        )
     }
 
     pub(crate) fn set_active_paged_owner(&mut self, seq_id: SeqId) {
@@ -890,7 +880,10 @@ impl MuseGlimmerInner {
             .record_tokens_all(self.active_paged_seq, tokens)
             .map_err(Error::from_reason)?;
         let ids = MxArray::from_uint32(tokens, &[1, tokens.len() as i64])?;
-        let mut hidden = self.scaleless_rms_norm(&self.embed_tokens.forward(&ids)?)?;
+        let mut hidden = rms_norm_unscaled(
+            &self.embed_tokens.forward(&ids)?,
+            self.config.text_config.rms_norm_eps,
+        )?;
         for index in 0..self.layers.len() {
             let layer: &MuseGlimmerDecoderLayer = unsafe { &*self.layers.as_ptr().add(index) };
             let (route, window) = {
@@ -1054,7 +1047,10 @@ impl MuseGlimmerInner {
         self.decode_timing = None;
         let ids = rows.iter().map(|&(_, token)| token).collect::<Vec<_>>();
         let input = MxArray::from_uint32(&ids, &[rows.len() as i64, 1])?;
-        let mut hidden = self.scaleless_rms_norm(&self.embed_tokens.forward(&input)?)?;
+        let mut hidden = rms_norm_unscaled(
+            &self.embed_tokens.forward(&input)?,
+            self.config.text_config.rms_norm_eps,
+        )?;
         let text = &self.config.text_config;
         let eligible = rows.len() == 1
             && text.head_dim == 128
@@ -1158,33 +1154,35 @@ fn validate_paged_tap_layer_ids(tap: Option<&DsparkTap<'_>>, num_layers: usize) 
     Ok(())
 }
 
+/// Muse paged decode state; wrapped by [`PagedStepper`] for the
+/// `DecodeStep` impl.
 pub(crate) struct MusePagedDecode<'a> {
     inner: &'a mut MuseGlimmerInner,
 }
 
-impl DecodeStep for MusePagedDecode<'_> {
-    fn forward_with_token(
-        &mut self,
-        _input_ids: &MxArray,
-        token_id: u32,
-    ) -> Result<(MxArray, bool)> {
-        Ok((
-            self.inner
-                .run_paged_decode_step_for(self.inner.active_paged_seq, token_id)?
-                .squeeze(Some(&[1]))?,
-            false,
-        ))
+impl PagedStepModel for MusePagedDecode<'_> {
+    /// `AsyncTokenAndLogits`: schedule the sampled token AND the logits for
+    /// async eval unconditionally; the loop-top `y.eval()` forces
+    /// materialization next iteration.
+    const EVAL: EvalPolicy = EvalPolicy::AsyncTokenAndLogits;
+    const FINAL_TOKEN_POLICY: FinalTokenPolicy = FinalTokenPolicy::KeepAllOnLength;
+
+    fn paged_step(&mut self, token_id: u32) -> Result<MxArray> {
+        self.inner
+            .run_paged_decode_step_for(self.inner.active_paged_seq, token_id)
     }
 
-    fn forward(&mut self, input_ids: &MxArray) -> Result<(MxArray, bool)> {
-        self.forward_with_token(input_ids, input_ids.item_at_int32(0)? as u32)
+    fn maintain_cache(&mut self, step: i32) {
+        // Muse's paged stepper never overrode `maintain_cache`, so it runs
+        // the FLAT every-256-step `clear_cache` — NOT the paged cadence
+        // (`maybe_clear_cache_for_paged_step`, 1024 default) the other
+        // families use. Preserved verbatim for zero behavior change.
+        if (step + 1) % 256 == 0 {
+            crate::array::clear_cache();
+        }
     }
 
-    fn eval_step(&mut self, next_token: &MxArray, logits: &MxArray, _budget_forced: bool) {
-        MxArray::async_eval_arrays(&[next_token, logits]);
-    }
-
-    fn materialize_final(&mut self, token_id: u32) -> Result<()> {
+    fn materialize_final_token(&mut self, token_id: u32) -> Result<()> {
         let _ = self
             .inner
             .run_paged_decode_step_for(self.inner.active_paged_seq, token_id)?;
@@ -1192,20 +1190,9 @@ impl DecodeStep for MusePagedDecode<'_> {
     }
 }
 
-pub(crate) struct MusePrefixState {
-    effective_cached_prefix_len: usize,
-    suffix_len: usize,
-}
-
-impl PagedPrefix for MusePrefixState {
-    fn effective_cached_prefix_len(&self) -> usize {
-        self.effective_cached_prefix_len
-    }
-
-    fn suffix_len(&self) -> usize {
-        self.suffix_len
-    }
-}
+/// Muse paged prefix state — the shared two-usize shape
+/// (`engine::paged_epilogue`); the coordinator resolves the split.
+pub(crate) type MusePrefixState = SimplePagedPrefix;
 
 pub(crate) struct MuseGlimmerDecode<'a> {
     inner: &'a mut MuseGlimmerInner,
@@ -1341,7 +1328,7 @@ impl StreamEmitter for MuseGlimmerEmitter {
 
 impl PagedBackend for MuseGlimmerInner {
     type PagedDecode<'a>
-        = MusePagedDecode<'a>
+        = PagedStepper<MusePagedDecode<'a>>
     where
         Self: 'a;
     type PrefixState = MusePrefixState;
@@ -1383,7 +1370,7 @@ impl PagedBackend for MuseGlimmerInner {
     }
 
     fn begin_paged_decode(&mut self) -> Result<Self::PagedDecode<'_>> {
-        Ok(MusePagedDecode { inner: self })
+        Ok(PagedStepper(MusePagedDecode { inner: self }))
     }
 
     fn finalize_paged_turn(&mut self, reuse_cache: bool, cache_salt: u64) {
@@ -1437,18 +1424,14 @@ impl PagedBackend for MuseGlimmerInner {
         keep_all: bool,
         reuse_cache: bool,
     ) -> Result<()> {
-        if reuse_cache {
-            let mut history = save_tokens.to_vec();
-            let generated = if keep_all || generated.is_empty() {
-                generated
-            } else {
-                &generated[..generated.len() - 1]
-            };
-            history.extend_from_slice(generated);
-            self.cached_token_history = history;
-        } else {
-            self.cached_token_history.clear();
-        }
+        save_paged_token_history(
+            save_tokens,
+            generated,
+            keep_all,
+            reuse_cache,
+            FinalTokenPolicy::KeepAllOnLength,
+            &mut self.cached_token_history,
+        );
         Ok(())
     }
 
@@ -1458,12 +1441,6 @@ impl PagedBackend for MuseGlimmerInner {
         generated: &[u32],
         keep_all: bool,
     ) -> bool {
-        let generated_len = if keep_all || generated.is_empty() {
-            generated.len()
-        } else {
-            generated.len() - 1
-        };
-        let target = prompt_len.saturating_add(generated_len);
         let Some(paged) = self.paged.as_mut() else {
             return false;
         };
@@ -1473,12 +1450,16 @@ impl PagedBackend for MuseGlimmerInner {
         else {
             return false;
         };
-        let surplus = (current as usize).saturating_sub(target);
-        surplus == 0
-            || paged
-                .coordinator
-                .rollback_last_tokens_all(self.active_paged_seq, surplus as u32)
-                .is_ok()
+        let seq_id = self.active_paged_seq;
+        reconcile_paged_surplus(
+            current as usize,
+            prompt_len,
+            generated.len(),
+            keep_all,
+            FinalTokenPolicy::KeepAllOnLength,
+            |n| paged.coordinator.rollback_last_tokens_all(seq_id, n),
+        )
+        .is_ok()
     }
 }
 
@@ -1567,33 +1548,23 @@ impl ChatBackend for MuseGlimmerInner {
     }
 
     fn save_cache_state(&mut self, args: SaveStateArgs<'_>) {
-        if args.is_delta || args.reuse_cache {
-            let mut history = args.save_tokens.to_vec();
-            if !args.generated_tokens.is_empty() {
-                history.extend_from_slice(
-                    &args.generated_tokens[..args.generated_tokens.len().saturating_sub(1)],
-                );
-            }
-            self.cached_token_history = history;
-        } else {
+        if !fwd::save_flat_token_history(
+            args.save_tokens,
+            args.generated_tokens,
+            false,
+            args.is_delta || args.reuse_cache,
+            FinalTokenPolicy::AlwaysDrop,
+            &mut self.cached_token_history,
+        ) {
             self.caches = init_caches(&self.config);
-            self.cached_token_history.clear();
         }
     }
 
     fn eval_caches(&self) -> Result<()> {
-        let mut arrays = Vec::new();
-        for cache in &self.caches {
-            if let Some((k, v)) = cache.get_cached_kv() {
-                arrays.push(k);
-                arrays.push(v);
-            }
-        }
-        let refs: Vec<&MxArray> = arrays.iter().collect();
-        if !refs.is_empty() {
-            MxArray::eval_arrays(&refs)?;
-        }
-        Ok(())
+        // `collect_cache_arrays` materializes the same underlying K/V the
+        // prior `get_cached_kv` slices did (the slice nodes were views
+        // into the same lazy buffers).
+        fwd::eval_layer_caches(&self.caches)
     }
 
     fn prefill(&mut self, prompt_tokens: &[u32], stream: Stream) -> Result<MxArray> {

@@ -1,39 +1,31 @@
 /**
  * Pins the dashboard's family label against the lm registry's own detection
  * (`matchFamily` over `MODEL_FAMILY_DATA` in `packages/lm/src/family-data.ts`).
- * The fixtures are a deliberate hand-held mirror of the registry rows: every
- * raw alias labels its canonical family id, the architecture probes fire in
- * registry declaration order (gemma4 unified, muse, harrier, nemotron), and
- * shapes the loader rejects (unknown model_type, malformed architectures) keep
- * the dashboard's raw-string fallback instead of throwing.
+ * Alias fixtures are derived from the registry rows themselves so a new family
+ * is covered automatically (the alias→family map's literal pin lives in
+ * `model-loader-registry.test.ts`); the architecture-probe and fallback cases
+ * below stay hand-written because they pin probe order (gemma4 unified, muse,
+ * harrier, nemotron) and the fail-closed shapes the loader must not throw on.
  */
 
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { MODEL_FAMILY_DATA } from '@mlx-node/lm/family-data';
 import { afterAll, beforeAll, describe, expect, it } from 'vite-plus/test';
 
 import { discoverLocalModels } from '../src/models.js';
 
 const UNIFIED_GEMMA = 'Gemma4UnifiedForConditionalGeneration';
 
+// Raw config aliases → canonical family id, one row per registry alias.
+const ALIAS_CASES = MODEL_FAMILY_DATA.flatMap((row) =>
+  row.match.rawModelTypes.map((raw) => [`alias-${raw}`, { model_type: raw }, row.id] as const),
+);
+
 const LABEL_CASES = [
-  // Raw config aliases → canonical family id, one row per registry alias.
-  ['alias-gemma4', { model_type: 'gemma4' }, 'gemma4'],
-  ['alias-gemma4-text', { model_type: 'gemma4_text' }, 'gemma4'],
-  ['alias-gemma4-unified', { model_type: 'gemma4_unified' }, 'gemma4'],
-  ['alias-muse-glimmer', { model_type: 'muse_glimmer' }, 'muse_glimmer'],
-  ['alias-muse-glimmer-text', { model_type: 'muse_glimmer_text' }, 'muse_glimmer'],
-  ['alias-harrier', { model_type: 'harrier' }, 'harrier'],
-  ['alias-qwen3', { model_type: 'qwen3' }, 'qwen3'],
-  ['alias-qwen3-5', { model_type: 'qwen3_5' }, 'qwen3_5'],
-  ['alias-qwen3-5-moe', { model_type: 'qwen3_5_moe' }, 'qwen3_5_moe'],
-  ['alias-lfm2', { model_type: 'lfm2' }, 'lfm2'],
-  ['alias-lfm2-moe', { model_type: 'lfm2_moe' }, 'lfm2_moe'],
-  ['alias-nemotron-h', { model_type: 'nemotron_h' }, 'nemotron_h'],
-  ['alias-internvl-chat', { model_type: 'internvl_chat' }, 'internvl_chat'],
-  ['alias-qianfan-ocr', { model_type: 'qianfan-ocr' }, 'qianfan-ocr'],
+  ...ALIAS_CASES,
 
   // Architecture probes, in registry declaration order and precedence.
   ['probe-gemma-missing-type', { architectures: [UNIFIED_GEMMA] }, 'gemma4'],
@@ -56,6 +48,7 @@ const LABEL_CASES = [
   ['probe-harrier-default-base', { architectures: ['Qwen3Model'] }, 'harrier'],
   ['probe-harrier-non-string-entries', { model_type: 'qwen3', architectures: ['Qwen3Model', 42] }, 'harrier'],
   ['probe-nemotron-arch', { model_type: 'nemotron', architectures: ['NemotronHForCausalLM'] }, 'nemotron_h'],
+  ['probe-k2-arch', { model_type: 'unknown', architectures: ['K2HorizonForCausalLM'] }, 'k2_horizon'],
 
   // Loader defaults and the dashboard's raw-string fallback for shapes the
   // loader fails closed on (a viewer must label, never throw).

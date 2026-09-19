@@ -8,11 +8,13 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
-use crate::cold_tier::{resolve_persist_cold, shard_identities_stable, snapshot_shard_identities};
+use crate::cold_tier::{CheckpointLoadGuard, resolve_persist_cold};
 use crate::engine::persistence::{
+    KeyRule, RenameSpec, WRAPPER_STRIP_PREFIXES, apply_rename_spec, cast_f32_tensors_to_bf16,
     dequant_fp8_weights, get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
     prewarm_checkpoint_pages,
 };
+use crate::models::paged_config::PagedCacheConfig;
 use crate::models::quant_dispatch::{
     PlainFp8Residency, default_per_layer_quant, defer_plain_fp8_materialization,
     ensure_affine_biases_present, ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
@@ -137,6 +139,7 @@ fn parse_config_with_load_metadata(model_path: &Path) -> Result<ParsedGemma4Conf
         .map_err(|e| Error::from_reason(format!("Failed to read config.json: {}", e)))?;
     let raw: Value = serde_json::from_str(&raw_str)
         .map_err(|e| Error::from_reason(format!("Failed to parse config.json: {}", e)))?;
+    let paged = PagedCacheConfig::from_raw_json(&raw);
 
     // Gemma4 HF configs wrap text params in a `text_config` sub-dict
     let text_cfg = raw.get("text_config");
@@ -362,18 +365,11 @@ fn parse_config_with_load_metadata(model_path: &Path) -> Result<ParsedGemma4Conf
             None
         },
 
-        // Paged-attention knobs — opt-in, default to None so existing
-        // checkpoints without these keys load unchanged.
-        paged_cache_memory_mb: raw
-            .get("paged_cache_memory_mb")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32),
-        paged_block_size: raw
-            .get("paged_block_size")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32),
-        use_block_paged_cache: raw.get("use_block_paged_cache").and_then(|v| v.as_bool()),
-        persist_paged_cache: raw.get("persist_paged_cache").and_then(|v| v.as_bool()),
+        // Preserve absent options for the model's load-time defaults.
+        paged_cache_memory_mb: paged.paged_cache_memory_mb,
+        paged_block_size: paged.paged_block_size,
+        use_block_paged_cache: paged.use_block_paged_cache,
+        persist_paged_cache: paged.persist_paged_cache,
     };
 
     Ok(ParsedGemma4Config {
@@ -925,6 +921,67 @@ fn validate_required_weights(
     Ok(())
 }
 
+/// Strip `.linear.` from vision weight keys. ClippableLinear stores weights
+/// as `*.linear.weight` in the checkpoint, but we want `*.weight` for lookup.
+static GEMMA4_VISION_LINEAR_RENAMES: &[KeyRule] = &[
+    KeyRule::ReplaceIfPrefixed {
+        scope: "vision_tower.",
+        from: ".linear.weight",
+        to: ".weight",
+    },
+    KeyRule::ReplaceIfPrefixed {
+        scope: "embed_vision.",
+        from: ".linear.weight",
+        to: ".weight",
+    },
+];
+
+/// Audio ENCODER weights are dropped always — the unified audio path is
+/// encoder-free, so a real `audio_tower.`/`audio_encoder.` would be a
+/// non-unified mel encoder we do not implement.
+static GEMMA4_AUDIO_ENCODER_DROPS: &[KeyRule] = &[
+    KeyRule::DropPrefix("audio_tower."),
+    KeyRule::DropPrefix("audio_encoder."),
+];
+
+/// Vision prefixes dropped when NEITHER vision path is active. The SigLIP
+/// tower keys (`vision_tower.`/`vision_encoder.`/`multi_modal_projector.`)
+/// belong to the dense gemma4 family; the unified checkpoint instead ships
+/// `vision_embedder.` + `embed_vision.` (`embed_vision.` is shared by both
+/// paths). When a text-only load has neither config, every vision prefix is
+/// dropped so the load does not error on an unexpected weight.
+static GEMMA4_VISION_DROPS: &[KeyRule] = &[
+    KeyRule::DropPrefix("vision_tower."),
+    KeyRule::DropPrefix("vision_encoder."),
+    KeyRule::DropPrefix("vision_embedder."),
+    KeyRule::DropPrefix("multi_modal_projector."),
+    KeyRule::DropPrefix("embed_vision."),
+];
+
+/// PLE weights dropped when PLE is not enabled for this model.
+static GEMMA4_PLE_DROPS: &[KeyRule] = &[
+    KeyRule::DropPrefix("embed_tokens_per_layer."),
+    KeyRule::DropPrefix("per_layer_model_projection."),
+    KeyRule::DropPrefix("per_layer_projection_norm."),
+    KeyRule::DropContains(".per_layer_input_gate."),
+    KeyRule::DropContains(".per_layer_projection."),
+    KeyRule::DropContains(".post_per_layer_input_norm."),
+];
+
+/// Clip params (`input_min/max`, `output_min/max`) are dropped for TEXT
+/// weights but kept for `vision_tower.*` (ClippableLinear needs them). The
+/// `KeepIfPrefix` short-circuits the clip drops for vision keys; it sits
+/// AFTER the PLE drops because the original evaluated PLE drops on
+/// `vision_tower.*` keys too — only the clip drops carried the
+/// `!vision_tower.` guard.
+static GEMMA4_CLIP_DROPS: &[KeyRule] = &[
+    KeyRule::KeepIfPrefix("vision_tower."),
+    KeyRule::DropContains("input_max"),
+    KeyRule::DropContains("input_min"),
+    KeyRule::DropContains("output_max"),
+    KeyRule::DropContains("output_min"),
+];
+
 /// Sanitize HuggingFace weight keys to internal format.
 ///
 /// Handles:
@@ -936,99 +993,41 @@ pub fn sanitize_weights(
     params: &mut HashMap<String, MxArray>,
     config: &Gemma4Config,
 ) -> Result<HashMap<String, MxArray>> {
-    let mut sanitized = HashMap::new();
-
-    let keys: Vec<String> = params.keys().cloned().collect();
-    for key in keys {
-        let value = params.remove(&key).unwrap();
-
-        // Strip prefixes — supports both HF format and mlx-lm converted format:
-        // HF: model.language_model.model.layers.* or model.layers.*
-        // mlx-lm converted: language_model.model.layers.*
-        let clean_key = key
-            .strip_prefix("model.language_model.model.")
-            .or_else(|| key.strip_prefix("model.language_model."))
-            .or_else(|| key.strip_prefix("language_model.model."))
-            .or_else(|| key.strip_prefix("language_model."))
-            .or_else(|| key.strip_prefix("model."))
-            .unwrap_or(&key)
-            .to_string();
-
-        // Strip `.linear.` from vision weight keys. ClippableLinear stores weights
-        // as `*.linear.weight` in the checkpoint, but we want `*.weight` for lookup.
-        let clean_key =
-            if clean_key.starts_with("vision_tower.") || clean_key.starts_with("embed_vision.") {
-                clean_key.replace(".linear.weight", ".weight")
-            } else {
-                clean_key
-            };
-
-        // Skip audio ENCODER weights (always — the unified audio path is
-        // encoder-free, so a real `audio_tower.`/`audio_encoder.` would be a
-        // non-unified mel encoder we do not implement).
-        if clean_key.starts_with("audio_tower.") || clean_key.starts_with("audio_encoder.") {
-            continue;
-        }
-        // The unified checkpoint ships `embed_audio.*` (the raw-window
-        // projection). Keep it only when the checkpoint declares an
-        // `audio_config`; otherwise drop it so non-unified loads stay
-        // byte-identical and do not error on an unexpected weight.
-        if !config.has_audio && clean_key.starts_with("embed_audio.") {
-            continue;
-        }
-
-        // Skip vision weights only when neither vision path is active. The
-        // SigLIP tower keys (`vision_tower.`/`vision_encoder.`/
-        // `multi_modal_projector.`) belong to the dense gemma4 family; the
-        // unified checkpoint instead ships `vision_embedder.` + `embed_vision.`.
-        // `embed_vision.` is shared by both paths. When a text-only load has
-        // neither config, every vision prefix is dropped so the load does not
-        // error on an unexpected weight.
-        if config.vision_config.is_none()
-            && config.unified_vision_config.is_none()
-            && (clean_key.starts_with("vision_tower.")
-                || clean_key.starts_with("vision_encoder.")
-                || clean_key.starts_with("vision_embedder.")
-                || clean_key.starts_with("multi_modal_projector.")
-                || clean_key.starts_with("embed_vision."))
-        {
-            continue;
-        }
-
-        // Skip rotary embeddings (computed at runtime)
-        if clean_key.contains("self_attn.rotary_emb") {
-            continue;
-        }
-
-        // Skip clip params for TEXT weights (not used). Keep for VISION weights
-        // (ClippableLinear needs input_min/max, output_min/max).
-        if (clean_key.contains("input_max")
-            || clean_key.contains("input_min")
-            || clean_key.contains("output_max")
-            || clean_key.contains("output_min"))
-            && !clean_key.starts_with("vision_tower.")
-        {
-            continue;
-        }
-
-        // Skip PLE weights when PLE is not enabled for this model.
-        if !config.per_layer_input_embeds
-            && (clean_key.starts_with("embed_tokens_per_layer.")
-                || clean_key.starts_with("per_layer_model_projection.")
-                || clean_key.starts_with("per_layer_projection_norm.")
-                || clean_key.contains(".per_layer_input_gate.")
-                || clean_key.contains(".per_layer_projection.")
-                || clean_key.contains(".post_per_layer_input_norm."))
-        {
-            continue;
-        }
-
-        // mlx-lm nn.RMSNorm passes weight directly to mx.fast.rms_norm (no +1 offset).
-        // The checkpoint stores full effective values (initialized to ones in mlx-lm).
-        // Our Rust RMSNorm::forward also passes weight directly — no adjustment needed.
-
-        sanitized.insert(clean_key, value);
+    // Declarative key rewrite — supports both HF format and mlx-lm converted
+    // format: HF `model.language_model.model.layers.*` or `model.layers.*`,
+    // mlx-lm converted `language_model.model.layers.*` (the shared
+    // `WRAPPER_STRIP_PREFIXES` chain, longest-first).
+    let mut rules: Vec<KeyRule> = Vec::with_capacity(18);
+    rules.extend_from_slice(GEMMA4_VISION_LINEAR_RENAMES);
+    rules.extend_from_slice(GEMMA4_AUDIO_ENCODER_DROPS);
+    // The unified checkpoint ships `embed_audio.*` (the raw-window
+    // projection). Keep it only when the checkpoint declares an
+    // `audio_config`; otherwise drop it so non-unified loads stay
+    // byte-identical and do not error on an unexpected weight.
+    if !config.has_audio {
+        rules.push(KeyRule::DropPrefix("embed_audio."));
     }
+    if config.vision_config.is_none() && config.unified_vision_config.is_none() {
+        rules.extend_from_slice(GEMMA4_VISION_DROPS);
+    }
+    // Rotary embeddings are computed at runtime.
+    rules.push(KeyRule::DropContains("self_attn.rotary_emb"));
+    if !config.per_layer_input_embeds {
+        rules.extend_from_slice(GEMMA4_PLE_DROPS);
+    }
+    rules.extend_from_slice(GEMMA4_CLIP_DROPS);
+
+    // mlx-lm nn.RMSNorm passes weight directly to mx.fast.rms_norm (no +1 offset).
+    // The checkpoint stores full effective values (initialized to ones in mlx-lm).
+    // Our Rust RMSNorm::forward also passes weight directly — no adjustment needed.
+    let mut sanitized = apply_rename_spec(
+        std::mem::take(params),
+        &RenameSpec {
+            strip_prefixes: WRAPPER_STRIP_PREFIXES,
+            rules: &rules,
+            ..Default::default()
+        },
+    )?;
 
     // Handle tie_word_embeddings
     if config.tie_word_embeddings {
@@ -1050,30 +1049,9 @@ pub fn sanitize_weights(
     // are read from config.json AFTER sanitize runs, so per-layer modes are
     // not available here. Affine `.scales` (sibling weight is packed Uint32)
     // keep today's bf16 cast.
-    let sym8_scale_keys: std::collections::HashSet<String> = sanitized
-        .keys()
-        .filter_map(|k| k.strip_suffix(".scales").map(|p| (k, p)))
-        .filter(|(_, prefix)| {
-            sanitized
-                .get(&format!("{prefix}.weight"))
-                .and_then(|w| w.dtype().ok())
-                == Some(DType::Int8)
-        })
-        .map(|(k, _)| k.clone())
-        .collect();
-    for (key, value) in sanitized.iter_mut() {
-        if key.starts_with("vision_tower.") || key.starts_with("embed_vision.") {
-            continue;
-        }
-        if sym8_scale_keys.contains(key) {
-            continue;
-        }
-        if value.dtype().is_ok_and(|dt| dt == DType::Float32)
-            && let Ok(casted) = value.astype(DType::BFloat16)
-        {
-            *value = casted;
-        }
-    }
+    cast_f32_tensors_to_bf16(&mut sanitized, |k| {
+        k.starts_with("vision_tower.") || k.starts_with("embed_vision.")
+    });
 
     Ok(sanitized)
 }
@@ -2628,19 +2606,11 @@ impl Gemma4Inner {
         // fail-closed gate before this loader attaches persistence.
         let persist_cold =
             resolve_persist_cold("gemma4", persist_env.as_deref(), config.persist_paged_cache);
-        let shard_snapshot_before_mmap = if persist_cold {
-            snapshot_shard_identities(path)
-        } else {
-            None
-        };
+        let mut checkpoint_load = CheckpointLoadGuard::before_mmap(path, persist_cold);
 
         let mut params = load_all_safetensors(path, should_load_media_sidecar(&config))?;
 
-        let shard_snapshot_at_mmap = if persist_cold {
-            snapshot_shard_identities(path)
-        } else {
-            None
-        };
+        checkpoint_load.record_mmap();
 
         // WATCHDOG / cold-mmap pre-warm — must precede the FIRST GPU eval
         // of any mmap-backed weight (FP8 dequant in `dequant_fp8_weights`,
@@ -2877,12 +2847,7 @@ impl Gemma4Inner {
             // attaching it also arms the reconcile-down restore and the
             // auxiliary-state obligation the sliding prefill discharges.
             if let Some(ctx) = inner.build_cold_tier_context(model_path, &weights_resident) {
-                let after_fingerprint = snapshot_shard_identities(path);
-                if shard_identities_stable(
-                    &shard_snapshot_before_mmap,
-                    &shard_snapshot_at_mmap,
-                    &after_fingerprint,
-                ) {
+                if checkpoint_load.stable_after_fingerprint() {
                     inner.attach_cold_tier(ctx, &weights_resident);
                 } else {
                     tracing::warn!(
@@ -3204,6 +3169,36 @@ mod tests {
         .expect("write config.json");
         let cfg = parse_config(&dir).expect("parse_config");
         (cfg, dir)
+    }
+
+    #[test]
+    fn paged_config_reads_root_options_without_nested_fallback() {
+        let mut raw = serde_json::json!({
+            "text_config": {
+                "hidden_size": 64,
+                "paged_cache_memory_mb": 999,
+                "paged_block_size": 32,
+                "use_block_paged_cache": true,
+                "persist_paged_cache": true
+            }
+        });
+        let (absent, dir) = parse_config_from_json(raw.clone());
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(absent.paged_cache_memory_mb, None);
+        assert_eq!(absent.paged_block_size, None);
+        assert_eq!(absent.use_block_paged_cache, None);
+        assert_eq!(absent.persist_paged_cache, None);
+        raw["paged_cache_memory_mb"] = serde_json::json!(4294967360_u64);
+        raw["paged_block_size"] = serde_json::json!(-1);
+        raw["pagedBlockSize"] = serde_json::json!(32);
+        raw["use_block_paged_cache"] = serde_json::json!(false);
+        raw["persist_paged_cache"] = serde_json::json!(false);
+        let (config, dir) = parse_config_from_json(raw);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(config.paged_cache_memory_mb, Some(64));
+        assert_eq!(config.paged_block_size, None);
+        assert_eq!(config.use_block_paged_cache, Some(false));
+        assert_eq!(config.persist_paged_cache, Some(false));
     }
 
     /// The unified 12B checkpoint advertises `model_type == "gemma4_unified"`

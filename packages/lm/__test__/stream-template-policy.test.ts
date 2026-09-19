@@ -6,24 +6,14 @@ const tokenizerMocks = vi.hoisted(() => ({
   fromPretrained: vi.fn(),
 }));
 
-vi.mock('@mlx-node/core', () => {
-  class UnusedNativeModel {}
-  return {
-    Gemma4Model: UnusedNativeModel,
-    Lfm2Model: UnusedNativeModel,
-    MuseGlimmerModel: UnusedNativeModel,
-    NemotronHModel: UnusedNativeModel,
-    Qwen3Model: UnusedNativeModel,
-    Qwen35Model: UnusedNativeModel,
-    Qwen35MoeModel: UnusedNativeModel,
-    Qwen4ExpModel: UnusedNativeModel,
-    Qwen3Tokenizer: {
-      fromPretrained: tokenizerMocks.fromPretrained,
-    },
-  };
-});
+vi.mock('@mlx-node/core', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@mlx-node/core')>()),
+  Qwen3Tokenizer: {
+    fromPretrained: tokenizerMocks.fromPretrained,
+  },
+}));
 
-import { makeStreamingModel } from '../src/stream.js';
+import { K2HorizonModel, makeStreamingModel } from '../src/stream.js';
 
 class NativeStreamingStub {
   static async load(_modelPath: string): Promise<NativeStreamingStub> {
@@ -126,6 +116,20 @@ describe('makeStreamingModel template content policy', () => {
       undefined,
       'low',
     );
+  });
+
+  it.each([
+    ['none', 'low'],
+    ['minimal', 'low'],
+    ['low', 'low'],
+    ['medium', 'medium'],
+    ['high', 'high'],
+    ['xhigh', 'high'],
+    ['max', 'high'],
+    [undefined, undefined],
+    ['bogus', undefined],
+  ] as const)('normalizes K2 reasoning effort %s to %s', (effort, expected) => {
+    expect(K2HorizonModel.prototype.normalizeReasoningEffort(effort)).toBe(expected);
   });
 
   it('uses the native asset directory after a direct GGUF load', async () => {

@@ -28,7 +28,7 @@ use crate::transformer::paged_policy::{
 use napi::bindgen_prelude::*;
 
 use super::config::Qwen3_5Config;
-use super::quantized_linear::{LinearProj, QuantizedLinear};
+use crate::models::quantized_linear::{LinearProj, QuantizedLinear};
 
 /// Qwen3.5 full attention with gating and partial RoPE.
 ///
@@ -592,16 +592,14 @@ impl Qwen3_5Attention {
 
         // Paged-pool layout: `[num_tokens, num_kv_heads, head_dim]`.
         // [B, H_kv, T, D] -> [B, T, H_kv, D] -> [B*T, H_kv, D].
-        let keys_paged = keys_bhtd.transpose(Some(&[0, 2, 1, 3]))?.reshape(&[
-            batch * seq_len,
+        let (keys_paged, values_paged) = crate::models::attention_core::paged_kv_layout(
+            &keys_bhtd,
+            &values_bhtd,
+            batch,
+            seq_len,
             self.num_kv_heads as i64,
             self.head_dim as i64,
-        ])?;
-        let values_paged = values_bhtd.transpose(Some(&[0, 2, 1, 3]))?.reshape(&[
-            batch * seq_len,
-            self.num_kv_heads as i64,
-            self.head_dim as i64,
-        ])?;
+        )?;
 
         let trace_enabled = inference_trace_enabled();
         let inference_info_enabled =
@@ -2318,7 +2316,7 @@ mod tests {
                 Some(additive_bias.clone()),
                 32,
                 4,
-                super::super::quantized_linear::DEFAULT_QUANT_MODE.to_string(),
+                crate::models::quantized_linear::DEFAULT_QUANT_MODE.to_string(),
             )
         };
         let mut block = Qwen3_5Attention::new(&cfg)?;

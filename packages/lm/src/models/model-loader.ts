@@ -7,6 +7,7 @@ import {
   Gemma4Model as NativeGemma4Model,
   ggufArchitecture,
   HarrierModel,
+  K2HorizonModel as NativeK2HorizonModel,
   Lfm2Model as NativeLfm2Model,
   MuseGlimmerModel as NativeMuseGlimmerModel,
   NemotronHModel as NativeNemotronHModel,
@@ -23,6 +24,7 @@ import { familyDataFor, type ModelType, type TrainableFamilyId } from '../family
 import { detectModelType as detectLocalModelType } from '../model-detection.js';
 import {
   Gemma4Model,
+  K2HorizonModel,
   Lfm2Model,
   MuseGlimmerModel,
   NemotronHModel,
@@ -136,6 +138,10 @@ const LOADER_BINDINGS = {
     load: (modelPath: string) => NemotronHModel.load(modelPath),
     nativeModelClass: NativeNemotronHModel,
   },
+  k2_horizon: {
+    load: (modelPath: string) => K2HorizonModel.load(modelPath),
+    nativeModelClass: NativeK2HorizonModel,
+  },
   internvl_chat: {
     load: (modelPath: string) => QianfanOCRModel.load(modelPath),
     nativeModelClass: QianfanOCRModel,
@@ -184,7 +190,7 @@ function dispatchLoad(
   modelPath: string,
   options: LoadModelOptions | undefined,
 ): Promise<unknown> {
-  if (options?.auxiliaryModelPath !== undefined && modelType !== 'qwen4_exp') {
+  if (options?.auxiliaryModelPath !== undefined && requireFamilyData(modelType).acceptsAuxiliaryModel !== true) {
     throw new Error(
       `auxiliaryModelPath is only supported by qwen4_exp models; ${modelPath} has model_type "${modelType}"`,
     );
