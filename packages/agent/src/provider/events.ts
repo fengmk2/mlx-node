@@ -26,10 +26,10 @@ import type {
   Usage,
 } from '@earendil-works/pi-ai';
 import type { ChatStreamDelta, ChatStreamFinal, PerformanceMetrics, ToolCallResult } from '@mlx-node/lm';
+import { longestSuffixPrefixOverlap, ToolCallTagBuffer } from '@mlx-node/lm';
 
 import { coerceErrorMessage } from './error-coercion.js';
 import { ReasoningTagBuffer } from './reasoning-tag-buffer.js';
-import { ToolCallTagBuffer } from './tool-call-buffer.js';
 
 /**
  * All-zero usage. Shared with the stream adapter's TurnEmitter-independent
@@ -181,6 +181,35 @@ export class TurnEmitter {
       // close the open block.
       this.appendThinking(this.thinkingBuffer.flush());
       this.appendVisibleText(this.textBuffer.flush());
+
+      // Terminal text recovery, mirroring the server endpoints: once a
+      // structural tag suppressed the stream, the emitted text is a
+      // verbatim prefix of the model's raw output, so `final.text` minus
+      // the longest suffix/prefix overlap is exactly what never reached
+      // the wire — cleaned post-call text on success, or the verbatim raw
+      // sentinel block when the call was rejected (the parser returns it
+      // as content with no tool calls, so it must be visible here too).
+      const finalText = final.text;
+      if (finalText) {
+        const emitted = this.partial.content
+          .filter((b): b is TextContent => b.type === 'text')
+          .map((b) => b.text)
+          .join('');
+        const streamed = emitted + this.pendingLeadingWhitespace;
+        if (!streamed.includes(finalText)) {
+          let overlap = longestSuffixPrefixOverlap(streamed, finalText);
+          if (overlap < this.pendingLeadingWhitespace.length) {
+            // The parked leading whitespace never reached the wire and the
+            // authoritative final text doesn't carry it (native cleaned
+            // text is outer-trimmed) — prepending it via appendVisibleText
+            // would emit bytes the final event trimmed. Drop it and
+            // recompute the tail against only what was actually emitted.
+            this.pendingLeadingWhitespace = '';
+            overlap = longestSuffixPrefixOverlap(emitted, finalText);
+          }
+          this.appendVisibleText(finalText.slice(overlap));
+        }
+      }
       this.closeOpenBlock();
 
       let sawOkToolCall = false;

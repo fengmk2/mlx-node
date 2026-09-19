@@ -1,6 +1,5 @@
+import { ToolCallTagBuffer } from '@mlx-node/lm';
 import { describe, expect, it } from 'vite-plus/test';
-
-import { ToolCallTagBuffer } from '../src/provider/tool-call-buffer.js';
 
 describe('ToolCallTagBuffer', () => {
   it('passes plain text through unchanged', () => {
@@ -113,6 +112,76 @@ describe('ToolCallTagBuffer', () => {
 
     expect(buffer.push('Hello <')).toEqual({ safeText: 'Hello ', tagFound: false, cleanPrefix: '' });
     expect(buffer.push('world')).toEqual({ safeText: '<world', tagFound: false, cleanPrefix: '' });
+    expect(buffer.flush()).toBe('');
+  });
+
+  // LFM2 cases mirror __test__/server/tool-call-buffer.test.ts — both
+  // exercise the shared ToolCallTagBuffer (now in @mlx-node/lm). Once the
+  // start sentinel lands, EVERYTHING after it is suppressed: the streamed
+  // text stays a verbatim prefix of the raw output so the terminal
+  // recovery can emit the right tail whether the call parses or not.
+  it('suppresses LFM2 sentinel blocks and everything after them', () => {
+    const buffer = new ToolCallTagBuffer();
+
+    expect(buffer.push('The weather in Paris is ')).toEqual({
+      safeText: 'The weather in Paris is ',
+      tagFound: false,
+      cleanPrefix: '',
+    });
+    // Start sentinel split across chunks holds the prefix boundary.
+    expect(buffer.push('<|tool_call_')).toEqual({
+      safeText: '',
+      tagFound: false,
+      cleanPrefix: '',
+    });
+    expect(buffer.push('start|>[get_weather(location=')).toEqual({
+      safeText: '',
+      tagFound: true,
+      cleanPrefix: '',
+    });
+    // Interior, the end sentinel, AND post-call prose are all suppressed —
+    // the terminal recovery emits the post-call text from `finalText`.
+    expect(buffer.push('"Paris")]<|tool_call_end|>sunny today.')).toEqual({
+      safeText: '',
+      tagFound: false,
+      cleanPrefix: '',
+    });
+    expect(buffer.flush()).toBe('');
+  });
+
+  it('suppresses the LFM2 post-call echo and prose to stream end', () => {
+    const buffer = new ToolCallTagBuffer();
+
+    buffer.push('<|tool_call_start|>[get_weather(location="Paris")]');
+    expect(buffer.push('<|tool_call_end|>[get_weather(location="Paris")]').safeText).toBe('');
+    // Echo bytes and trailing prose are held alike — nothing leaks.
+    expect(buffer.push('<|tool_call_end|>done.')).toEqual({
+      safeText: '',
+      tagFound: false,
+      cleanPrefix: '',
+    });
+    expect(buffer.flush()).toBe('');
+  });
+
+  it('holds a whole LFM2 block landing in one delta to the end', () => {
+    const buffer = new ToolCallTagBuffer();
+
+    const pushed = buffer.push('intro <|tool_call_start|>[f()]<|tool_call_end|>outro');
+    expect(pushed.tagFound).toBe(true);
+    expect(pushed.cleanPrefix).toBe('intro ');
+    // The trailing prose is recovered from `finalText` by the terminal
+    // path, not released by the buffer itself.
+    expect(buffer.flush()).toBe('');
+  });
+
+  it('keeps later LFM2 sentinel blocks suppressed too', () => {
+    const buffer = new ToolCallTagBuffer();
+
+    buffer.push('<|tool_call_start|>[f()]<|tool_call_end|>');
+    // A second block's prose and interior stay suppressed — a malformed
+    // later block must not leave released text ahead of the raw tail.
+    const second = buffer.push('between <|tool_call_start|>[g()');
+    expect(second).toEqual({ safeText: '', tagFound: false, cleanPrefix: '' });
     expect(buffer.flush()).toBe('');
   });
 });

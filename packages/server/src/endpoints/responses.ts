@@ -14,6 +14,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { ChatConfig, ChatMessage, ChatResult, ResponseStore, StoredResponseRecord } from '@mlx-node/core';
 import { isContextCapacityError } from '@mlx-node/lm';
 import type { ChatSession, ChatStreamEvent, SessionCapableModel } from '@mlx-node/lm';
+import { ToolCallTagBuffer } from '@mlx-node/lm';
 
 import { resetPreservingNativeCacheForWarmReuse } from '../chat-session-warm-reuse.js';
 import { sendBadRequest, sendInternalError, sendNotFound, sendRateLimit, sendStorageTimeout } from '../errors.js';
@@ -49,7 +50,6 @@ import {
 } from '../streaming.js';
 import { longestSuffixPrefixOverlap } from '../text-recovery.js';
 import { mergeTimingUsageExtensions, resolveServerTuningForUsage, type ServerTimingForUsage } from '../timing.js';
-import { ToolCallTagBuffer } from '../tool-call-buffer.js';
 import {
   createVisibility,
   endJson,
@@ -431,6 +431,16 @@ async function handleStreamingNativeWithAbort(
   let reasoningText = '';
   let messageItemId: string | null = null;
   let messageText = '';
+  // Whitespace-only text before any content is parked, not emitted: the
+  // native side outer-trims `final.text`, so eagerly emitted leading
+  // whitespace would leave the delta stream ahead of `output_text.done`
+  // whenever a suppressed tool call follows it.
+  let pendingLeadingWhitespace = '';
+  // The leading-whitespace run that DID reach the wire (flushed with the
+  // first real text). When a later tool call trims it from `final.text`,
+  // the done text keeps it anyway — emitted bytes can't be un-sent, and
+  // the delta stream must sum to `output_text.done`.
+  let emittedLeadingWs = '';
   let hasEmittedMessage = false;
   let hasEmittedReasoning = false;
   // Tracks whether the reasoning output item's `response.output_item.done`
@@ -479,9 +489,18 @@ async function handleStreamingNativeWithAbort(
         sawDone = true;
         // Final event -- close open items and emit completed
 
-        // Flush any remaining pending text (no tool call tag was found)
-        const remainingText = tagBuffer.flush();
-        if (!tagBuffer.suppressed && remainingText) {
+        // Flush any remaining pending text (no tool call tag was found).
+        // flush() resolves the LFM2 paired-sentinel state machine first, so
+        // a same-chunk `<|tool_call_end|>prose` tail still releases its
+        // prose — whatever it returns is safe to emit regardless of the
+        // still-suppressed post-call echo watch.
+        const remainingText = pendingLeadingWhitespace + tagBuffer.flush();
+        if (remainingText.trim() === '' && messageText === '') {
+          // Still only leading whitespace — keep it parked; the terminal
+          // recovery below decides whether it lands inside finalText.
+          pendingLeadingWhitespace = remainingText;
+        } else if (remainingText) {
+          pendingLeadingWhitespace = '';
           if (!hasEmittedMessage) {
             hasEmittedMessage = true;
             messageItemId = genId('msg_');
@@ -544,7 +563,14 @@ async function handleStreamingNativeWithAbort(
         // Use the final event's parsed text (markup-stripped) as the authoritative content.
         // If the parsed text is empty and there are tool calls, skip the message item entirely
         // (matching the non-streaming buildOutputItems behavior).
-        const finalText = event.text;
+        let finalText = event.text;
+        // Leading whitespace that already reached the wire stays in the
+        // done text — a later tool call may have trimmed it from
+        // `final.text`, but emitted bytes can't be un-sent and the delta
+        // stream must sum to `output_text.done`.
+        if (emittedLeadingWs && !finalText.startsWith(emittedLeadingWs)) {
+          finalText = emittedLeadingWs + finalText;
+        }
         const hasToolCalls = event.toolCalls.some((t) => t.status === 'ok');
         const skipMessageItem = !finalText && hasToolCalls;
 
@@ -584,7 +610,7 @@ async function handleStreamingNativeWithAbort(
           !hasToolCalls &&
           finalText &&
           hasEmittedMessage &&
-          !messageText.includes(finalText)
+          !(messageText + pendingLeadingWhitespace).includes(finalText)
         ) {
           // Recovery: streaming text was cut off by a false-alarm `<tool_call>` tag.
           //
@@ -611,8 +637,16 @@ async function handleStreamingNativeWithAbort(
           //       (this is the original `<t`-strip bug we're fixing).
           // Length-based guards (`finalText.length > messageText.length`)
           // misclassify case (b) when the streamed whitespace is long.
-          const overlap = longestSuffixPrefixOverlap(messageText, finalText);
-          const unsent = finalText.slice(overlap);
+          let overlap = longestSuffixPrefixOverlap(messageText + pendingLeadingWhitespace, finalText);
+          if (overlap < pendingLeadingWhitespace.length) {
+            // The parked leading whitespace never reached the wire and the
+            // authoritative text doesn't carry it — drop it and recompute
+            // the tail against only what was actually emitted.
+            pendingLeadingWhitespace = '';
+            overlap = longestSuffixPrefixOverlap(messageText, finalText);
+          }
+          const unsent = pendingLeadingWhitespace + finalText.slice(overlap);
+          pendingLeadingWhitespace = '';
           if (unsent) {
             messageText += unsent;
             writeSSEEvent(res, 'response.output_text.delta', {
@@ -635,9 +669,26 @@ async function handleStreamingNativeWithAbort(
         // duplicate-trim case where finalText is a substring of the
         // streamed text (e.g. native `.trim()` shrinkage). See the
         // companion comment above for the case-distinction rationale.
-        if (hasEmittedMessage && finalText && !tagBuffer.suppressed && !messageText.includes(finalText)) {
-          const overlap = longestSuffixPrefixOverlap(messageText, finalText);
-          const unsent = finalText.slice(overlap);
+        //
+        // `suppressed` alone is not disqualifying: LFM2's start sentinel
+        // suppresses to stream end (the interior could still fail parsing),
+        // so a successful call leaves post-call prose held in the buffer.
+        // When the final event DID parse calls, emit the held tail so the
+        // delta stream still sums to `output_text.done` — as the Messages
+        // and agent terminal-recovery paths already do.
+        if (
+          hasEmittedMessage &&
+          finalText &&
+          (!tagBuffer.suppressed || hasToolCalls) &&
+          !(messageText + pendingLeadingWhitespace).includes(finalText)
+        ) {
+          let overlap = longestSuffixPrefixOverlap(messageText + pendingLeadingWhitespace, finalText);
+          if (overlap < pendingLeadingWhitespace.length) {
+            pendingLeadingWhitespace = '';
+            overlap = longestSuffixPrefixOverlap(messageText, finalText);
+          }
+          const unsent = pendingLeadingWhitespace + finalText.slice(overlap);
+          pendingLeadingWhitespace = '';
           if (unsent) {
             messageText += unsent;
             writeSSEEvent(res, 'response.output_text.delta', {
@@ -653,6 +704,11 @@ async function handleStreamingNativeWithAbort(
         // (possible if all text arrived in the final event only)
         if (!hasEmittedMessage && finalText && !skipMessageItem) {
           hasEmittedMessage = true;
+          // Nothing reached the wire yet — emit the authoritative text once.
+          // When it still carries the parked leading whitespace those bytes
+          // are already inside `finalText`; otherwise the parked bytes were
+          // trimmed upstream and must be dropped.
+          pendingLeadingWhitespace = '';
           messageItemId = genId('msg_');
           const messageItem: MessageOutputItem = {
             id: messageItemId,
@@ -679,6 +735,10 @@ async function handleStreamingNativeWithAbort(
             content_index: 0,
             delta: finalText,
           });
+        }
+
+        if (hasEmittedMessage && messageText !== finalText) {
+          finalText = messageText;
         }
 
         if (hasEmittedMessage && messageItemId && !skipMessageItem) {
@@ -905,44 +965,62 @@ async function handleStreamingNativeWithAbort(
                 part: textPart,
               });
             }
-            messageText += cleanPrefix;
+            const deltaText = pendingLeadingWhitespace + cleanPrefix;
+            pendingLeadingWhitespace = '';
+            if (!emittedLeadingWs && !messageText) {
+              emittedLeadingWs = deltaText.match(/^\s+/)?.[0] ?? '';
+            }
+            messageText += deltaText;
             writeSSEEvent(res, 'response.output_text.delta', {
               item_id: messageItemId,
               output_index: outputItems.findIndex((i) => i.id === messageItemId),
               content_index: 0,
-              delta: cleanPrefix,
+              delta: deltaText,
             });
           }
         } else if (safeText) {
-          if (!hasEmittedMessage) {
-            hasEmittedMessage = true;
-            messageItemId = genId('msg_');
-            const messageItem: MessageOutputItem = {
-              id: messageItemId,
-              type: 'message',
-              role: 'assistant',
-              status: 'in_progress',
-              content: [],
-            };
-            const miIndex = outputItems.length;
-            outputItems.push(messageItem);
-            outputIndex = miIndex;
-            writeSSEEvent(res, 'response.output_item.added', { output_index: miIndex, item: messageItem });
-            const textPart = { type: 'output_text' as const, text: '', annotations: [] as never[] };
-            writeSSEEvent(res, 'response.content_part.added', {
+          const combined = pendingLeadingWhitespace + safeText;
+          if (combined.trim() === '' && messageText === '') {
+            // Whitespace-only chunks before any content park instead of
+            // reaching the wire — the native side outer-trims `final.text`,
+            // so emitted leading whitespace would leave the delta stream
+            // ahead of `output_text.done` when suppression follows.
+            pendingLeadingWhitespace = combined;
+          } else {
+            pendingLeadingWhitespace = '';
+            if (!hasEmittedMessage) {
+              hasEmittedMessage = true;
+              messageItemId = genId('msg_');
+              const messageItem: MessageOutputItem = {
+                id: messageItemId,
+                type: 'message',
+                role: 'assistant',
+                status: 'in_progress',
+                content: [],
+              };
+              const miIndex = outputItems.length;
+              outputItems.push(messageItem);
+              outputIndex = miIndex;
+              writeSSEEvent(res, 'response.output_item.added', { output_index: miIndex, item: messageItem });
+              const textPart = { type: 'output_text' as const, text: '', annotations: [] as never[] };
+              writeSSEEvent(res, 'response.content_part.added', {
+                item_id: messageItemId,
+                output_index: miIndex,
+                content_index: 0,
+                part: textPart,
+              });
+            }
+            if (!emittedLeadingWs && !messageText) {
+              emittedLeadingWs = combined.match(/^\s+/)?.[0] ?? '';
+            }
+            messageText += combined;
+            writeSSEEvent(res, 'response.output_text.delta', {
               item_id: messageItemId,
-              output_index: miIndex,
+              output_index: outputItems.findIndex((i) => i.id === messageItemId),
               content_index: 0,
-              part: textPart,
+              delta: combined,
             });
           }
-          messageText += safeText;
-          writeSSEEvent(res, 'response.output_text.delta', {
-            item_id: messageItemId,
-            output_index: outputItems.findIndex((i) => i.id === messageItemId),
-            content_index: 0,
-            delta: safeText,
-          });
         }
       }
     }

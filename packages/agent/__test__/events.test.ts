@@ -325,6 +325,68 @@ describe('TurnEmitter', () => {
     expect(finalMessage(events).content).toEqual([{ type: 'text', text: 'result: <tool' }]);
   });
 
+  it('recovers LFM2 post-call prose from final.text after suppression', async () => {
+    const { emitter, stream } = makeEmitter();
+    emitter.onDelta(delta('before '));
+    // Once the start sentinel lands, everything after it is suppressed —
+    // the prose arrives via the terminal final.text tail instead.
+    emitter.onDelta(delta('<|tool_call_start|>[f(x=1)]<|tool_call_end|> after'));
+    emitter.onFinal(
+      makeFinal({
+        text: 'before  after',
+        finishReason: 'tool_calls',
+        toolCalls: [okCall('call_1', 'f', { x: 1 })],
+      }),
+    );
+
+    const events = await collect(stream);
+    expect(emittedText(events)).toBe('before  after');
+    expect(finalMessage(events).content).toEqual([
+      { type: 'text', text: 'before  after' },
+      { type: 'toolCall', id: 'call_1', name: 'f', arguments: { x: 1 } },
+    ]);
+  });
+
+  it('recovers the verbatim raw block when an LFM2 call is rejected', async () => {
+    const { emitter, stream } = makeEmitter();
+    const raw = 'before <|tool_call_start|>[f(x=)]<|tool_call_end|> after';
+    emitter.onDelta(delta('before '));
+    // The malformed call suppresses the rest of the stream; the parse
+    // keeps the whole output verbatim with no tool calls, so the wire
+    // must end with the raw text — prefix streamed, tail recovered.
+    emitter.onDelta(delta('<|tool_call_start|>[f(x=)]<|tool_call_end|> after'));
+    emitter.onFinal(makeFinal({ text: raw }));
+
+    const events = await collect(stream);
+    expect(emittedText(events)).toBe(raw);
+    expect(finalMessage(events).content).toEqual([{ type: 'text', text: raw }]);
+    expect(finalMessage(events).stopReason).toBe('stop');
+  });
+
+  it('drops parked leading whitespace that the trimmed final text no longer carries', async () => {
+    const { emitter, stream } = makeEmitter();
+    // Whitespace-only chunks park in pendingLeadingWhitespace instead of
+    // reaching the wire; the sentinel then suppresses everything else.
+    emitter.onDelta(delta('\n\n'));
+    emitter.onDelta(delta('<|tool_call_start|>[f()]<|tool_call_end|>after'));
+    // The authoritative final text is outer-trimmed — the \n\n prefix is
+    // gone, so the recovered tail must not re-prepend the parked bytes.
+    emitter.onFinal(
+      makeFinal({
+        text: 'after',
+        finishReason: 'tool_calls',
+        toolCalls: [okCall('call_1', 'f', {})],
+      }),
+    );
+
+    const events = await collect(stream);
+    expect(emittedText(events)).toBe('after');
+    expect(finalMessage(events).content).toEqual([
+      { type: 'text', text: 'after' },
+      { type: 'toolCall', id: 'call_1', name: 'f', arguments: {} },
+    ]);
+  });
+
   it('emits one toolcall trio per parsed call and stops with toolUse', async () => {
     const { emitter, stream } = makeEmitter();
     emitter.onFinal(
@@ -569,7 +631,8 @@ describe('TurnEmitter', () => {
     emitter.onError(new Error('late error'));
 
     const events = await collect(stream);
-    expect(types(events)).toEqual(['start', 'done']);
+    // The final text never streamed, so terminal recovery emits it.
+    expect(types(events)).toEqual(['start', 'text_start', 'text_delta', 'text_end', 'done']);
     expect(finalMessage(events).stopReason).toBe('stop');
   });
 });

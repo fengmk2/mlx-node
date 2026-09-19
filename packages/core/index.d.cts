@@ -3235,7 +3235,10 @@ export interface ColdSidecarStats {
  * Contains pre-parsed tool calls, thinking, and clean text.
  */
 export interface CompletionInfo {
-  /** Clean text with <tool_call> and <think> tags removed */
+  /**
+   * Clean text with tool-call markup (`<tool_call>` and the LFM2
+   * `<|tool_call_start|>…<|tool_call_end|>` pair) and <think> tags removed
+   */
   text: string;
   /** Raw output before tag stripping (for debugging/XML parsing) */
   rawText: string;
@@ -4356,7 +4359,7 @@ export interface Lfm2Config {
   /** Number of leading DENSE layers before MoE layers begin. */
   numDenseLayers?: number | undefined;
   /**
-   * Renormalize the top-k routing weights to sum to 1 (`/(sum+1e-20)`).
+   * Renormalize the top-k routing weights to sum to 1 (`/(sum+1e-6)`).
    *
    * `Option<bool>` so TS callers may omit it (napi renders bare `bool` as
    * required). Absent (None) is read as `true` everywhere via
@@ -4364,13 +4367,22 @@ export interface Lfm2Config {
    */
   normTopkProb?: boolean | undefined;
   /**
-   * Add the learned per-expert bias to the post-softmax gates BEFORE top-k.
+   * Add the learned per-expert bias to the routing scores BEFORE top-k
+   * (selection-only; the bias is NOT folded into the gathered weights).
    *
    * `Option<bool>` so TS callers may omit it (napi renders bare `bool` as
    * required). Absent (None) is read as `true` everywhere via
-   * `.unwrap_or(true)`, matching the prior `default = "default_true"`.
+   * `.unwrap_or(true)`, matching HF `configuration_lfm2_moe.py`.
    */
   useExpertBias?: boolean | undefined;
+  /**
+   * Post-renormalization scale applied to the gathered routing weights
+   * (HF `Lfm2MoeTopKRouter`: `routing_weights * routed_scaling_factor`).
+   * HF default is 1.0; absent on every checkpoint shipped so far but kept
+   * as a first-class field so a future checkpoint that sets it is not
+   * silently dropped.
+   */
+  routedScalingFactor?: number | undefined;
 }
 
 export interface MemorySnapshot {
@@ -5732,7 +5744,9 @@ export interface ToolCallResult {
   /** Error message if status != "ok" */
   error?: string;
   /**
-   * Raw content from <tool_call> tag (preserved for debugging/persistence)
+   * Raw content from the tool-call markup (preserved for debugging/persistence):
+   * the `<tool_call>…</tool_call>` block, or for LFM2 the whole
+   * `<|tool_call_start|>…<|tool_call_end|>` sentinel block.
    * Defaults to empty string for backward compatibility with older JSON
    */
   rawContent: string;

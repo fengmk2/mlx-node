@@ -8,6 +8,9 @@ use crate::nn::{Linear, RMSNorm, RoPE};
 use crate::transformer::KVCache;
 use crate::transformer::paged_flags::{graph_decode_gather_enabled, native_kv_write_enabled};
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
+use crate::transformer::paged_policy::{
+    gather_kv_for_decode_with_fallback, warn_once_on_sync_fallback, write_kv_chunk,
+};
 use napi::bindgen_prelude::*;
 
 /// When enabled (opt-in; default OFF), cache-hit prefill (`cached_prefix_len > 0`,
@@ -16,9 +19,10 @@ use napi::bindgen_prelude::*;
 /// which reads the K/V pool through MLX graph dependencies with no forced host
 /// sync. When disabled (the default), or when the bridge is unavailable for the
 /// inputs (non-Metal backend, batch > 1, an unsupported cache dtype, or an
-/// oversized auxiliary buffer), the synchronous `read_kv_range` path is used
-/// instead — a `[0, total_ctx)` host read that forces a per-layer pool eval via
-/// `eval_pending_pool_write_for_layer`.
+/// oversized auxiliary buffer), `gather_kv_for_prefill_sdpa` gathers the dense
+/// `[0, total_ctx)` K/V in-graph for an explicit-mask SDPA instead; the
+/// synchronous `read_kv_range` host read remains only as a last resort for
+/// cache dtypes the dense gather cannot serve (FP8).
 ///
 /// The bridge reads the SAME physical KV bytes as `read_kv_range`; only the
 /// attention kernel differs (fused paged-attn vs explicit-mask SDPA), the
@@ -220,6 +224,7 @@ impl Lfm2Attention {
         first_logical_position: u32,
         cached_prefix_len: u32,
         is_prefill: bool,
+        prefill_mask: Option<&MxArray>,
     ) -> Result<MxArray> {
         let batch = x.shape_at(0)?;
         let seq_len = x.shape_at(1)?;
@@ -278,25 +283,15 @@ impl Lfm2Attention {
         // back to the synchronous write if it is disabled or the native
         // kernel could not place the K/V (a failed native write leaves the
         // pool untouched, so the sync write below is not a double-write).
-        let native_written = native_kv_write_enabled()
-            && adapter
-                .update_keys_values_native(
-                    attn_layer_idx,
-                    &keys_paged,
-                    &values_paged,
-                    first_logical_position,
-                )
-                .is_ok();
-        if !native_written {
-            adapter
-                .update_keys_values(
-                    attn_layer_idx,
-                    &keys_paged,
-                    &values_paged,
-                    first_logical_position,
-                )
-                .map_err(napi::Error::from_reason)?;
-        }
+        write_kv_chunk(
+            adapter,
+            attn_layer_idx,
+            &keys_paged,
+            &values_paged,
+            first_logical_position,
+            "lfm2",
+        )
+        .map_err(napi::Error::from_reason)?;
 
         // 5. Compute attention output.
         let attn_bhtd = if is_prefill {
@@ -339,6 +334,15 @@ impl Lfm2Attention {
                         cached_prefix_len,
                         self.scale as f32,
                     ) {
+                        Err(err) => {
+                            warn_once_on_sync_fallback(
+                                "lfm2",
+                                "prefill_paged_attention",
+                                attn_layer_idx,
+                                &err,
+                            );
+                            None
+                        }
                         Ok(attn_t_h_d) => {
                             let target_dtype = x.dtype()?;
                             let attn_t_h_d = attn_t_h_d.astype(target_dtype)?;
@@ -351,7 +355,6 @@ impl Lfm2Attention {
                             ])?;
                             Some(attn)
                         }
-                        Err(_) => None,
                     }
                 } else {
                     None
@@ -360,14 +363,37 @@ impl Lfm2Attention {
                 match maybe_paged_attn {
                     Some(attn) => attn,
                     None => {
+                        // Cache-hit prefill: gather the dense [1, Hkv, T, D]
+                        // K/V IN-GRAPH (take+transpose over the pool arrays,
+                        // retaining the pending write's lazy dependency) and
+                        // run the same explicit-mask SDPA — bit-identical to
+                        // the `read_kv_range` host path but without its
+                        // blocking blit + per-element CPU repack + re-upload.
+                        // `read_kv_range` remains the last resort for cache
+                        // dtypes the dense gather cannot serve (FP8).
                         let (k_full, v_full) = adapter
-                            .read_kv_range(attn_layer_idx, 0, total_ctx)
+                            .gather_kv_for_prefill_sdpa(attn_layer_idx, total_ctx)
+                            .or_else(|err| {
+                                warn_once_on_sync_fallback(
+                                    "lfm2",
+                                    "prefill_sdpa_gather",
+                                    attn_layer_idx,
+                                    &err,
+                                );
+                                adapter.read_kv_range(attn_layer_idx, 0, total_ctx)
+                            })
                             .map_err(napi::Error::from_reason)?;
-                        let mask = create_causal_mask(
-                            seq_len as i32,
-                            Some(cached_prefix_len as i32),
-                            None,
-                        )?;
+                        // The mask is a pure function of (seq_len,
+                        // cached_prefix_len) — identical across attention
+                        // layers — so the caller builds it once per chunk.
+                        let mask = match prefill_mask {
+                            Some(mask) => mask.clone(),
+                            None => create_causal_mask(
+                                seq_len as i32,
+                                Some(cached_prefix_len as i32),
+                                None,
+                            )?,
+                        };
                         scaled_dot_product_attention(
                             &queries_bhtd,
                             &k_full,
@@ -391,33 +417,15 @@ impl Lfm2Attention {
             // through graph dependencies — no per-layer host eval). Fall back
             // to the synchronous gather when it is disabled or unavailable for
             // these inputs (e.g. a query/cache dtype it cannot serve).
-            let attn_3d = if graph_decode_gather_enabled() {
-                match adapter.gather_kv_for_decode_graph(
-                    attn_layer_idx,
-                    &queries_3d,
-                    self.scale as f32,
-                    /* softcap */ 1.0,
-                ) {
-                    Ok(attn_3d) => attn_3d,
-                    Err(_) => adapter
-                        .gather_kv_for_decode(
-                            attn_layer_idx,
-                            &queries_3d,
-                            self.scale as f32,
-                            /* softcap */ 1.0,
-                        )
-                        .map_err(napi::Error::from_reason)?,
-                }
-            } else {
-                adapter
-                    .gather_kv_for_decode(
-                        attn_layer_idx,
-                        &queries_3d,
-                        self.scale as f32,
-                        /* softcap */ 1.0,
-                    )
-                    .map_err(napi::Error::from_reason)?
-            };
+            let attn_3d = gather_kv_for_decode_with_fallback(
+                adapter,
+                attn_layer_idx,
+                &queries_3d,
+                self.scale as f32,
+                /* softcap */ 1.0,
+                "lfm2",
+            )
+            .map_err(napi::Error::from_reason)?;
             // Cast back to x's dtype so the residual stays homogeneous.
             let target_dtype = x.dtype()?;
             let attn_3d = attn_3d.astype(target_dtype)?;

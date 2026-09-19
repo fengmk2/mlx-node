@@ -10351,6 +10351,303 @@ describe('createHandler', () => {
       expect(msgContent.text).toBe('Let me look that up.');
     });
 
+    it('recovers the post-call text tail for a successful suppressed LFM2 call', async () => {
+      // LFM2's <|tool_call_start|> suppresses to stream end (call validity is
+      // only known at the final event), so post-call prose never reaches a
+      // delta mid-stream. The terminal recovery must still emit it so the
+      // accumulated deltas equal `response.output_text.done`.
+      const streamEvents = [
+        { done: false, text: 'before ', isReasoning: false },
+        { done: false, text: '<|tool_call_start|>[get_weather(city=', isReasoning: false },
+        { done: false, text: '"SF")]<|tool_call_end|>after', isReasoning: false },
+        {
+          done: true,
+          text: 'before after',
+          finishReason: 'tool_calls',
+          toolCalls: [
+            {
+              id: 'call_lfm2',
+              name: 'get_weather',
+              arguments: '{"city":"SF"}',
+              status: 'ok',
+              rawContent: '',
+            },
+          ],
+          thinking: null,
+          numTokens: 20,
+          promptTokens: 10,
+          reasoningTokens: 0,
+          rawText: 'before <|tool_call_start|>[get_weather(city="SF")]<|tool_call_end|>after',
+        },
+      ];
+
+      const registry = new ModelRegistry();
+      registry.register('stream-model', createMockStreamModel(streamEvents));
+      const handler = createHandler(registry);
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'stream-model',
+        input: 'hi',
+        stream: true,
+      });
+      const { res, getBody, waitForEnd } = createMockRes();
+      await handler(req, res);
+      await waitForEnd();
+
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      for (const line of getBody().split('\n')) {
+        if (line.startsWith('event: ')) {
+          events.push({ event: line.slice(7), data: {} });
+        } else if (line.startsWith('data: ') && events.length > 0) {
+          events[events.length - 1].data = JSON.parse(line.slice(6));
+        }
+      }
+
+      const allDeltaText = events
+        .filter((e) => e.event === 'response.output_text.delta')
+        .map((e) => e.data.delta as string)
+        .join('');
+      const doneText = events.find((e) => e.event === 'response.output_text.done')?.data.text;
+
+      expect(doneText).toBe('before after');
+      // The held post-call prose is emitted as a terminal delta — deltas
+      // sum to the advertised done text.
+      expect(allDeltaText).toBe('before after');
+      expect(allDeltaText).not.toContain('<|tool_call_start|>');
+    });
+
+    it('drops leading whitespace that the trimmed done text no longer carries', async () => {
+      // A whitespace-only chunk before the sentinel would emit "\n\n"
+      // eagerly while the native final text is outer-trimmed to "after" —
+      // the delta stream would run ahead of `output_text.done`.
+      const streamEvents = [
+        { done: false, text: '\n\n', isReasoning: false },
+        { done: false, text: '<|tool_call_start|>[get_weather()]<|tool_call_end|>after', isReasoning: false },
+        {
+          done: true,
+          text: 'after',
+          finishReason: 'tool_calls',
+          toolCalls: [
+            {
+              id: 'call_lfm2',
+              name: 'get_weather',
+              arguments: '{}',
+              status: 'ok',
+              rawContent: '',
+            },
+          ],
+          thinking: null,
+          numTokens: 20,
+          promptTokens: 10,
+          reasoningTokens: 0,
+          rawText: '\n\n<|tool_call_start|>[get_weather()]<|tool_call_end|>after',
+        },
+      ];
+
+      const registry = new ModelRegistry();
+      registry.register('stream-model', createMockStreamModel(streamEvents));
+      const handler = createHandler(registry);
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'stream-model',
+        input: 'hi',
+        stream: true,
+      });
+      const { res, getBody, waitForEnd } = createMockRes();
+      await handler(req, res);
+      await waitForEnd();
+
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      for (const line of getBody().split('\n')) {
+        if (line.startsWith('event: ')) {
+          events.push({ event: line.slice(7), data: {} });
+        } else if (line.startsWith('data: ') && events.length > 0) {
+          events[events.length - 1].data = JSON.parse(line.slice(6));
+        }
+      }
+
+      const allDeltaText = events
+        .filter((e) => e.event === 'response.output_text.delta')
+        .map((e) => e.data.delta as string)
+        .join('');
+      const doneText = events.find((e) => e.event === 'response.output_text.done')?.data.text;
+
+      expect(doneText).toBe('after');
+      expect(allDeltaText).toBe('after');
+    });
+
+    it('emits parked leading whitespace once when it survives into done text', async () => {
+      // A whitespace-only reply parks the "\n\n" chunk, then the final event
+      // carries the same bytes (no tool-call trimming). The terminal delta
+      // must emit the authoritative text once — not prepend the parked copy.
+      const streamEvents = [
+        { done: false, text: '\n\n', isReasoning: false },
+        {
+          done: true,
+          text: '\n\n',
+          finishReason: 'stop',
+          toolCalls: [],
+          thinking: null,
+          numTokens: 2,
+          promptTokens: 10,
+          reasoningTokens: 0,
+          rawText: '\n\n',
+        },
+      ];
+
+      const registry = new ModelRegistry();
+      registry.register('stream-model', createMockStreamModel(streamEvents));
+      const handler = createHandler(registry);
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'stream-model',
+        input: 'hi',
+        stream: true,
+      });
+      const { res, getBody, waitForEnd } = createMockRes();
+      await handler(req, res);
+      await waitForEnd();
+
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      for (const line of getBody().split('\n')) {
+        if (line.startsWith('event: ')) {
+          events.push({ event: line.slice(7), data: {} });
+        } else if (line.startsWith('data: ') && events.length > 0) {
+          events[events.length - 1].data = JSON.parse(line.slice(6));
+        }
+      }
+
+      const allDeltaText = events
+        .filter((e) => e.event === 'response.output_text.delta')
+        .map((e) => e.data.delta as string)
+        .join('');
+      const doneText = events.find((e) => e.event === 'response.output_text.done')?.data.text;
+
+      expect(doneText).toBe('\n\n');
+      expect(allDeltaText).toBe('\n\n');
+    });
+
+    it('keeps emitted leading whitespace in done text when tool-call trimming removes it', async () => {
+      // "\n\n" parks, then "before " flushes it into a delta before the
+      // sentinel suppresses. The native done text is outer-trimmed to
+      // "before after", but the whitespace already reached the wire —
+      // `output_text.done` must keep it so deltas sum to the advertised text.
+      const streamEvents = [
+        { done: false, text: '\n\n', isReasoning: false },
+        {
+          done: false,
+          text: 'before <|tool_call_start|>[get_weather()]<|tool_call_end|>after',
+          isReasoning: false,
+        },
+        {
+          done: true,
+          text: 'before after',
+          finishReason: 'tool_calls',
+          toolCalls: [
+            {
+              id: 'call_lfm2',
+              name: 'get_weather',
+              arguments: '{}',
+              status: 'ok',
+              rawContent: '',
+            },
+          ],
+          thinking: null,
+          numTokens: 20,
+          promptTokens: 10,
+          reasoningTokens: 0,
+          rawText: '\n\nbefore <|tool_call_start|>[get_weather()]<|tool_call_end|>after',
+        },
+      ];
+
+      const registry = new ModelRegistry();
+      registry.register('stream-model', createMockStreamModel(streamEvents));
+      const handler = createHandler(registry);
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'stream-model',
+        input: 'hi',
+        stream: true,
+      });
+      const { res, getBody, waitForEnd } = createMockRes();
+      await handler(req, res);
+      await waitForEnd();
+
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      for (const line of getBody().split('\n')) {
+        if (line.startsWith('event: ')) {
+          events.push({ event: line.slice(7), data: {} });
+        } else if (line.startsWith('data: ') && events.length > 0) {
+          events[events.length - 1].data = JSON.parse(line.slice(6));
+        }
+      }
+
+      const allDeltaText = events
+        .filter((e) => e.event === 'response.output_text.delta')
+        .map((e) => e.data.delta as string)
+        .join('');
+      const doneText = events.find((e) => e.event === 'response.output_text.done')?.data.text;
+
+      expect(doneText).toBe('\n\nbefore after');
+      expect(allDeltaText).toBe('\n\nbefore after');
+    });
+
+    it('keeps an emitted trailing separator when a terminal tool call trims it', async () => {
+      const streamEvents = [
+        { done: false, text: 'Let me check. ', isReasoning: false },
+        {
+          done: false,
+          text: '<|tool_call_start|>[lookup()]<|tool_call_end|>',
+          isReasoning: false,
+        },
+        {
+          done: true,
+          text: 'Let me check.',
+          finishReason: 'tool_calls',
+          toolCalls: [
+            {
+              id: 'call_lfm2',
+              name: 'lookup',
+              arguments: '{}',
+              status: 'ok',
+              rawContent: '',
+            },
+          ],
+          thinking: null,
+          numTokens: 16,
+          promptTokens: 8,
+          reasoningTokens: 0,
+          rawText: 'Let me check. <|tool_call_start|>[lookup()]<|tool_call_end|>',
+        },
+      ];
+
+      const registry = new ModelRegistry();
+      registry.register('stream-model', createMockStreamModel(streamEvents));
+      const handler = createHandler(registry);
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'stream-model',
+        input: 'hi',
+        stream: true,
+      });
+      const { res, getBody, waitForEnd } = createMockRes();
+      await handler(req, res);
+      await waitForEnd();
+
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      for (const line of getBody().split('\n')) {
+        if (line.startsWith('event: ')) {
+          events.push({ event: line.slice(7), data: {} });
+        } else if (line.startsWith('data: ') && events.length > 0) {
+          events[events.length - 1].data = JSON.parse(line.slice(6));
+        }
+      }
+
+      const allDeltaText = events
+        .filter((e) => e.event === 'response.output_text.delta')
+        .map((e) => e.data.delta as string)
+        .join('');
+      const doneText = events.find((e) => e.event === 'response.output_text.done')?.data.text;
+
+      expect(allDeltaText).toBe('Let me check. ');
+      expect(doneText).toBe(allDeltaText);
+    });
+
     it('skips message item when final text is empty and tool calls are present', async () => {
       // Model immediately produces tool-call markup, no visible text
       const streamEvents = [

@@ -11,6 +11,7 @@ import {
   buildMessageStop,
   internalToolCallIdToAnthropic,
   mapStopReason,
+  recoverSuppressedToolCallText,
 } from '../../packages/server/src/mappers/anthropic-response.js';
 
 function makeChatResult(overrides: Record<string, unknown> = {}) {
@@ -718,5 +719,38 @@ describe('buildMessageStop', () => {
     const event = buildMessageStop();
 
     expect(event.type).toBe('message_stop');
+  });
+});
+
+describe('recoverSuppressedToolCallText', () => {
+  it('strips each LFM2 sentinel block separately, keeping inter-block prose', () => {
+    // A greedy `.*` to the LAST `<|tool_call_end|>` would delete the prose
+    // between blocks (`mid`) — the match must be per-block lazy.
+    const raw =
+      'pre <|tool_call_start|>[f(x=1)]<|tool_call_end|> mid <|tool_call_start|>[g(y=2)]<|tool_call_end|> tail';
+    expect(recoverSuppressedToolCallText(raw)).toBe('pre  mid  tail');
+  });
+
+  it('strips echoed call bodies after an LFM2 block', () => {
+    // The model may repeat `[f()]<|tool_call_end|>` without a start
+    // sentinel — the echo body must not leak into recovered text.
+    const raw = '<|tool_call_start|>[f()]<|tool_call_end|>[f()]<|tool_call_end|>';
+    expect(recoverSuppressedToolCallText(raw)).toBe('');
+  });
+
+  it('strips multiple echoed bodies but keeps prose before a real block', () => {
+    const raw =
+      'pre <|tool_call_start|>[f()]<|tool_call_end|>[g()]<|tool_call_end|> mid <|tool_call_start|>[h()]<|tool_call_end|> tail';
+    expect(recoverSuppressedToolCallText(raw)).toBe('pre  mid  tail');
+  });
+
+  it('strips an unclosed LFM2 block through end of text', () => {
+    const raw = 'pre <|tool_call_start|>[f(x=1)]';
+    expect(recoverSuppressedToolCallText(raw)).toBe('pre ');
+  });
+
+  it('drops orphan end sentinels and non-LFM2 families', () => {
+    const raw = 'a <|tool_call_end|> b <tool_call>{"name":"x"}</tool_call> c';
+    expect(recoverSuppressedToolCallText(raw)).toBe('a  b  c');
   });
 });
