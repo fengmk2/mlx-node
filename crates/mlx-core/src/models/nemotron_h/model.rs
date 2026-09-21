@@ -404,8 +404,19 @@ impl NemotronHInner {
         self.mtp.is_some() && self.mtp_weights_loaded
     }
 
+    /// `release_scheduled_caches_for` can leave `caches` empty — release must
+    /// not depend on a fresh allocation succeeding. Repopulate lazily at use
+    /// time; every caller of this still sees a fully populated set.
+    fn ensure_caches(&mut self) -> Result<()> {
+        if self.caches.is_empty() {
+            self.caches = fresh_caches(&self.config, &self.layers)?;
+        }
+        Ok(())
+    }
+
     /// Full forward over input_ids [1, T]: returns [1, T, vocab] logits.
     pub(crate) fn forward(&mut self, input_ids: &MxArray) -> Result<MxArray> {
+        self.ensure_caches()?;
         let h = fwd::forward_body_normed(
             input_ids,
             &self.embedding,
@@ -425,6 +436,7 @@ impl NemotronHInner {
         input_ids: &MxArray,
         embedding: &Embedding,
     ) -> Result<(MxArray, MxArray)> {
+        self.ensure_caches()?;
         let hidden = fwd::forward_body_normed(
             input_ids,
             embedding,
@@ -438,12 +450,15 @@ impl NemotronHInner {
     }
 
     /// Reset all caches and cached token history.
-    pub(crate) fn reset_caches_internal(&mut self) {
-        self.caches = fresh_caches(&self.config, &self.layers).expect("fresh caches rebuild");
+    pub(crate) fn reset_caches_internal(&mut self) -> Result<()> {
+        // `fresh_caches` is fallible (mamba state allocation); on error the
+        // prior caches stay installed.
+        self.caches = fresh_caches(&self.config, &self.layers)?;
         self.cached_token_history.clear();
         self.flat_mtp_caches_desynced = false;
         // The seed describes a backbone history that just went away.
         self.pending_mtp_draft_seed = None;
+        Ok(())
     }
 
     /// Eval every live cache array (post-prefill sync).
@@ -469,7 +484,11 @@ impl NemotronHInner {
             FinalTokenPolicy::KeepAllOnLength,
             &mut self.cached_token_history,
         ) {
-            self.reset_caches_internal();
+            // `save_cache_state` callers include fixed-`()` trait impls, so a
+            // failed rebuild logs and leaves the prior caches installed.
+            if let Err(error) = self.reset_caches_internal() {
+                eprintln!("nemotron_h reset_caches_internal failed: {error}");
+            }
         }
     }
 
@@ -632,7 +651,7 @@ impl NemotronHInner {
         let mut bytes = 0u64;
         for i in 0..self.layers.len() {
             if self.config.is_mamba_layer(i)
-                && let Some(state) = self.caches[i].as_mamba_state()
+                && let Some(state) = self.caches.get(i).and_then(|c| c.as_mamba_state())
             {
                 bytes = bytes
                     .saturating_add(state.conv.nbytes() as u64)
@@ -824,57 +843,90 @@ impl NemotronHInner {
     /// into `caches`, parking the previously active sequence (lfm2 ShortConv
     /// pattern).
     pub(crate) fn activate_paged_seq(&mut self, seq_id: SeqId) -> Result<()> {
+        // Presence check first, matching the original ordering: a missing
+        // adapter must fail before any cache state is mutated.
+        if self.paged_adapter.is_none() {
+            return Err(Error::from_reason(
+                "nemotron_h paged adapter is unavailable",
+            ));
+        }
+        if self.active_scheduled_seq != Some(seq_id) {
+            // Capture BEFORE the remove: a preempted sequence's recurrent state was
+            // released, so the remove falls back to FRESH zero-state caches and the reuse
+            // predicate must know the state did not survive.
+            let had_state = self.scheduled_caches.contains_key(&seq_id);
+            // Run every fallible allocation BEFORE the first mutation: an
+            // uncached seq_id needs fresh recurrent state, and parking the
+            // active sequence allocates its blank replacement. Any failure
+            // returns with the adapter, `caches`, and the scheduled-seq flags
+            // all still describing the previously active sequence — and with
+            // seq_id's parked entry intact, since the remove runs last.
+            // (`active_scheduled_seq == seq_id` leaves the flags untouched on
+            // purpose — see the prime_prefix_state_for note below.)
+            let fresh = if had_state {
+                None
+            } else {
+                Some(fresh_caches(&self.config, &self.layers)?)
+            };
+            self.park_active_scheduled_caches()?;
+            self.caches = match fresh {
+                Some(caches) => caches,
+                None => self.scheduled_caches.remove(&seq_id).ok_or_else(|| {
+                    Error::from_reason("nemotron_h scheduled caches entry vanished mid-activation")
+                })?,
+            };
+            self.active_scheduled_seq = Some(seq_id);
+            self.active_seq_recurrent_survived = had_state;
+        }
+        // Adapter activation is pure request-table bookkeeping (no fallible
+        // allocation), so it runs last: on success every side names seq_id.
+        // When the sequence is already live this is a no-op, and the flags stay
+        // as they were — re-asserting `active_seq_recurrent_survived` here would
+        // overwrite a preempted sequence's honest `had_state = false` before
+        // `prime_prefix_state_for` reads it, resuming with mamba state at zero
+        // against a full cached KV prefix.
         self.paged_adapter
             .as_mut()
             .ok_or_else(|| Error::from_reason("nemotron_h paged adapter is unavailable"))?
             .activate_request(seq_id)
             .map_err(Error::from_reason)?;
-        if self.active_scheduled_seq == Some(seq_id) {
-            // Already live: LEAVE THE FLAG ALONE. The scheduler activates a
-            // sequence and then activates it AGAIN through `prime_prefix_state_for`;
-            // re-asserting `true` here would overwrite a preempted sequence's honest
-            // `had_state = false` before that function reads it, resuming with mamba
-            // state at zero against a full cached KV prefix.
-            return Ok(());
-        }
-        // Capture BEFORE the remove: a preempted sequence's recurrent state was
-        // released, so the remove falls back to FRESH zero-state caches and the reuse
-        // predicate must know the state did not survive.
-        let had_state = self.scheduled_caches.contains_key(&seq_id);
-        self.park_active_scheduled_caches();
-        self.caches = self
-            .scheduled_caches
-            .remove(&seq_id)
-            .unwrap_or_else(|| fresh_caches(&self.config, &self.layers).expect("fresh caches"));
-        self.active_scheduled_seq = Some(seq_id);
-        self.active_seq_recurrent_survived = had_state;
         Ok(())
     }
 
-    pub(crate) fn park_active_scheduled_caches(&mut self) {
-        let Some(seq_id) = self.active_scheduled_seq.take() else {
-            return;
+    pub(crate) fn park_active_scheduled_caches(&mut self) -> Result<()> {
+        let Some(seq_id) = self.active_scheduled_seq else {
+            return Ok(());
         };
-        let replacement = fresh_caches(&self.config, &self.layers).expect("fresh caches");
+        // On error the sequence stays active with its caches still installed.
+        let replacement = fresh_caches(&self.config, &self.layers)?;
         let caches = std::mem::replace(&mut self.caches, replacement);
         self.scheduled_caches.insert(seq_id, caches);
+        self.active_scheduled_seq = None;
+        Ok(())
     }
 
-    fn reset_scheduled_caches_for(&mut self, seq_id: SeqId) {
-        let fresh = || fresh_caches(&self.config, &self.layers).expect("fresh caches");
+    fn reset_scheduled_caches_for(&mut self, seq_id: SeqId) -> Result<()> {
+        let fresh = fresh_caches(&self.config, &self.layers)?;
         if self.active_scheduled_seq == Some(seq_id) {
-            self.caches = fresh();
+            self.caches = fresh;
         } else {
-            self.scheduled_caches.insert(seq_id, fresh());
+            self.scheduled_caches.insert(seq_id, fresh);
         }
+        Ok(())
     }
 
-    pub(crate) fn release_scheduled_caches_for(&mut self, seq_id: SeqId) {
+    pub(crate) fn release_scheduled_caches_for(&mut self, seq_id: SeqId) -> Result<()> {
         if self.active_scheduled_seq == Some(seq_id) {
+            // Freeing must not depend on a fresh allocation succeeding: clear
+            // in place so the recurrent state is released even under memory
+            // pressure. `caches` stays empty until the next activate or reset
+            // repopulates it — `forward` lazily allocates when it finds the
+            // set empty.
             self.active_scheduled_seq = None;
-            self.caches = fresh_caches(&self.config, &self.layers).expect("fresh caches");
+            self.caches.clear();
         }
         self.scheduled_caches.remove(&seq_id);
+        Ok(())
     }
 
     /// Attention-layer ordinal for the adapter's LayerKVPool (0..6).
@@ -888,7 +940,7 @@ impl NemotronHInner {
 
     /// Stack one mamba layer's per-request states into one batched state.
     fn stacked_mamba_state(&mut self, seq_ids: &[SeqId], layer_idx: usize) -> Result<Mamba2State> {
-        self.park_active_scheduled_caches();
+        self.park_active_scheduled_caches()?;
         let mut rows = Vec::with_capacity(seq_ids.len());
         for &seq_id in seq_ids {
             let caches = self.scheduled_caches.get(&seq_id).ok_or_else(|| {
@@ -1147,7 +1199,7 @@ impl NemotronHInner {
         if self.row_exact_decode_projections {
             return self.run_row_exact_decode_wave(rows);
         }
-        self.park_active_scheduled_caches();
+        self.park_active_scheduled_caches()?;
         let planned_rows = record_decode_wave(
             self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason("run_paged_decode_step_batched: paged adapter is unavailable")
@@ -1275,7 +1327,7 @@ impl ChatBackend for NemotronHInner {
     fn reset_caches(&mut self, scope: ResetScope) -> Result<()> {
         // Shared clear for BOTH scopes: wipe flat caches + token history +
         // parked scheduled state.
-        self.reset_caches_internal();
+        self.reset_caches_internal()?;
         self.scheduled_caches.clear();
         self.active_scheduled_seq = None;
         // The EXPLICIT command reset must restore a fully cold state: release the live
@@ -1516,7 +1568,13 @@ impl PagedBackend for NemotronHInner {
             let _ = finalize_single_adapter_turn(adapter, reuse_cache, &[], cache_salt);
         }
         if !reuse_cache {
-            self.release_scheduled_caches_for(0);
+            // Fixed `()` signature: on error leave the sequence's prior
+            // caches installed rather than panic.
+            if let Err(error) = self.release_scheduled_caches_for(0) {
+                eprintln!(
+                    "nemotron_h release_scheduled_caches_for failed in finalize_paged_turn: {error}"
+                );
+            }
         }
     }
 
@@ -1524,7 +1582,13 @@ impl PagedBackend for NemotronHInner {
         if let Some(adapter) = self.paged_adapter.as_mut() {
             let _ = abort_single_adapter_turn(adapter);
         }
-        self.release_scheduled_caches_for(self.active_scheduled_seq.unwrap_or(0));
+        if let Err(error) =
+            self.release_scheduled_caches_for(self.active_scheduled_seq.unwrap_or(0))
+        {
+            eprintln!(
+                "nemotron_h release_scheduled_caches_for failed in abort_paged_turn: {error}"
+            );
+        }
         self.cached_token_history.clear();
     }
 
@@ -1613,12 +1677,17 @@ impl HybridSchedulerBackend for NemotronHInner {
     }
 
     fn park_active_scheduled_recurrent(&mut self) -> Result<()> {
-        self.park_active_scheduled_caches();
-        Ok(())
+        self.park_active_scheduled_caches()
     }
 
     fn release_scheduled_recurrent_for(&mut self, seq_id: SeqId) {
-        self.release_scheduled_caches_for(seq_id);
+        // Fixed `()` signature: on error leave the sequence's prior caches
+        // installed rather than panic.
+        if let Err(error) = self.release_scheduled_caches_for(seq_id) {
+            eprintln!(
+                "nemotron_h release_scheduled_caches_for failed in release_scheduled_recurrent_for: {error}"
+            );
+        }
     }
 
     fn run_paged_decode_step_batched(&mut self, rows: &[(SeqId, u32)]) -> Result<MxArray> {
@@ -1819,7 +1888,7 @@ impl NemotronHInner {
             self.cached_token_history.clear();
         }
         if !reused_state {
-            self.reset_scheduled_caches_for(seq_id);
+            self.reset_scheduled_caches_for(seq_id)?;
         }
         Ok(NemotronHPrefixState {
             effective_cached_prefix_len: cached_prefix_len,
@@ -2451,7 +2520,7 @@ impl NemotronHInner {
         self.pending_mtp_draft_seed = None;
         // The partial seed left the backbone caches mid-prompt; the AR lane
         // must start from a clean slate.
-        self.reset_caches_internal();
+        self.reset_caches_internal()?;
         // THIS turn, and only this turn, leaves the speculative lane. The paged
         // core reads `plan.decoder` to decide whether to admit a verify cycle, and
         // a stale `Speculative` here would send the fallback straight back into
@@ -2473,7 +2542,7 @@ impl NemotronHInner {
     fn mtp_seed_aborted(&mut self, args: &mut WholeTurnArgs<'_>, err: Error) -> Result<TurnOutput> {
         if err.reason == PREFILL_CANCELLED {
             self.pending_mtp_draft_seed = None;
-            self.reset_caches_internal();
+            self.reset_caches_internal()?;
             return Err(err);
         }
         self.mtp_seed_failed_fallback(args, &err)
@@ -2543,9 +2612,9 @@ impl NemotronHInner {
         // `self.caches` wholesale, so park any adapter-owned scheduled sequence FIRST or
         // its per-request state is lost to a later paged turn.
         if self.active_scheduled_seq.is_some() {
-            self.park_active_scheduled_caches();
+            self.park_active_scheduled_caches()?;
         }
-        self.reset_caches_internal();
+        self.reset_caches_internal()?;
         self.flat_mtp_caches_desynced = false;
 
         let mut profiler =
@@ -3174,9 +3243,9 @@ mod scheduler_tests {
         // ---- batched: reset both requests and replay the SAME decode ----
         // Cold restart with fresh salts so the second prefill cannot hit the
         // allocator's prefix cache and take a different arithmetic path.
-        inner.park_active_scheduled_caches();
-        inner.reset_scheduled_caches_for(1);
-        inner.reset_scheduled_caches_for(2);
+        inner.park_active_scheduled_caches().unwrap();
+        inner.reset_scheduled_caches_for(1).unwrap();
+        inner.reset_scheduled_caches_for(2).unwrap();
         {
             let adapter = inner.paged_adapter.as_mut().expect("adapter");
             let _ = adapter.release_request_for(1);
@@ -3250,8 +3319,8 @@ mod scheduler_tests {
             .to_float32()
             .unwrap()
             .to_vec();
-        inner.park_active_scheduled_caches();
-        inner.reset_scheduled_caches_for(1);
+        inner.park_active_scheduled_caches().unwrap();
+        inner.reset_scheduled_caches_for(1).unwrap();
         let _ = inner.paged_adapter.as_mut().unwrap().release_request_for(1);
         let prefix2 = inner
             .prime_prefix_state_for(1, &prompt, &[], 2, false)
@@ -3321,9 +3390,9 @@ mod scheduler_tests {
             .to_float32()
             .unwrap()
             .to_vec();
-        inner.park_active_scheduled_caches();
-        inner.reset_scheduled_caches_for(1);
-        inner.reset_scheduled_caches_for(2);
+        inner.park_active_scheduled_caches().unwrap();
+        inner.reset_scheduled_caches_for(1).unwrap();
+        inner.reset_scheduled_caches_for(2).unwrap();
         {
             let adapter = inner.paged_adapter.as_mut().unwrap();
             let _ = adapter.release_request_for(1);
@@ -3458,7 +3527,7 @@ mod scheduler_tests {
         );
 
         // A genuinely restored state stays survived across re-activation.
-        inner.park_active_scheduled_caches();
+        inner.park_active_scheduled_caches().unwrap();
         inner.activate_paged_seq(4).expect("activate parked");
         assert!(inner.active_seq_recurrent_survived, "parked state survives");
         inner.activate_paged_seq(4).expect("re-activate live");
@@ -3500,7 +3569,7 @@ mod scheduler_tests {
     /// Flatten one sequence's mamba conv + SSM state into comparable f32s. Parks
     /// first so the state is reachable whether or not the sequence is the live one.
     fn mamba_fingerprint(inner: &mut NemotronHInner, seq_id: SeqId) -> Vec<f32> {
-        inner.park_active_scheduled_caches();
+        inner.park_active_scheduled_caches().unwrap();
         let caches = inner
             .scheduled_caches
             .get(&seq_id)
@@ -4145,7 +4214,7 @@ mod scheduler_tests {
                 .expect("register blocks for reuse");
             adapter.release_request_for(1).expect("release request");
         }
-        inner.release_scheduled_caches_for(1);
+        inner.release_scheduled_caches_for(1).unwrap();
 
         // Resume, in the scheduler's order: activate the recurrent row FIRST,
         // then prepare the prefix.
@@ -4219,7 +4288,7 @@ mod scheduler_tests {
             .expect("adapter")
             .finalize_turn_keep_live(&[], salt)
             .expect("finalize keep-live");
-        inner.park_active_scheduled_caches();
+        inner.park_active_scheduled_caches().unwrap();
 
         inner.activate_paged_seq(1).expect("activate turn 2");
         assert!(
@@ -4287,11 +4356,11 @@ mod scheduler_tests {
                 .is_live_for_continue(),
             "the fixture needs a LIVE, already-registered request"
         );
-        inner.park_active_scheduled_caches();
+        inner.park_active_scheduled_caches().unwrap();
 
         // EXACTLY what `ensure_recurrent_slot` does to an idle victim: drop
         // the recurrent row and nothing else.
-        inner.release_scheduled_caches_for(1);
+        inner.release_scheduled_caches_for(1).unwrap();
 
         inner.activate_paged_seq(1).expect("activate turn 2");
         let admission = HybridSchedulerBackend::prepare_scheduled_prefix(
@@ -4352,7 +4421,7 @@ mod scheduler_tests {
             );
             inner.activate_paged_seq(seq_id).expect("activate");
         }
-        inner.park_active_scheduled_caches();
+        inner.park_active_scheduled_caches().unwrap();
         assert_eq!(
             inner.scheduled_recurrent_units(),
             cap,
@@ -4372,7 +4441,7 @@ mod scheduler_tests {
         );
 
         // Evicting one idle row (what `ensure_recurrent_slot` does) reopens a slot.
-        inner.release_scheduled_caches_for(0);
+        inner.release_scheduled_caches_for(0).unwrap();
         assert_eq!(inner.scheduled_recurrent_units(), cap - 1);
         assert!(
             HybridSchedulerBackend::can_activate_scheduled_recurrent(&inner, newcomer),
@@ -4392,7 +4461,7 @@ mod scheduler_tests {
         assert_eq!(inner.scheduled_recurrent_units(), 0, "fresh model has none");
         inner.activate_paged_seq(1).expect("activate 1");
         assert_eq!(inner.scheduled_recurrent_units(), 1);
-        inner.park_active_scheduled_caches();
+        inner.park_active_scheduled_caches().unwrap();
         assert_eq!(inner.scheduled_recurrent_units(), 1, "parked still counts");
         inner.activate_paged_seq(2).expect("activate 2");
         assert_eq!(inner.scheduled_recurrent_units(), 2);
@@ -4422,7 +4491,7 @@ mod scheduler_tests {
             !inner.scheduled_recurrent_state_live(1),
             "a FRESH activation is zero-state, not survived"
         );
-        inner.park_active_scheduled_caches();
+        inner.park_active_scheduled_caches().unwrap();
         assert!(
             inner.scheduled_recurrent_state_live(1),
             "a parked row IS live for its owner"
@@ -4437,7 +4506,7 @@ mod scheduler_tests {
             !inner.scheduled_recurrent_state_live(2),
             "an unrelated sequence must not inherit the active row's survival"
         );
-        inner.release_scheduled_caches_for(1);
+        inner.release_scheduled_caches_for(1).unwrap();
         assert!(
             !inner.scheduled_recurrent_state_live(1),
             "a released row is not live"
