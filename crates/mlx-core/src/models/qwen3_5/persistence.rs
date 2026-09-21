@@ -1298,6 +1298,24 @@ fn apply_weights_inner_with_residency(
     let default_plq = default_per_layer_quant(quant_bits, quant_group_size, default_mode);
     let plain_fp8_residency = std::cell::RefCell::new(PlainFp8Residency::default());
 
+    // The family's activation dtype = the embedding's dequantized OUTPUT dtype,
+    // which is NOT always the `.scales` dtype: MLX `dequantize` emits
+    // `result_type(scales, biases)` for affine but bf16 for K-quant/IQ/mxfp
+    // (whose `.scales` hold integer sub-block codes — the fp16 super-scale
+    // lives in `.biases`). Dense tables emit their own dtype.
+    // Sidecar params (norm/conv f32 tensors) fold down to THIS dtype — never
+    // blanket-bf16, so an f32/f16-compute checkpoint keeps matching numerics.
+    let compute_dtype = params
+        .get("embedding.scales")
+        .and_then(|w| w.dtype().ok())
+        .map(|d| match d {
+            DType::Float16 | DType::BFloat16 | DType::Float32 => d,
+            // K-quant/IQ/mxfp scales are integer codes; MLX emits bf16.
+            _ => DType::BFloat16,
+        })
+        .or_else(|| params.get("embedding.weight").and_then(|w| w.dtype().ok()))
+        .unwrap_or(DType::BFloat16);
+
     let try_build_ql = |params: &HashMap<String, MxArray>,
                         prefix: &str|
      -> Result<Option<crate::models::quantized_linear::QuantizedLinear>> {
@@ -1341,7 +1359,15 @@ fn apply_weights_inner_with_residency(
             PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, prefix),
             PerLayerMode::Fp8E4m3 => try_build_fp8_e4m3_quantized_linear(params, prefix)?,
             PerLayerMode::Affine => {
+                // GGUF affine sidecars are f16. Under bf16/f32 activations
+                // `quantized_matmul` promotes the call to f32 and re-casts
+                // scales/biases EVERY forward — pre-cast once instead
+                // (bit-identical values, fewer AsType dispatches). Under f16
+                // activations the native f16 path already matches; hoisting
+                // would flip it to f32 and cost MORE casts, so it stays off.
                 try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
+                    .map(|mut ql| ql.promote_affine_sidecars_to_f32(compute_dtype).map(|_| ql))
+                    .transpose()?
             }
             PerLayerMode::Sym8 => try_build_sym8_quantized_linear(params, prefix)?,
             PerLayerMode::Q6K
@@ -1479,7 +1505,9 @@ fn apply_weights_inner_with_residency(
 
     // Final norm
     if let Some(w) = params.get("final_norm.weight") {
-        inner.final_norm.set_weight(w)?;
+        inner
+            .final_norm
+            .set_weight(&super::sidecar_to_compute_dtype(w, compute_dtype)?)?;
     }
 
     // LM head. The outer `Some(head)` guard preserves the tied-embeddings
@@ -1670,13 +1698,13 @@ fn apply_weights_inner_with_residency(
                     }
                 }
                 if let Some(w) = params.get(&format!("{}.linear_attn.conv1d.weight", prefix)) {
-                    gdn.set_conv1d_weight(w)?;
+                    gdn.set_conv1d_weight(w, compute_dtype)?;
                 }
                 if let Some(w) = params.get(&format!("{}.linear_attn.dt_bias", prefix)) {
                     gdn.set_dt_bias(w);
                 }
                 if let Some(w) = params.get(&format!("{}.linear_attn.norm.weight", prefix)) {
-                    gdn.set_norm_weight(w)?;
+                    gdn.set_norm_weight(w, compute_dtype)?;
                 }
                 if let Some(w) = params.get(&format!("{}.linear_attn.A_log", prefix)) {
                     gdn.set_a_log(w)?;
@@ -1772,10 +1800,10 @@ fn apply_weights_inner_with_residency(
                     }
                 }
                 if let Some(w) = params.get(&format!("{}.self_attn.q_norm.weight", prefix)) {
-                    attn.set_q_norm_weight(w)?;
+                    attn.set_q_norm_weight(w, compute_dtype)?;
                 }
                 if let Some(w) = params.get(&format!("{}.self_attn.k_norm.weight", prefix)) {
-                    attn.set_k_norm_weight(w)?;
+                    attn.set_k_norm_weight(w, compute_dtype)?;
                 }
                 if let Some(w) = params.get(&format!("{}.self_attn.q_proj.bias", prefix)) {
                     attn.set_q_proj_bias(Some(w))?;
@@ -1859,10 +1887,10 @@ fn apply_weights_inner_with_residency(
         }
 
         if let Some(w) = params.get(&format!("{}.input_layernorm.weight", prefix)) {
-            layer.set_input_layernorm_weight(w)?;
+            layer.set_input_layernorm_weight(w, compute_dtype)?;
         }
         if let Some(w) = params.get(&format!("{}.post_attention_layernorm.weight", prefix)) {
-            layer.set_post_attention_layernorm_weight(w)?;
+            layer.set_post_attention_layernorm_weight(w, compute_dtype)?;
         }
     }
 
@@ -1885,7 +1913,7 @@ fn apply_weights_inner_with_residency(
         } else {
             let missing_mtp = missing_mtp_required_weights(params, config);
             if missing_mtp.is_empty() {
-                mtp.apply_weights(params, default_plq, per_layer_quant)?;
+                mtp.apply_weights(params, default_plq, per_layer_quant, compute_dtype)?;
                 inner.mtp_weights_loaded = true;
             } else {
                 inner.mtp_weights_loaded = false;

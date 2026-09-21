@@ -85,6 +85,22 @@ pub struct Qwen3_5Attention {
     kv_proj: Option<(LinearProj, i64)>,
 }
 
+/// IO bundle for [`Qwen3_5Attention::forward_verify`] (the compiled DFlash2
+/// verify path): the graph reads position and the K/V prefix as array inputs
+/// and returns the post-RoPE block through `out_kv`, so nothing host-baked —
+/// cache offsets, prefix lengths, write bounds — enters the traced region.
+pub(crate) struct AttentionVerifyIo<'a> {
+    /// Live K prefix `[B, Hkv, P, D]` — a view into the flat KVCache buffer.
+    pub prefix_keys: &'a MxArray,
+    /// Live V prefix `[B, Hkv, P, D]`.
+    pub prefix_values: &'a MxArray,
+    /// Per-batch RoPE position of this block's first row, `[B] int32`.
+    pub rope_offsets: &'a MxArray,
+    /// Receives `(new_k, new_v)` `[B, Hkv, T, D]` post-RoPE — the layout
+    /// `KVCache::update_and_fetch` would store.
+    pub out_kv: &'a mut Option<(MxArray, MxArray)>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CacheHitPrefillMode {
     /// Keep the paged pool authoritative and select the compute kernel from
@@ -299,9 +315,11 @@ impl Qwen3_5Attention {
     /// [B,T,H*D])`.
     ///
     /// Fast path (`finalize_q_gate_block()` installed either the dense cache or
-    /// a packed quantized block layout): one projection followed by two flat
-    /// `slice_axis` calls. Both halves are already row-contiguous, so queries'
-    /// `[B,T,H,D]` reshape is a free view and gate needs no reshape at all.
+    /// a packed quantized block layout): one projection followed by a single
+    /// `split_sections` — zero-copy views instead of two `slice_axis` copy
+    /// dispatches. Queries' `[B,T,H,D]` reshape stays a strided view and
+    /// materializes only if a downstream kernel requires contiguous input;
+    /// gate feeds elementwise ops directly.
     /// `MLX_DISABLE_QGATE_BLOCK_SPLIT=1` is sampled by the finalizer at load
     /// time, letting a second process load native order for same-binary A/B
     /// without retaining both quantized layouts.
@@ -318,8 +336,9 @@ impl Qwen3_5Attention {
                 (Some(w_block_t), None) => x.matmul(w_block_t)?,
                 (None, _) => self.q_proj.forward(x)?,
             };
-            let queries_flat = flat.slice_axis(2, 0, hd)?;
-            let gate = flat.slice_axis(2, hd, 2 * hd)?;
+            let qg = flat.split_sections(&[hd], 2)?;
+            let queries_flat = &qg[0];
+            let gate = qg[1].clone();
             let queries = queries_flat.reshape(&[
                 batch,
                 seq_len,
@@ -359,11 +378,8 @@ impl Qwen3_5Attention {
         {
             let kv = merged.forward(x)?; // [B, T, k_dim + v_dim]
             let last = kv.ndim()? as usize - 1;
-            let width = kv.shape_at(last as u32)?;
-            return Ok((
-                kv.slice_axis(last, 0, *k_rows)?,
-                kv.slice_axis(last, *k_rows, width)?,
-            ));
+            let kv_split = kv.split_sections(&[*k_rows], last as i32)?;
+            return Ok((kv_split[0].clone(), kv_split[1].clone()));
         }
         Ok((self.k_proj.forward(x)?, self.v_proj.forward(x)?))
     }
@@ -509,7 +525,61 @@ impl Qwen3_5Attention {
         let output = if let Some(m) = mask {
             scaled_dot_product_attention(&queries, &keys, &values, self.scale as f64, Some(m))?
         } else if seq_len > 1 {
-            scaled_dot_product_attention_causal(&queries, &keys, &values, self.scale as f64)?
+            // The fused vector kernel launches 32×gqa×qL threads in its
+            // 2-pass variant — qL·gqa > 32 exceeds the threadgroup limit and
+            // MLX falls back to a ~15-op unfused graph (expand + scores matmul
+            // + arange mask + where + softmax + matmul). Speculative verify
+            // blocks land just over the bound (e.g. qL=7, gqa=6 → 42).
+            // Splitting the query block keeps each call inside the fused
+            // kernel: causal alignment follows from qL_off = kL − qL, so the
+            // head chunk runs against keys truncated to kL − tail while the
+            // tail chunk sees the full cache.
+            let gqa = (self.num_heads / self.num_kv_heads.max(1)) as i64;
+            let vector_dims = matches!(self.head_dim, 64 | 96 | 128 | 256);
+            let tail = if (1..=32).contains(&gqa) {
+                (32 / gqa).min(seq_len - 1)
+            } else {
+                0
+            };
+            if vector_dims
+                && tail >= 1
+                && seq_len <= 8
+                && seq_len * gqa > 32
+                && std::env::var("MLX_DISABLE_SDPA_VERIFY_SPLIT").is_err()
+            {
+                let head_len = seq_len - tail;
+                let kv_len = keys.shape_at(2)?;
+                let q_parts = queries.split_sections(&[head_len], 2)?;
+                let kv_split = keys.split_sections(&[kv_len - tail], 2)?;
+                let vv_split = values.split_sections(&[kv_len - tail], 2)?;
+                let out_head = if head_len > 1 {
+                    scaled_dot_product_attention_causal(
+                        &q_parts[0],
+                        &kv_split[0],
+                        &vv_split[0],
+                        self.scale as f64,
+                    )?
+                } else {
+                    // Single-row head: causal is a no-op, it attends to the
+                    // whole truncated prefix.
+                    scaled_dot_product_attention(
+                        &q_parts[0],
+                        &kv_split[0],
+                        &vv_split[0],
+                        self.scale as f64,
+                        None,
+                    )?
+                };
+                let out_tail = scaled_dot_product_attention_causal(
+                    &q_parts[1],
+                    &keys,
+                    &values,
+                    self.scale as f64,
+                )?;
+                MxArray::concatenate(&out_head, &out_tail, 2)?
+            } else {
+                scaled_dot_product_attention_causal(&queries, &keys, &values, self.scale as f64)?
+            }
         } else {
             scaled_dot_product_attention(&queries, &keys, &values, self.scale as f64, None)?
         };
@@ -518,12 +588,142 @@ impl Qwen3_5Attention {
         let output = output.transpose(Some(&[0, 2, 1, 3]))?;
         let output = output.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
 
-        // Apply gate: output * sigmoid(gate)
+        // Apply gate: output * sigmoid(gate) — one compiled fusion instead
+        // of a Sigmoid + Multiply pair.
         // gate is already [B, T, H*D] from the per-head split above
-        let gate_sigmoid = Activations::sigmoid(&gate)?;
-        let gated_output = output.mul(&gate_sigmoid)?;
+        let gated_output = Activations::sigmoid_mul_compiled(&gate, &output)?;
 
         // Output projection
+        self.o_proj.forward(&gated_output)
+    }
+
+    /// Compiled-verify forward for the DFlash2 flat-cache path.
+    ///
+    /// Identical math to [`Self::forward`] with `mask = None`,
+    /// `position_ids = None` and a `KVCache`, but the position base and the
+    /// K/V prefix arrive as graph INPUTS and the post-RoPE block leaves
+    /// through `io.out_kv` — the traced region performs no host-int cache
+    /// reads and no cache writes, so the recorded tape stays valid as the
+    /// prefix length varies under `shapeless` compile:
+    ///
+    ///   * RoPE uses `forward_with_offsets` — `offset[b] + t` equals the
+    ///     scalar path's `offset + t` bit-for-bit, but the base is a runtime
+    ///     array instead of a baked host int.
+    ///   * The full K/V for SDPA is `concat(prefix, new)`; the verify-split's
+    ///     truncated head reads `concat(prefix, new[..head_len])` — a slice on
+    ///     the constant block axis rather than the varying prefix axis, so no
+    ///     host-bound slice enters the tape.
+    ///   * The fused SDPA primitive derives `qL_off = kL - qL` from the real
+    ///     input shapes at eval time (see
+    ///     `backend/metal/scaled_dot_product_attention.cpp`), so the causal
+    ///     alignment stays correct for any prefix length. The split keeps
+    ///     each piece at `qL·gqa <= 32` so the primitive is always the fused
+    ///     vector kernel — never the unfused fallback, which would bake
+    ///     `kL - qL` into `arange` nodes at trace time.
+    ///
+    /// The caller persists `out_kv` after invoke via `KVCache::update_and_fetch`.
+    pub(crate) fn forward_verify(
+        &self,
+        x: &MxArray,
+        io: &mut AttentionVerifyIo<'_>,
+    ) -> Result<MxArray> {
+        let batch = x.shape_at(0)?;
+        let seq_len = x.shape_at(1)?;
+
+        let (queries, gate) = self.project_q_gate(x, batch, seq_len)?;
+        let (keys, values) = self.project_kv(x)?;
+        let keys = keys.reshape(&[
+            batch,
+            seq_len,
+            self.num_kv_heads as i64,
+            self.head_dim as i64,
+        ])?;
+        let values = values.reshape(&[
+            batch,
+            seq_len,
+            self.num_kv_heads as i64,
+            self.head_dim as i64,
+        ])?;
+        let queries = self.q_norm.forward(&queries)?;
+        let keys = self.k_norm.forward(&keys)?;
+
+        // RoPE rotates along axis -2: feed [B, H, T, D] directly and keep
+        // that layout — the eager path's round-trip back to [B, T, H, D]
+        // only exists to satisfy the KVCache write order, which lives in
+        // the caller here.
+        let queries = self
+            .rope
+            .forward_with_offsets(&queries.transpose(Some(&[0, 2, 1, 3]))?, io.rope_offsets)?;
+        let new_keys = self
+            .rope
+            .forward_with_offsets(&keys.transpose(Some(&[0, 2, 1, 3]))?, io.rope_offsets)?;
+        let new_values = values.transpose(Some(&[0, 2, 1, 3]))?;
+        *io.out_kv = Some((new_keys.clone(), new_values.clone()));
+
+        // Full K/V for SDPA without touching the cache buffer.
+        let keys = MxArray::concatenate(io.prefix_keys, &new_keys, 2)?;
+        let values = MxArray::concatenate(io.prefix_values, &new_values, 2)?;
+
+        let output = if seq_len > 1 {
+            // Same qL·gqa verify-split as `forward` — see its comment for the
+            // threadgroup-limit rationale — but the head chunk's truncated
+            // K/V is `concat(prefix, new[..head_len])` so no slice bound
+            // depends on the (shape-varying) prefix length.
+            let gqa = (self.num_heads / self.num_kv_heads.max(1)) as i64;
+            let vector_dims = matches!(self.head_dim, 64 | 96 | 128 | 256);
+            let tail = if (1..=32).contains(&gqa) {
+                (32 / gqa).min(seq_len - 1)
+            } else {
+                0
+            };
+            if vector_dims
+                && tail >= 1
+                && seq_len <= 8
+                && seq_len * gqa > 32
+                && std::env::var("MLX_DISABLE_SDPA_VERIFY_SPLIT").is_err()
+            {
+                let head_len = seq_len - tail;
+                let q_parts = queries.split_sections(&[head_len], 2)?;
+                let head_k =
+                    MxArray::concatenate(io.prefix_keys, &new_keys.slice_axis(2, 0, head_len)?, 2)?;
+                let head_v = MxArray::concatenate(
+                    io.prefix_values,
+                    &new_values.slice_axis(2, 0, head_len)?,
+                    2,
+                )?;
+                let out_head = if head_len > 1 {
+                    scaled_dot_product_attention_causal(
+                        &q_parts[0],
+                        &head_k,
+                        &head_v,
+                        self.scale as f64,
+                    )?
+                } else {
+                    scaled_dot_product_attention(
+                        &q_parts[0],
+                        &head_k,
+                        &head_v,
+                        self.scale as f64,
+                        None,
+                    )?
+                };
+                let out_tail = scaled_dot_product_attention_causal(
+                    &q_parts[1],
+                    &keys,
+                    &values,
+                    self.scale as f64,
+                )?;
+                MxArray::concatenate(&out_head, &out_tail, 2)?
+            } else {
+                scaled_dot_product_attention_causal(&queries, &keys, &values, self.scale as f64)?
+            }
+        } else {
+            scaled_dot_product_attention(&queries, &keys, &values, self.scale as f64, None)?
+        };
+
+        let output = output.transpose(Some(&[0, 2, 1, 3]))?;
+        let output = output.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
+        let gated_output = Activations::sigmoid_mul_compiled(&gate, &output)?;
         self.o_proj.forward(&gated_output)
     }
 
@@ -1296,9 +1496,8 @@ impl Qwen3_5Attention {
         let output = attn_bhtd.transpose(Some(&[0, 2, 1, 3]))?;
         let output = output.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
 
-        // Apply gate: output * sigmoid(gate).
-        let gate_sigmoid = Activations::sigmoid(&gate)?;
-        let gated_output = output.mul(&gate_sigmoid)?;
+        // Apply gate: output * sigmoid(gate) — one compiled fusion.
+        let gated_output = Activations::sigmoid_mul_compiled(&gate, &output)?;
 
         // Output projection.
         self.o_proj.forward(&gated_output)
@@ -1457,7 +1656,7 @@ impl Qwen3_5Attention {
         }
         .astype(x.dtype()?)?
         .reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
-        let output = output.mul(&Activations::sigmoid(&gate)?)?;
+        let output = Activations::sigmoid_mul_compiled(&gate, &output)?;
         if preserve_singleton_projection_graphs {
             let projected = (0..rows.len())
                 .map(|row| {
@@ -1523,11 +1722,13 @@ impl Qwen3_5Attention {
     pub fn set_o_proj_bias(&mut self, b: Option<&MxArray>) -> Result<()> {
         self.o_proj.set_bias(b, "o_proj")
     }
-    pub fn set_q_norm_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.q_norm.set_weight(w)
+    pub fn set_q_norm_weight(&mut self, w: &MxArray, compute_dtype: DType) -> Result<()> {
+        self.q_norm
+            .set_weight(&super::sidecar_to_compute_dtype(w, compute_dtype)?)
     }
-    pub fn set_k_norm_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.k_norm.set_weight(w)
+    pub fn set_k_norm_weight(&mut self, w: &MxArray, compute_dtype: DType) -> Result<()> {
+        self.k_norm
+            .set_weight(&super::sidecar_to_compute_dtype(w, compute_dtype)?)
     }
 
     /// Precompute the block-ordered `[hidden, 2*H*D]` q_proj weight (queries

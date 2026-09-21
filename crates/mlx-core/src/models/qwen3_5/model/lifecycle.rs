@@ -75,6 +75,7 @@ impl Qwen35Inner {
             cached_paged_image_token_positions: Vec::new(),
             cached_rope_deltas: None,
             model_id,
+            dflash2_compiled_verify_disabled: false,
             active_cache_owner_id: String::new(),
             gdn_root_cache_owner_id: None,
             gdn_root_cache_owner_is_explicit: false,
@@ -883,5 +884,25 @@ impl Qwen35Inner {
         );
         self.discard_dense_paged_session();
         self.paged_finalize_failed = true;
+    }
+}
+
+impl Qwen35Inner {
+    /// Erase every compiled-verify tape this instance has registered.
+    /// Each graph id namespaces a process-lifetime C++ registry entry whose
+    /// tape retains this model's captured weights: tapes must be invalidated
+    /// when the weights go away (drop) or change (training updates), or a
+    /// later verify silently replays the stale constants.
+    pub(super) fn erase_compiled_verifies(&self) {
+        crate::compiled_graph::erase_compiled_graphs_matching(
+            0xFFFF_FFFF_FFFF_FF00,
+            forward::COMPILED_VERIFY_TAG | ((self.model_id & 0x00FF_FFFF) << 8),
+        );
+    }
+}
+
+impl Drop for Qwen35Inner {
+    fn drop(&mut self) {
+        self.erase_compiled_verifies();
     }
 }

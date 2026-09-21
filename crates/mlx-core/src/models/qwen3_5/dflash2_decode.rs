@@ -347,6 +347,11 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
                 verified_ids.len()
             )));
         }
+        // Replay is required even on full accept: the windowed verify kernel
+        // carries the recurrent state in f32 across the whole window and rounds
+        // to bf16 once at the end, while replay re-rounds per token to restore
+        // the AR-exact state serial decode would leave. Skipping it would let a
+        // sub-ULP divergence compound across cycles.
         replay_mtp_snapshot_to(
             self.inner
                 .caches

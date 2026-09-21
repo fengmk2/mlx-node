@@ -558,6 +558,23 @@ fn apply_weights_moe_inner_with_residency(
     let is_quantized = is_quantized_checkpoint(params);
     let (default_plq, default_gate_plq) =
         compute_moe_defaults(params, top_level_mode, quant_bits, quant_group_size);
+    // The model's actual compute dtype is whatever the embedding emits —
+    // affine-quantized tables emit their `.scales` dtype, but K-quant/IQ/mxfp
+    // `.scales` are integer sub-block codes and MLX `dequantize` emits bf16
+    // for them; dense tables emit their own dtype. Sidecar casts must target
+    // this, not a hardcoded family default (f32/f16 checkpoints must keep
+    // f32/f16 sidecars).
+    let compute_dtype = params
+        .get("embedding.scales")
+        .and_then(|w| w.dtype().ok())
+        .map(|d| match d {
+            crate::array::DType::Float16
+            | crate::array::DType::BFloat16
+            | crate::array::DType::Float32 => d,
+            _ => crate::array::DType::BFloat16,
+        })
+        .or_else(|| params.get("embedding.weight").and_then(|w| w.dtype().ok()))
+        .unwrap_or(crate::array::DType::BFloat16);
     let plain_fp8_residency = std::cell::RefCell::new(PlainFp8Residency::default());
 
     // Helper: dispatch by per-layer mode (mxfp4 / mxfp8 / nvfp4 / affine /
@@ -973,13 +990,13 @@ fn apply_weights_moe_inner_with_residency(
                     }
                 }
                 if let Some(w) = params.get(&format!("{}.linear_attn.conv1d.weight", prefix)) {
-                    gdn.set_conv1d_weight(w)?;
+                    gdn.set_conv1d_weight(w, compute_dtype)?;
                 }
                 if let Some(w) = params.get(&format!("{}.linear_attn.dt_bias", prefix)) {
                     gdn.set_dt_bias(w);
                 }
                 if let Some(w) = params.get(&format!("{}.linear_attn.norm.weight", prefix)) {
-                    gdn.set_norm_weight(w)?;
+                    gdn.set_norm_weight(w, compute_dtype)?;
                 }
                 if let Some(w) = params.get(&format!("{}.linear_attn.A_log", prefix)) {
                     gdn.set_a_log(w)?;
@@ -1074,10 +1091,10 @@ fn apply_weights_moe_inner_with_residency(
                     }
                 }
                 if let Some(w) = params.get(&format!("{}.self_attn.q_norm.weight", prefix)) {
-                    attn.set_q_norm_weight(w)?;
+                    attn.set_q_norm_weight(w, compute_dtype)?;
                 }
                 if let Some(w) = params.get(&format!("{}.self_attn.k_norm.weight", prefix)) {
-                    attn.set_k_norm_weight(w)?;
+                    attn.set_k_norm_weight(w, compute_dtype)?;
                 }
                 if let Some(w) = params.get(&format!("{}.self_attn.q_proj.bias", prefix)) {
                     attn.set_q_proj_bias(Some(w))?;
@@ -1361,7 +1378,13 @@ fn apply_weights_moe_inner_with_residency(
             );
             if missing.is_empty() {
                 if let Some(mtp) = inner.mtp.as_mut() {
-                    mtp.apply_weights(params, default_plq, default_gate_plq, per_layer_quant)?;
+                    mtp.apply_weights(
+                        params,
+                        default_plq,
+                        default_gate_plq,
+                        per_layer_quant,
+                        compute_dtype,
+                    )?;
                 }
                 inner.mtp_weights_loaded = true;
             } else {

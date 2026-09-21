@@ -486,6 +486,16 @@ unsafe extern "C-unwind" {
         out_handles: *mut u64,
         max_outputs: usize,
     ) -> usize;
+    /// Unequal split: `indices` are the N-1 cut points on `axis`, producing
+    /// N sections through a single Split primitive (one GPU dispatch).
+    pub fn mlx_array_split_indices(
+        handle: *mut mlx_array,
+        indices: *const i64,
+        indices_len: usize,
+        axis: i32,
+        out_handles: *mut u64,
+        max_outputs: usize,
+    ) -> usize;
     pub fn mlx_array_tile(
         handle: *mut mlx_array,
         reps: *const i32,
@@ -1969,6 +1979,7 @@ unsafe extern "C-unwind" {
     ) -> bool;
 
     // Fused GDN gating: beta = sigmoid(b), g = -exp(a_log) * softplus(a + dt_bias)
+    // `emit_exp` selects exp(g) output for the per-step recurrence path.
     pub fn mlx_fused_gdn_gating(
         b: *mut mlx_array,
         a: *mut mlx_array,
@@ -1976,6 +1987,7 @@ unsafe extern "C-unwind" {
         dt_bias: *mut mlx_array,
         num_heads: i32,
         total_elements: i32,
+        emit_exp: bool,
         out_beta: *mut *mut mlx_array,
         out_g: *mut *mut mlx_array,
     ) -> bool;
@@ -2010,6 +2022,16 @@ pub type LayerFunctionPtr = extern "C-unwind" fn(
     max_outputs: usize,
     context: *mut std::os::raw::c_void,
 ) -> usize;
+
+// Compiled-graph builder: receives owning `mlx_array` handles for the traced
+// inputs, writes `n_outputs` owning handles to `outputs`, returns success.
+pub type MlxGraphBuilder = unsafe extern "C" fn(
+    ctx: *mut std::os::raw::c_void,
+    inputs: *const *const mlx_array,
+    n_inputs: usize,
+    outputs: *mut *mut mlx_array,
+    n_outputs: usize,
+) -> bool;
 
 unsafe extern "C" {
     /// Forward-local runtime settings. Begin/end must run on the same thread.
@@ -2081,8 +2103,48 @@ unsafe extern "C" {
         history: *mut mlx_array,
         scale: *mut mlx_array,
         dt: *mut mlx_array,
+        mean_eps: bool,
+        beta_input_dtype: bool,
         outputs: *mut *mut mlx_array,
     ) -> bool;
+    pub fn mlx_dflash2_topk16(
+        logits: *mut mlx_array,
+        out_ids: *mut *mut mlx_array,
+        out_values: *mut *mut mlx_array,
+    ) -> bool;
+    /// Fused residual-add + RMSNorm: writes `h = x + res` and
+    /// `normed = rms_norm(h) * w` into the out pointers. Returns false on
+    /// contract violation (shape/dtype/contiguity) or kernel build failure.
+    pub fn mlx_fused_add_rmsnorm(
+        x: *mut mlx_array,
+        res: *mut mlx_array,
+        w: *mut mlx_array,
+        eps: *mut mlx_array,
+        out_h: *mut *mut mlx_array,
+        out_normed: *mut *mut mlx_array,
+    ) -> bool;
+    /// Owning handle copy sharing the source's ArrayDesc (no graph node —
+    /// unlike `mlx_array_copy`). Used by the compiled-graph builder to hand
+    /// outputs across the FFI boundary.
+    pub fn mlx_array_clone_handle(handle: *const mlx_array) -> *mut mlx_array;
+    pub fn mlx_compiled_graph_invoke(
+        fn_id: u64,
+        builder: Option<MlxGraphBuilder>,
+        ctx: *mut std::ffi::c_void,
+        inputs: *const *const mlx_array,
+        n_inputs: usize,
+        outputs: *mut *mut mlx_array,
+        n_outputs: usize,
+        shapeless: bool,
+    ) -> bool;
+    /// Erase every cached compiled-graph entry whose fn_id matches `value`
+    /// under `mask`. Erasing drops the compiled `std::function`, whose
+    /// shared_ptr deleter also removes MLX's internal tape cache — releasing
+    /// the constants (model weights) the tape retains.
+    pub fn mlx_compiled_graph_erase_matching(mask: u64, value: u64);
+    /// Test hook: toggle MLX's global compile mode so tests can exercise the
+    /// raw-closure path (builder runs on every invoke).
+    pub fn mlx_compiled_graph_set_compile_disabled(disabled: bool);
     pub fn mlx_qwen4_window_conv(
         x: *mut mlx_array,
         history: *mut mlx_array,

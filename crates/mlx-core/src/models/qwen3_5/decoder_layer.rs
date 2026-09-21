@@ -1,15 +1,32 @@
-use crate::array::MxArray;
+use crate::array::{DType, MxArray};
 use crate::nn::RMSNorm;
 use crate::transformer::MLP;
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use crate::transformer::paged_kv_cache_adapter::SeqId;
 use napi::bindgen_prelude::*;
 
-use super::attention::Qwen3_5Attention;
+use super::arrays_cache::ArraysCache;
+use super::attention::{AttentionVerifyIo, Qwen3_5Attention};
 use super::config::Qwen3_5Config;
 use super::gated_delta_net::GatedDeltaNet;
 use super::layer_cache::Qwen3_5LayerCache;
 use crate::models::quantized_linear::{MLPVariant, QuantizedLinear};
+
+/// Per-layer cache IO for the compiled DFlash2 verify graph
+/// ([`DecoderLayer::forward_verify`]).
+///
+/// `Linear` is a detached `ArraysCache` seeded with the layer's live
+/// `(conv_state, recurrent_state)` inputs — the GDN forward writes its
+/// (dead) post-window states into it and the caller drops it; commit replays
+/// the accepted prefix from the pre-verify snapshot regardless of what the
+/// verify pass wrote.
+///
+/// `FullAttention` carries the prefix views, RoPE offsets and the new-K/V
+/// sink described by [`AttentionVerifyIo`].
+pub(crate) enum LayerVerifyIo<'a> {
+    Linear(&'a mut ArraysCache),
+    FullAttention(AttentionVerifyIo<'a>),
+}
 
 /// Per-layer routing kind for Qwen3.5's paged dispatch.
 ///
@@ -81,6 +98,20 @@ pub struct DecoderLayer {
 }
 
 impl DecoderLayer {
+    /// `h = x + res` + `normed = norm(h)` — one Metal dispatch via the fused
+    /// add_rmsnorm kernel when the contract holds, else the separate ops.
+    /// The fused kernel is bit-identical to `x.add(res)` + `norm.forward(h)`
+    /// (same element mapping as `rms_single_row`/`rms_looped`), so this is
+    /// safe on every path — eager, paged, prefill and compiled verify alike.
+    fn add_residual_norm(norm: &RMSNorm, x: &MxArray, res: &MxArray) -> Result<(MxArray, MxArray)> {
+        if let Some(pair) = norm.forward_residual_add(x, res) {
+            return Ok(pair);
+        }
+        let h = x.add(res)?;
+        let normed = norm.forward(&h)?;
+        Ok((h, normed))
+    }
+
     /// Whether this layer uses linear attention (derived from attention type).
     pub fn is_linear(&self) -> bool {
         matches!(self.attn, AttentionType::Linear(_))
@@ -182,14 +213,45 @@ impl DecoderLayer {
             }
         };
 
-        // Residual connection
-        let h = x.add(&attn_out)?;
-
-        // Pre-norm + MLP
-        let normed = self.post_attention_layernorm.forward(&h)?;
+        // Residual + post-attention norm (fused add_rmsnorm when eligible)
+        let (h, normed) = Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
         let mlp_out = self.mlp.forward(&normed)?;
 
         // Residual connection
+        h.add(&mlp_out)
+    }
+
+    /// Compiled-verify forward for the DFlash2 flat-cache path — the same
+    /// pre-norm → attention → residual → norm → MLP → residual skeleton as
+    /// [`Self::forward_inner_with_tape`] under `mask = None`,
+    /// `position_ids = None`, but every cache interaction flows through `io`
+    /// (graph inputs in, graph outputs out) instead of mutating
+    /// `Qwen3_5LayerCache`. GDN layers still record their tape via
+    /// `tape_sink` — the tape fields become compiled-graph outputs upstream.
+    pub(crate) fn forward_verify(
+        &mut self,
+        x: &MxArray,
+        io: &mut LayerVerifyIo<'_>,
+        use_kernel: bool,
+        tape_sink: Option<&mut Option<super::gated_delta_net::GdnLayerTape>>,
+    ) -> Result<MxArray> {
+        let normed = self.input_layernorm.forward(x)?;
+        let attn_out = match (&mut self.attn, io) {
+            (AttentionType::Linear(gdn), LayerVerifyIo::Linear(ac)) => {
+                gdn.forward_with_tape(&normed, None, Some(&mut **ac), use_kernel, tape_sink)?
+            }
+            (AttentionType::Full(attn), LayerVerifyIo::FullAttention(aio)) => {
+                attn.forward_verify(&normed, aio)?
+            }
+            (AttentionType::Linear(_), _) | (AttentionType::Full(_), _) => {
+                return Err(Error::from_reason(
+                    "Qwen3.5 compiled verify: layer/cache io kind mismatch",
+                ));
+            }
+        };
+
+        let (h, normed) = Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
+        let mlp_out = self.mlp.forward(&normed)?;
         h.add(&mlp_out)
     }
 
@@ -281,10 +343,9 @@ impl DecoderLayer {
                     rope_position_offset,
                     mrope_cache,
                 )?;
-                // Residual.
-                let h = x.add(&attn_out)?;
-                // Pre-norm + MLP.
-                let normed = self.post_attention_layernorm.forward(&h)?;
+                // Residual + post-attention norm (fused when eligible).
+                let (h, normed) =
+                    Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
                 let mlp_out = self.mlp.forward(&normed)?;
                 h.add(&mlp_out)
             }
@@ -336,8 +397,8 @@ impl DecoderLayer {
                 let normed = self.input_layernorm.forward(x)?;
                 let attn_out =
                     attn.forward_paged_batched(&normed, adapter, paged_idx, rows, false)?;
-                let h = x.add(&attn_out)?;
-                let normed = self.post_attention_layernorm.forward(&h)?;
+                let (h, normed) =
+                    Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
                 let mlp_out = self.mlp.forward(&normed)?;
                 h.add(&mlp_out)
             }
@@ -416,8 +477,8 @@ impl DecoderLayer {
                     rope_position_offset,
                     &mut None,
                 )?;
-                let h = x.add(&attn_out)?;
-                let normed = self.post_attention_layernorm.forward(&h)?;
+                let (h, normed) =
+                    Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
                 let mlp_out = self.mlp.forward(&normed)?;
                 h.add(&mlp_out)
             }
@@ -426,12 +487,18 @@ impl DecoderLayer {
 
     // ========== Weight accessors ==========
 
-    pub fn set_input_layernorm_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.input_layernorm.set_weight(w)
+    pub fn set_input_layernorm_weight(&mut self, w: &MxArray, compute_dtype: DType) -> Result<()> {
+        self.input_layernorm
+            .set_weight(&super::sidecar_to_compute_dtype(w, compute_dtype)?)
     }
 
-    pub fn set_post_attention_layernorm_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.post_attention_layernorm.set_weight(w)
+    pub fn set_post_attention_layernorm_weight(
+        &mut self,
+        w: &MxArray,
+        compute_dtype: DType,
+    ) -> Result<()> {
+        self.post_attention_layernorm
+            .set_weight(&super::sidecar_to_compute_dtype(w, compute_dtype)?)
     }
 
     // ========== Weight getters (for training parameter extraction) ==========

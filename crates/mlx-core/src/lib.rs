@@ -14,6 +14,7 @@ pub mod benchmarks;
 pub mod cache_limit;
 pub mod calibration;
 pub mod cold_tier;
+pub(crate) mod compiled_graph;
 pub mod convert;
 pub mod convert_gemma_import;
 pub mod dataset;
