@@ -1,4 +1,5 @@
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -164,7 +165,15 @@ describe('mlx serve — end to end', () => {
 
     expect(observedUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
     expect(exitCodes).toEqual([0]);
-    await expect(fetch(healthUrl)).rejects.toThrow();
+    const connectionError = await new Promise<NodeJS.ErrnoException | null>((resolve) => {
+      const socket = connect(Number(new URL(healthUrl).port), '127.0.0.1');
+      socket.once('error', (error) => resolve(error as NodeJS.ErrnoException));
+      socket.once('connect', () => {
+        socket.destroy();
+        resolve(null);
+      });
+    });
+    expect(connectionError?.code).toBe('ECONNREFUSED');
 
     // Handlers detached on shutdown: a leaked one would keep a closed host
     // alive in the listener list and swallow the next Ctrl+C.

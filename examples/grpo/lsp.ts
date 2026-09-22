@@ -84,26 +84,16 @@ export interface LspService {
 // ============================================================================
 
 /**
- * Find the node_modules directory by searching upward from the current file.
- */
-function findNodeModules(): string {
-  let dir = __dirname;
-  while (dir !== path.dirname(dir)) {
-    const nodeModules = path.join(dir, 'node_modules');
-    if (fs.existsSync(nodeModules)) {
-      return nodeModules;
-    }
-    dir = path.dirname(dir);
-  }
-  throw new Error('Could not find node_modules directory');
-}
-
-/**
- * Resolve a path within a package.
+ * Resolve a package file from the nearest node_modules that contains it.
  */
 function resolvePackagePath(packageName: string, internalPath: string): string {
-  const nodeModules = findNodeModules();
-  return path.join(nodeModules, packageName, internalPath);
+  let dir = __dirname;
+  while (dir !== path.dirname(dir)) {
+    const candidate = path.join(dir, 'node_modules', packageName, internalPath);
+    if (fs.existsSync(candidate)) return candidate;
+    dir = path.dirname(dir);
+  }
+  throw new Error(`Could not find ${packageName}/${internalPath} in a parent node_modules directory`);
 }
 
 // ============================================================================

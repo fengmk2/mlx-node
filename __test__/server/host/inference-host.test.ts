@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
-import { createServer as createNetServer } from 'node:net';
+import { connect as connectNet, createServer as createNetServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -324,16 +324,28 @@ describe('createInferenceHost — binding and health', () => {
     const address = host.server.server.address();
     expect(address !== null && typeof address === 'object' ? address.address : null).toBe('::1');
     expect(host.url).toBe(`http://[::1]:${host.port}`);
-    expect((await fetch(`${host.url}/health`)).status).toBe(200);
+    const response = await fetch(`${host.url}/health`);
+    expect(response.status).toBe(200);
+    await response.arrayBuffer();
   });
 
   it('stops answering once closed', async () => {
     const modelsDir = await makeModelsDir(['alpha']);
     const host = await start({ modelsDir });
     const url = `${host.url}/health`;
-    expect((await fetch(url)).status).toBe(200);
+    const response = await fetch(url);
+    expect(response.status).toBe(200);
+    await response.arrayBuffer();
     await host.close({ timeoutMs: 0 });
-    await expect(fetch(url)).rejects.toThrow();
+    const connectionError = await new Promise<NodeJS.ErrnoException | null>((resolve) => {
+      const socket = connectNet(host.port, '127.0.0.1');
+      socket.once('error', (error) => resolve(error as NodeJS.ErrnoException));
+      socket.once('connect', () => {
+        socket.destroy();
+        resolve(null);
+      });
+    });
+    expect(connectionError?.code).toBe('ECONNREFUSED');
   });
 
   /**
@@ -559,7 +571,13 @@ describe('createInferenceHost — a network-reachable bind must be gated', () =>
     const modelsDir = await makeModelsDir(['alpha']);
     for (const bind of ['127.0.0.1', 'localhost', undefined]) {
       const host = await start({ modelsDir, host: bind, port: 0 });
-      expect((await fetch(`${host.url}/v1/models`)).status, String(bind)).toBe(200);
+      expect(host.host).toBe(bind ?? '127.0.0.1');
+      const address = host.server.server.address();
+      if (address === null || typeof address === 'string') throw new Error('Expected an IP socket');
+      const ip = address.family === 'IPv6' ? `[${address.address}]` : address.address;
+      const response = await fetch(`http://${ip}:${address.port}/v1/models`);
+      expect(response.status, String(bind)).toBe(200);
+      await response.arrayBuffer();
     }
   });
 });

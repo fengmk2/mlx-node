@@ -162,9 +162,9 @@ async function postResponse(baseUrl: string, input: string): Promise<{ id?: stri
   });
 }
 
-const stage1Describe = MODEL_ENV_PRESENT ? describe.sequential : describe.skip;
+const stage1Describe = MODEL_ENV_PRESENT ? describe : describe.skip;
 
-stage1Describe('Stage-1 real-model server admission', () => {
+stage1Describe('Stage-1 real-model server admission', { concurrent: false }, () => {
   let instance: ServerInstance;
   let nativeModel: SchedulerStatsModel;
   let peakActive: () => number;

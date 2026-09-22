@@ -333,7 +333,7 @@ const ARGV_BUDGET = 128 * 1024;
 export function findMachOFiles(root: string): string[] {
   const files = listRegularFiles(root);
   let output = '';
-  for (let i = 0; i < files.length; ) {
+  for (let i = 0; i < files.length;) {
     const batch: string[] = [];
     let bytes = 0;
     while (i < files.length && (batch.length === 0 || bytes + files[i].length + 1 < ARGV_BUDGET)) {

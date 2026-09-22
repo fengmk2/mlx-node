@@ -27,9 +27,9 @@ function isScheduledGemma(model: LoadableModel): model is LoadableModel & Schedu
   );
 }
 
-const gemmaDescribe = MODEL_ENV_PRESENT ? describe.sequential : describe.skip;
+const gemmaDescribe = MODEL_ENV_PRESENT ? describe : describe.skip;
 
-gemmaDescribe('Gemma4 grouped hybrid KV continuous batching', () => {
+gemmaDescribe('Gemma4 grouped hybrid KV continuous batching', { concurrent: false }, () => {
   let model: ScheduledGemma;
   const sessions: ChatSession[] = [];
   const activeSends = new Set<{

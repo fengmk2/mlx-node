@@ -1,5 +1,3 @@
-import { resolve } from 'node:path';
-
 import { Qwen3Tokenizer } from '@mlx-node/core';
 import {
   SFTDataset,
@@ -10,13 +8,13 @@ import {
 } from '@mlx-node/trl';
 import { describe, expect, it, beforeAll } from 'vite-plus/test';
 
+import { findTokenizerPath } from '../test-model-utils';
+
 describe('SFT Dataset', () => {
   let tokenizer: Qwen3Tokenizer;
 
   beforeAll(async () => {
-    // Load tokenizer from cached model
-    const tokenizerPath = resolve(process.cwd(), '.cache/models/qwen3-0.6b-mlx-bf16/tokenizer.json');
-    tokenizer = await Qwen3Tokenizer.fromPretrained(tokenizerPath);
+    tokenizer = await Qwen3Tokenizer.fromPretrained(findTokenizerPath());
   });
 
   describe('prompt-completion format', () => {
