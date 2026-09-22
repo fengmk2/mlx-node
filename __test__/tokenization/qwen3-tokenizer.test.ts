@@ -4,25 +4,16 @@
  * Comprehensive tests for the Rust-based Qwen3 tokenizer implementation
  */
 
-import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-
 import { Qwen3Tokenizer, type ChatMessage } from '@mlx-node/core';
 import { describe, it, expect, beforeAll } from 'vite-plus/test';
+
+import { findTokenizerPath } from '../test-model-utils';
 
 describe('Qwen3Tokenizer', () => {
   let tokenizer: Qwen3Tokenizer;
 
-  const TOKENIZER_PATH = join(
-    fileURLToPath(import.meta.url),
-    '..',
-    '..',
-    '..',
-    '.cache/models/qwen3-0.6b-mlx-bf16/tokenizer.json',
-  );
-
   beforeAll(async () => {
-    tokenizer = await Qwen3Tokenizer.fromPretrained(TOKENIZER_PATH);
+    tokenizer = await Qwen3Tokenizer.fromPretrained(findTokenizerPath());
   });
 
   describe('Initialization', () => {

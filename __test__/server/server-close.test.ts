@@ -1,6 +1,6 @@
 import { once } from 'node:events';
 import { request as httpRequest } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import { connect, type AddressInfo } from 'node:net';
 
 import type { SessionCapableModel } from '@mlx-node/lm';
 import { activeSSEStreamCount, createServer, type ServerInstance } from '@mlx-node/server';
@@ -278,7 +278,15 @@ describe('close() on a quiet server', () => {
   it('stops the server from accepting new requests', async () => {
     const { instance, base } = await start();
     await instance.close({ timeoutMs: 1_000 });
-    await expect(fetch(`${base}/health`)).rejects.toThrow();
+    const connectionError = await new Promise<NodeJS.ErrnoException | null>((resolve) => {
+      const socket = connect(Number(new URL(base).port), '127.0.0.1');
+      socket.once('error', (error) => resolve(error as NodeJS.ErrnoException));
+      socket.once('connect', () => {
+        socket.destroy();
+        resolve(null);
+      });
+    });
+    expect(connectionError?.code).toBe('ECONNREFUSED');
   });
 });
 
